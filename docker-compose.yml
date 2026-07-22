@@ -1,0 +1,30 @@
+# Blimp prod-source kit — an Iceberg REST catalog + S3 warehouse you run in YOUR
+# environment, so a Blimp cloud-native cluster can query it via the Production tab
+# (BYO source). Mirrors the reference prod-test setup: tabulario/iceberg-rest
+# (JDBC/SQLite catalog) over an S3 (or MinIO) warehouse.
+services:
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"                     # <-- point Blimp's "Iceberg REST URL" here
+    environment:
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      # WAL + busy_timeout: without these, concurrent CDC appends collide with the
+      # gateway drift-poller's catalog reads on SQLite's single global lock and
+      # fail with CommitStateUnknownException (SQLITE_BUSY). WAL lets readers run
+      # while a writer commits; busy_timeout makes a blocked writer wait, not fail.
+      CATALOG_URI: jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL
+      CATALOG_JDBC_USER: user
+      CATALOG_JDBC_PASSWORD: password
+      CATALOG_WAREHOUSE: ${WAREHOUSE}                 # e.g. s3://my-bucket/iceberg_wh
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      # For MinIO / S3-compatible stores, also set:
+      #   CATALOG_S3_ENDPOINT: http://minio:9000
+      #   CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    volumes:
+      - ./catalog:/catalog             # sqlite db — MUST be writable (dir + file)
+    restart: unless-stopped
