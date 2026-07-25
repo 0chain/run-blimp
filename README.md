@@ -153,23 +153,21 @@ Storage = warp S3 PUT/GET + TTFB, fio NFS, mlperf (needs `warp`, `fio`,
 Bench = min/median/avg/max author / materialize / delta-merge profile
 (`ITERS AUTHOR_ITERS CDC_ROWS`).
 
-### Step 7 — router corner cases (operator)
+## Notes
 
-`test_router_freshness.sh` toggles the gateway's router flags via SSM and
-proves both invariants: **router ON** → an append still changes the served
-result (immutable Iceberg files = new keys = no stale hit); **router OFF** →
-a source read writes **zero** bytes to the cache.
+**Router corner cases (operator).** `test_router_freshness.sh` toggles the
+gateway's router flags via SSM and proves both invariants: **router ON** → an
+append still changes the served result (immutable Iceberg files = new keys = no
+stale hit); **router OFF** → a source read writes **zero** bytes to the cache.
 
-### Step 8 — Blimp node stop/start (self-heal, no touch)
+**Blimp node stop/start (self-heal, no touch).** Raw EC2 stop/start: private IPs
+survive (in-VPC wiring reconnects untouched); public IPs change and the control
+plane's 60s cron reconciles the DB + every `zus-<id>-N` DNS record (gateway
+**and** blobbers) in ~1–2 min. MVs + wiring persist — re-run `--query`: the MV
+serves without re-author, CDC keeps merging.
 
-Raw EC2 stop/start: private IPs survive (in-VPC wiring reconnects untouched);
-public IPs change and the control plane's 60s cron reconciles the DB + every
-`zus-<id>-N` DNS record (gateway **and** blobbers) in ~1–2 min. MVs + wiring
-persist — re-run `--query`: the MV serves without re-author, CDC keeps merging.
-
-### Credentials model
-
-- **vpc mode: nothing typed.** Node + gateway each use their IAM instance
+**Credentials model.**
+- **vpc mode: nothing typed.** Iceberg node + gateway each use their IAM instance
   role (EC2 metadata); bucket access is a policy naming the role.
 - **external mode:** S3 keys typed once into `--setup` (`~/.blimp_env`,
   mode 600); pasted into the Blimp node UI they are stored in **AWS Secrets
