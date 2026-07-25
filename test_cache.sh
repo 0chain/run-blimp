@@ -42,6 +42,9 @@ export GW GW_AK GW_SK ROUTER NFS_MNT EC ORIGIN_BUCKET REGION
 echo ""
 echo "gateway=$GW  EC=$EC  router=$ROUTER  origin=s3://$ORIGIN_BUCKET/$CACHE_TABLE ($REGION)"
 echo "----------------------------------------------------------------------"
+# capture our own output so the final summary can be extracted from it
+CAP="${CAP:-/tmp/test_cache_out.log}"; : > "$CAP"
+exec > >(tee -a "$CAP") 2>&1
 run(){ echo; echo ">>> $1"; shift; "$@"; }
 
 # GUARANTEED cleanup — runs on completion, Ctrl-C, or any abort. Bench leftovers
@@ -100,4 +103,26 @@ run "5/5 eviction (drive the cache past the high watermark; watch the evictor)" 
   '
 
 echo ""
+echo "============================ STORAGE/CACHE SUMMARY ============================"
+awk '
+  / TTFB: Avg/                { ttfb=$0 }
+  /== warp PUT/               { sect="put" } /== warp GET/ { sect="get" }
+  / \* Average:.*MiB\/s/      { if (sect=="put" && !put) put=$3; else if (sect=="get" && !get) get=$3 }
+  /^  write: IOPS.*BW=/       { sub(/.*BW=/,""); sub(/ .*/,""); fw=$0 }
+  /^  read: IOPS.*BW=/        { sub(/.*BW=/,""); sub(/ .*/,""); fr=$0 }
+  /\[METRIC\] Training Accelerator/      { au=$NF; sub(/\(.*/,"",au); au=$(NF-1) }
+  /\[METRIC\] Training Throughput/       { sm=$(NF-1) }
+  /\[METRIC\] Training I\/O Throughput/  { io=$(NF-1) }
+  /direct-S3 \(origin\)/      { d=$3 }  /cache-S3 \(router/   { c=$4 }
+  /cache-mp-s3 \(warm\)/      { m=$3 }  /cache-NFS \(Ganesha/ { n=$4 }
+  /speedup vs direct-S3/      { sp=$0; sub(/^ */,"",sp) }
+  END{
+    printf "  warp   S3 PUT %s MiB/s · GET %s MiB/s\n", put, get
+    if (ttfb) { sub(/^ *\* */,"",ttfb); printf "  %s\n", ttfb }
+    printf "  fio    NFS write %s · read %s\n", fw, fr
+    if (io) printf "  mlperf AU %s%% · %s samples/s · %s MB/s\n", au, sm, io
+    printf "  cache  direct-S3 %s · router %s · mp-s3 %s · NFS %s MB/s\n", d, c, m, n
+    if (sp) printf "  %s\n", sp
+  }' "$CAP"
+echo "==============================================================================="
 echo "==================== suite complete — compare to EXPECTED_TEST_RESULTS.md ===================="

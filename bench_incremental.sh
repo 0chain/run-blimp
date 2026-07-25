@@ -17,7 +17,7 @@ NAMESPACE="${NAMESPACE:-tpcds}"; REGION="${REGION:-ap-south-1}"
 ITERS="${ITERS:-5}"; AUTHOR_ITERS="${AUTHOR_ITERS:-5}"; CDC_ROWS="${CDC_ROWS:-50000}"
 Q_DIR="${Q_DIR:-$HOME/tpcds_queries}"
 QAPI="http://$GW:9000"; TOKEN="zus-$CLUSTER_ID"; HERE="$(cd "$(dirname "$0")" && pwd)"
-PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
+PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
 now(){ date +%s.%N; }; el(){ awk -v a="$1" -v z="$2" 'BEGIN{printf "%.1f",(z-a)*1000}'; }
 J(){ python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
 
@@ -91,15 +91,16 @@ cycle(){ # cycle <label> <seed-extra-args...> — commit, webhook, inline re-ser
   local T0 R T1
   T0=$(now); R=$(run_sql "$Q1"); T1=$(now)
   CY_MAT=$(echo "$R" | J materialize_ms); CY_Q=$(echo "$R" | J query_ms)
+  CY_MERGE=$(echo "$R" | J merge_ms)   # delta-merge time (O(delta) incremental refresh)
   CY_ENGINE=$(echo "$R" | J engine); CY_WALL=$(el "$T0" "$T1")
 }
 
 # ---- B) append → incremental refresh ---------------------------------------------
-B_MAT=(); B_WALL=()
+B_MAT=(); B_MERGE=(); B_WALL=()
 for i in $(seq 1 "$ITERS"); do
   cycle "append-$i"
-  B_MAT+=("${CY_MAT:-0}"); B_WALL+=("$CY_WALL")
-  echo "  append[$i] refresh materialize_ms=${CY_MAT:-?} query_ms=${CY_Q:-?} engine=$CY_ENGINE wall_ms=$CY_WALL"
+  B_MAT+=("${CY_MAT:-0}"); B_MERGE+=("${CY_MERGE:-0}"); B_WALL+=("$CY_WALL")
+  echo "  append[$i] refresh delta_merge_ms=${CY_MERGE:-?} materialize_ms=${CY_MAT:-?} query_ms=${CY_Q:-?} engine=$CY_ENGINE wall_ms=$CY_WALL"
 done
 
 echo
@@ -107,5 +108,6 @@ echo "== SUMMARY (q1-scale MV over ${CDC_ROWS}-row commits) =="
 echo "  one-time author_ms (fresh queries):   $(stats "${A_AUTH[@]:-}")"
 echo "  one-time materialize_ms:              $(stats "${A_MAT[@]:-}")"
 echo "  one-time wall_ms:                     $(stats "${A_WALL[@]:-}")"
+echo "  append  delta_merge_ms:               $(stats "${B_MERGE[@]:-}")"
 echo "  append  refresh materialize_ms:       $(stats "${B_MAT[@]:-}")"
 echo "  append  commit→answer wall_ms:        $(stats "${B_WALL[@]:-}")"

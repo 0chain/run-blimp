@@ -31,7 +31,9 @@ d="${EC%%/*}"
 if [ "$d" -ge 8 ]; then EC_CONC=64; EC_FIO_JOBS=32; EC_FIO_IODEPTH=8;  EC_FIO_MIB=4608
   EC_DATASET_GB=136; EC_ACCEL=6; EC_RT=24; EC_PF=48
 else                    EC_CONC=16; EC_FIO_JOBS=16; EC_FIO_IODEPTH=16; EC_FIO_MIB=2304
-  EC_DATASET_GB=34;  EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
+  # 68 GiB set = 2x the 32 GiB gateway RAM: the warp GET can NOT be served from
+  # gateway page cache (34 GiB barely exceeded RAM and read cache-favorably).
+  EC_DATASET_GB=68;  EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
 FJ="${FIO_JOBS:-$EC_FIO_JOBS}"; FSZ="${FIO_SIZE:-${EC_FIO_MIB}M}"; FID="$EC_FIO_IODEPTH"
 echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC fio-jobs=$EC_FIO_JOBS fio-iodepth=$EC_FIO_IODEPTH per-stream=${EC_FIO_MIB}MiB obj=$OSZ mlperf-accel=$EC_ACCEL rt=$EC_RT pf=$EC_PF"
 

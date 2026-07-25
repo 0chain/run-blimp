@@ -7,7 +7,7 @@
 # these for MV generation; CDC appends land in the catalog's own warehouse.
 #
 # Usage:
-#   pip install "pyiceberg[s3fs]>=0.9,<0.10" "pyarrow>=14,<17" s3fs boto3
+#   pip install "pyiceberg[s3fs]>=0.10" "pyarrow>=14,<17" s3fs boto3
 #   (>=0.9 required: the sf1000 parquet stores small decimals as INT32/INT64,
 #    which pyiceberg 0.7/0.8 add_files rejects)
 #   python3 register_tpcds_tables.py \

@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# blimp — one command to set up, then validate, a Blimp prod source.
+# ==============================================================================
+#   blimp                 list the commands (this help)
+#   blimp --setup         PROD: run on YOUR app node — connect a Blimp cluster to
+#                         your data. Asks for your Iceberg REST + S3 endpoints;
+#                         if you don't have them, stands up an Iceberg catalog
+#                         (:8181) and/or an S3 warehouse bucket here for you,
+#                         then prints the values to point the Blimp cluster at.
+#   blimp --storage       TEST: storage/cache suite (warp, fio, mlperf, cache).
+#   blimp --query         TEST: query + CDC suite (author → append → delta-merge).
+#   blimp --bench         BENCH: statistical author / materialize / delta-merge
+#                         timing profile (min/median/avg/max over N iterations).
+#   blimp --all           TEST: --storage then --query.
+#
+# Wiring is saved to ~/.blimp_env (override path with BLIMP_ENV). --setup writes
+# it; --storage/--query/--all read it (and prompt for anything still missing).
+# Non-interactive: pre-set the env vars (REGION, CLUSTER_ID, GW, ICEBERG_URL,
+# WAREHOUSE, ORIGIN_BUCKET, NAMESPACE, GW_AK, GW_SK) and they won't be asked.
+# ==============================================================================
+set -uo pipefail
+# Resolve $0 through any symlink so `blimp` works when installed as
+# /usr/local/bin/blimp -> /opt/blimp/blimp — HERE must be the KIT dir (where the
+# sibling scripts live), not the symlink's dir.
+SELF="$0"; while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"; case "$link" in /*) SELF="$link";; *) SELF="$(dirname "$SELF")/$link";; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+ENVF="${BLIMP_ENV:-$HOME/.blimp_env}"
+bold(){ printf '\033[1m%s\033[0m\n' "$*"; }
+die(){ printf '\033[31m[blimp] FATAL: %s\033[0m\n' "$*" >&2; exit 1; }
+# ask VAR "prompt" [default] — keep an already-set value; else prompt (default on empty)
+ask(){ local var="$1" prompt="$2" def="${3:-}" cur="${!1:-}" v
+  [ -n "$cur" ] && { printf '%s' "$cur"; return; }
+  printf '%s%s: ' "$prompt" "${def:+ [$def]}" >&2; read -r v </dev/tty || true
+  printf '%s' "${v:-$def}"; }
+
+usage(){
+  bold "blimp — Blimp prod-source setup + validation"
+  cat <<'H'
+
+  blimp --setup      Connect a Blimp cluster to your data (run on your app node).
+                     Uses your Iceberg REST + S3 endpoints if you have them, or
+                     stands up an Iceberg catalog / S3 bucket here if you don't.
+  blimp --storage    Test: storage & read-through cache suite.
+  blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
+  blimp --bench      Bench: author / materialize / delta-merge timing profile
+                     (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
+  blimp --all        Test: storage then query.
+
+  Wiring is read from / written to ~/.blimp_env  (set BLIMP_ENV to relocate).
+H
+  [ -f "$ENVF" ] && { echo; bold "current wiring ($ENVF):"; sed 's/^/  /' "$ENVF"; }
+  return 0
+}
+
+save_env(){
+  umask 077
+  cat > "$ENVF" <<E
+# written by 'blimp --setup' — the wiring for --storage / --query
+REGION=$REGION
+CLUSTER_ID=$CLUSTER_ID
+GW=$GW
+GATEWAY=$GW
+ICEBERG_URL=$ICEBERG_URL
+WAREHOUSE=$WAREHOUSE
+ORIGIN_BUCKET=$ORIGIN_BUCKET
+NAMESPACE=$NAMESPACE
+GW_AK=${GW_AK:-}
+GW_SK=${GW_SK:-}
+BLIMP_PY=${BLIMP_PY:-python3}
+E
+  bold "saved wiring -> $ENVF"
+}
+
+# ---- the address the Blimp cluster (on AWS) reaches THIS node on -------------
+# Cross-cloud the gateway can't reach a private IP, so advertise the PUBLIC
+# address by default. ADVERTISE_HOST overrides — set it to the private IP for a
+# same-VPC / same-account AWS run, or to a stable DNS name you control.
+this_host(){
+  [ -n "${ADVERTISE_HOST:-}" ] && { printf '%s' "$ADVERTISE_HOST"; return; }
+  local ip; ip=$(curl -s -m 3 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')
+  [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+# ---- stand up an Iceberg REST catalog here (docker compose) ------------------
+# A single `docker run` — no compose plugin needed on the client box (the only
+# thing that ever required it). The catalog is one container; compose bought us
+# nothing here. `docker` (or `sudo docker`) is the only dependency.
+standup_iceberg(){
+  local DKR=docker; command -v docker >/dev/null || DKR="sudo docker"
+  $DKR info >/dev/null 2>&1 || DKR="sudo docker"
+  $DKR info >/dev/null 2>&1 || die "docker not available — needed to stand up the Iceberg catalog. Install docker, or pass an existing Iceberg REST URL."
+  bold "standing up an Iceberg REST catalog on :8181 over $WAREHOUSE"
+  $DKR rm -f iceberg-rest >/dev/null 2>&1 || true
+  $DKR run -d --name iceberg-rest --restart unless-stopped -p 8181:8181 \
+    -e CATALOG_WAREHOUSE="$WAREHOUSE" \
+    -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+    -e AWS_REGION="$REGION" \
+    -e AWS_ACCESS_KEY_ID="${S3_KEY:-${CAT_AK:-${AWS_ACCESS_KEY_ID:-}}}" \
+    -e AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${CAT_SK:-${AWS_SECRET_ACCESS_KEY:-}}}" \
+    tabulario/iceberg-rest:latest >/dev/null || die "failed to start iceberg-rest"
+  for i in $(seq 1 20); do
+    curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1 && break; sleep 3
+  done
+  curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1 || die "Iceberg catalog did not come up on :8181 (check: $DKR logs iceberg-rest)"
+  ICEBERG_URL="http://$(this_host):8181"
+  bold "  Iceberg catalog up — cluster reaches it at $ICEBERG_URL"
+}
+
+# ---- create an S3 warehouse bucket here (awscli) ----------------------------
+# GUARDRAIL 1 (co-location): the Iceberg warehouse (table metadata) MUST live in
+# the SAME bucket as the source data. The gateway reads catalog metadata through
+# its single source bucket (localhost:9000 fronts ZS3_SOURCE_BUCKET only); a
+# warehouse in a *different* bucket makes every metadata read 500 → grain
+# unsampleable → the MV author refuses. So when a data bucket is known we put the
+# warehouse at s3://<data-bucket>/wh; only with no data bucket do we mint one.
+standup_bucket(){
+  command -v aws >/dev/null || die "awscli not installed — needed to create an S3 bucket. Install it, or pass an existing s3:// warehouse."
+  aws sts get-caller-identity >/dev/null 2>&1 || die "AWS creds not working — run 'aws configure' (or set AWS_PROFILE), or pass an existing s3:// warehouse."
+  local bkt="${ORIGIN_BUCKET:-blimp-wh-${CLUSTER_ID:-$(this_host | tr -d '.')}}"
+  bold "creating/using S3 warehouse bucket s3://$bkt in $REGION"
+  if [ "$REGION" = us-east-1 ]; then
+    aws s3api create-bucket --bucket "$bkt" --region "$REGION" >/dev/null 2>&1 || true
+  else
+    aws s3api create-bucket --bucket "$bkt" --region "$REGION" \
+      --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null 2>&1 || true
+  fi
+  aws s3api head-bucket --bucket "$bkt" >/dev/null 2>&1 || die "could not create/access s3://$bkt"
+  WAREHOUSE="s3://$bkt/wh"
+  bold "  warehouse -> $WAREHOUSE  (co-located with data bucket $bkt)"
+}
+
+# ---- GUARDRAIL 2 (IAM): grant BOTH the gateway instance role and the Iceberg
+# catalog principal read/write on the data+warehouse bucket. On a split like the
+# SF1 test — data written by aws-cli, catalog registered by IAM user
+# blimp-catalog-*, gateway reading via its EC2 role — any one of the three
+# lacking access is a silent 403 at author time. Same-account/VPC only (we can
+# discover the gateway role); external creds are granted by the customer bucket
+# owner instead. Merges into any existing bucket policy, never clobbers.
+grant_bucket_access(){
+  local bkt="${1:?bucket}"
+  command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1 || {
+    bold "  (skip bucket-policy grant — no AWS creds here; ensure the bucket owner grants the gateway role + catalog user s3:Get/Put/List)"; return 0; }
+  local acct; acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+  # gateway instance role ARN (same account) — discover from the running gateway
+  local role_arn=""
+  local prof; prof=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text 2>/dev/null)
+  if [ -n "$prof" ] && [ "$prof" != None ]; then
+    local pname="${prof##*/}"
+    role_arn=$(aws iam get-instance-profile --instance-profile-name "$pname" \
+      --query 'InstanceProfile.Roles[0].Arn' --output text 2>/dev/null)
+  fi
+  [ "$role_arn" = None ] && role_arn=""
+  # principals: account root (covers the catalog IAM user + aws-cli writer in this
+  # account) plus the gateway role explicitly (belt & suspenders if it's assumed).
+  local princ="\"arn:aws:iam::${acct}:root\""
+  [ -n "$role_arn" ] && princ="$princ, \"$role_arn\""
+  bold "  granting s3 access on s3://$bkt to account $acct${role_arn:+ + gateway role}"
+  local pol; pol=$(cat <<J
+{"Version":"2012-10-17","Statement":[{"Sid":"BlimpSourceAccess","Effect":"Allow","Principal":{"AWS":[${princ}]},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::${bkt}","arn:aws:s3:::${bkt}/*"]}]}
+J
+)
+  aws s3api put-bucket-policy --bucket "$bkt" --policy "$pol" >/dev/null 2>&1 \
+    && bold "  ✓ bucket policy applied to s3://$bkt" \
+    || bold "  (could not set bucket policy on s3://$bkt — may already be owned cross-account; ensure the owner grants the gateway role + catalog user)"
+}
+
+# ---- auto-assess network mode: same-VPC (private) vs external cloud (public) --
+# The ONE signal that matters: can THIS node reach the cluster gateway's PRIVATE
+# IP? Yes → vpc mode (private IPs, IAM role, VPC S3 endpoint — no egress). No
+# (non-AWS, cross-VPC, or cross-account) → external mode (stable DNS, explicit
+# creds, public advertise). Sets MODE / GW_DEFAULT / ADVERTISE_DEFAULT / CREDS_HINT.
+assess_mode(){
+  MODE=external; GW_PRIV=""; GW_PUB=""
+  local imds="http://169.254.169.254/latest/meta-data" tok
+  tok=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
+  local H=(); [ -n "$tok" ] && H=(-H "X-aws-ec2-metadata-token: $tok")
+  CLIENT_PRIV=$(curl -s -m 2 "${H[@]}" "$imds/local-ipv4" 2>/dev/null)
+  CLIENT_PUB=$(curl -s -m 2 "${H[@]}" "$imds/public-ipv4" 2>/dev/null)
+  # discover the cluster gateway's private IP (needs aws CLI + creds + a running gw)
+  if command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then
+    read -r GW_PRIV GW_PUB <<<"$(aws ec2 describe-instances --region "$REGION" \
+      --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[0].Instances[0].[PrivateIpAddress,PublicIpAddress]' --output text 2>/dev/null)"
+    [ "$GW_PRIV" = None ] && GW_PRIV=""; [ "$GW_PUB" = None ] && GW_PUB=""
+  fi
+  # authoritative probe: reach the gateway PRIVATE IP (covers same-VPC AND peered)
+  if [ -n "$GW_PRIV" ] && [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$GW_PRIV:9000/minio/health/live" 2>/dev/null)" = 200 ]; then
+    MODE=vpc
+  fi
+  # CREDENTIAL domain is decided by ACCOUNT, not network reachability. If the
+  # describe-instances above FOUND the gateway, this node's AWS identity is in
+  # the SAME account → the IAM role reaches S3 (cross-REGION is fine; S3 access
+  # is account-scoped), so NO keys are needed even when the gateway's private IP
+  # is unreachable (different region / AZ / unpeered VPC). Keys are required only
+  # when the gateway isn't discoverable from here — a different account or a
+  # non-AWS host. SAME_ACCT drives whether --setup prompts for keys.
+  SAME_ACCT=0; { [ -n "$GW_PRIV" ] || [ -n "$GW_PUB" ]; } && SAME_ACCT=1
+  if [ "$MODE" = vpc ]; then
+    GW_DEFAULT="$GW_PRIV"; ADVERTISE_DEFAULT="$CLIENT_PRIV"; CREDS_HINT="blank (IAM instance role — same VPC/account)"
+  else
+    # External NETWORK path (public DNS + advertise this node publicly)…
+    GW_DEFAULT="${GW_PUB:-zus-$CLUSTER_ID-0.zus.network}"
+    ADVERTISE_DEFAULT="${CLIENT_PUB:-$(curl -s -m3 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')}"
+    if [ "$SAME_ACCT" = 1 ]; then
+      # …but SAME account → still key-free (cross-region AWS-internal).
+      CREDS_HINT="blank (IAM instance role — same account, cross-region)"
+    else
+      CREDS_HINT="explicit S3 keys (external / cross-account)"
+    fi
+  fi
+  bold "network assessment → MODE=$MODE (gateway private ${GW_PRIV:-unknown} reachable: $([ "$MODE" = vpc ] && echo yes || echo no)$([ "$MODE" != vpc ] && [ "$SAME_ACCT" = 1 ] && echo ', same account — cross-region')"
+  echo "  gateway → $GW_DEFAULT · advertise this node as → ${ADVERTISE_DEFAULT:-<set ADVERTISE_HOST>} · S3 creds → $CREDS_HINT"
+}
+
+# ---- install the prerequisites this kit needs (idempotent) ------------------
+# So a fresh node needs nothing pre-installed: docker (stand up the catalog),
+# python venv + pyiceberg/pyarrow/boto3 (register tables + CDC appends), unzip
+# (DuckDB CLI for the query suite), aws CLI (bucket create/grant + SSM). apt
+# systems get the packages installed; anything already present is skipped; a
+# non-apt host just gets a clear per-tool hint instead of a hard failure. Set
+# BLIMP_SKIP_DEPS=1 to bypass (offline / hardened hosts). The venv path is
+# recorded to the wiring (BLIMP_PY) so the test scripts reuse it.
+ensure_deps(){
+  [ "${BLIMP_SKIP_DEPS:-0}" = 1 ] && return 0
+  bold "== checking prerequisites =="
+  if command -v apt-get >/dev/null; then
+    local want=() ; command -v docker >/dev/null || want+=(docker.io)
+    command -v unzip  >/dev/null || want+=(unzip)
+    python3 -c 'import ensurepip' 2>/dev/null || want+=(python3-venv)
+    command -v aws >/dev/null || command -v snap >/dev/null || want+=(awscli)
+    if [ "${#want[@]}" -gt 0 ]; then
+      bold "  installing: ${want[*]}"
+      sudo apt-get update -qq 2>/dev/null || true
+      sudo apt-get install -y -qq "${want[@]}" 2>&1 | tail -1 || true
+    fi
+    command -v docker >/dev/null && sudo systemctl enable --now docker >/dev/null 2>&1 || true
+    # aws CLI: prefer snap (newer) when apt's awscli is absent
+    command -v aws >/dev/null || { command -v snap >/dev/null && sudo snap install aws-cli --classic >/dev/null 2>&1 || true; }
+  else
+    command -v docker >/dev/null || echo "  ! docker not found (needed to stand up the catalog) — install it or pass an existing Iceberg URL"
+    command -v aws    >/dev/null || echo "  ! aws CLI not found (needed to create/grant the S3 bucket) — install it or pass an existing warehouse"
+  fi
+  # python venv with the Iceberg libs (register_tpcds_tables.py / seed_tpcds.py)
+  BLIMP_PY="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"
+  if ! "$BLIMP_PY" -c 'import pyiceberg' 2>/dev/null; then
+    if command -v python3 >/dev/null && python3 -c 'import ensurepip' 2>/dev/null; then
+      bold "  creating python venv + pyiceberg (one-time)…"
+      python3 -m venv "$HOME/.blimp_venv" 2>/dev/null \
+        && "$HOME/.blimp_venv/bin/pip" install -q --upgrade pip 2>/dev/null \
+        && "$HOME/.blimp_venv/bin/pip" install -q "pyiceberg[s3fs]" pyarrow boto3 2>&1 | tail -1
+      BLIMP_PY="$HOME/.blimp_venv/bin/python3"
+    fi
+  fi
+  "$BLIMP_PY" -c 'import pyiceberg' 2>/dev/null \
+    && bold "  ✓ deps ready (python: $BLIMP_PY)" \
+    || { BLIMP_PY=python3; echo "  ! pyiceberg unavailable — register/CDC steps need: pip install 'pyiceberg[s3fs]' pyarrow boto3"; }
+  export BLIMP_PY
+}
+
+cmd_setup(){
+  bold "== blimp --setup — connect a Blimp cluster to this node's data =="
+  ensure_deps
+  echo
+  REGION=$(ask REGION "AWS region" "ap-south-1")
+  CLUSTER_ID=$(ask CLUSTER_ID "Blimp cluster id (from blimp.software)")
+  [ -n "$CLUSTER_ID" ] || die "CLUSTER_ID is required (the Blimp cluster to connect)"
+  # Zero-touch: probe the private gateway path and pick vpc vs external mode, then
+  # derive the gateway address, the address we advertise this node on, and the
+  # creds default from it. Every value stays overridable via the prompts/env.
+  echo; assess_mode
+  GW=$(ask GW "Blimp gateway address" "$GW_DEFAULT")
+  # this_host() advertises ADVERTISE_HOST to the cluster; default it from the mode
+  # (private IP in vpc mode, public IP/DNS in external mode).
+  [ -n "${ADVERTISE_HOST:-}" ] || ADVERTISE_HOST="$ADVERTISE_DEFAULT"
+  export ADVERTISE_HOST
+  NAMESPACE=$(ask NAMESPACE "Iceberg namespace" "tpcds")
+
+  # --- Iceberg REST catalog: BYO or stand up ---
+  echo; bold "Iceberg REST catalog"
+  ICEBERG_URL=$(ask ICEBERG_URL "  Existing Iceberg REST URL (blank = stand one up here)")
+
+  # --- S3 endpoint + data bucket + warehouse: BYO or stand up ---
+  echo; bold "S3 / warehouse"
+  S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint (blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
+  # Ask the DATA bucket first — the warehouse (Iceberg metadata) then co-locates
+  # INSIDE it (guardrail 1). Blank data bucket + blank warehouse = mint one.
+  ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (your source S3 data lives here)")
+  WAREHOUSE=$(ask WAREHOUSE "  Warehouse s3://bucket/prefix (blank = s3://<data-bucket>/wh)" \
+    "${ORIGIN_BUCKET:+s3://$ORIGIN_BUCKET/wh}")
+  [ -n "$WAREHOUSE" ] || standup_bucket
+  [ -n "$ORIGIN_BUCKET" ] || ORIGIN_BUCKET=$(echo "$WAREHOUSE" | sed -E 's#^s3://([^/]+).*#\1#')
+  # Guardrail 1 enforcement: warn loudly if warehouse and data bucket diverge — a
+  # split makes the gateway's catalog-metadata reads 500 and the MV author refuse.
+  local wh_bkt; wh_bkt=$(echo "$WAREHOUSE" | sed -E 's#^s3://([^/]+).*#\1#')
+  if [ -n "$ORIGIN_BUCKET" ] && [ "$wh_bkt" != "$ORIGIN_BUCKET" ]; then
+    printf '\033[33m  ⚠ warehouse bucket (%s) ≠ data bucket (%s). The gateway serves catalog\n    metadata only from the data bucket; a split will make MV authoring fail.\n    Recommended: use s3://%s/wh. Continue anyway? [y/N] \033[0m' "$wh_bkt" "$ORIGIN_BUCKET" "$ORIGIN_BUCKET" >&2
+    local yn; read -r yn </dev/tty || true
+    [ "${yn:-N}" = y ] || [ "${yn:-N}" = Y ] || WAREHOUSE="s3://$ORIGIN_BUCKET/wh"
+  fi
+  # Explicit S3 keys are REQUIRED only when this node's AWS identity can't reach
+  # the bucket via a role — i.e. a DIFFERENT account or a non-AWS host. We ask
+  # ONLY then. vpc mode (same VPC) and external-but-SAME-account (cross-region /
+  # unpeered VPC) both use the IAM instance role, so no prompt — asking-then-blank
+  # was noise and a stray "none" poisons the catalog. A pre-set S3_KEY still wins.
+  if { [ "${MODE:-external}" = external ] && [ "${SAME_ACCT:-0}" != 1 ]; } || [ -n "${S3_KEY:-}" ]; then
+    S3_KEY=$(ask S3_KEY "  S3 access key ($CREDS_HINT)")
+    S3_SECRET=$(ask S3_SECRET "  S3 secret key (required cross-account)")
+  fi
+  # Treat a blank / whitespace / literal "none" as "use the IAM role" — never
+  # hand a bogus key to the catalog or gateway.
+  case "$(printf '%s' "${S3_KEY:-}" | tr -d '[:space:]')" in ""|none|None|NONE) S3_KEY=""; S3_SECRET="";; esac
+
+  # Guardrail 2: grant the gateway role + catalog principal access to the bucket
+  # (same-account only; no-op with a clear hint when we can't).
+  [ -n "$ORIGIN_BUCKET" ] && grant_bucket_access "$ORIGIN_BUCKET"
+
+  # stand up the catalog now that WAREHOUSE is known
+  [ -n "$ICEBERG_URL" ] || standup_iceberg
+
+  save_env
+
+  # --- how the Blimp cluster connects to this source ---
+  # Only show the S3-key lines when keys are actually in play (external mode).
+  # In vpc mode omit them entirely — the gateway uses its IAM role, so there is
+  # no "secret you entered" to echo.
+  local cred_lines=""
+  if [ -n "${S3_KEY:-}" ]; then
+    cred_lines="    S3 access key    : $S3_KEY
+    S3 secret key    : •••• (the secret you entered above)"
+  else
+    cred_lines="    S3 credentials   : none — gateway reads via its IAM instance role"
+  fi
+  echo; bold "================= POINT THE BLIMP CLUSTER AT THIS SOURCE ================="
+  cat <<OUT
+  In the cluster UI → Query Optimizer → Production (BYO Iceberg source):
+    Iceberg REST URL : $ICEBERG_URL
+    Warehouse        : $WAREHOUSE
+    S3 endpoint      : $S3_ENDPOINT
+$cred_lines
+    Namespace        : $NAMESPACE
+
+  Then push data changes and refresh MVs incrementally with:
+    curl -X POST http://$GW:9000/admin/source/snapshot_changed \\
+      -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \\
+      -d '{"namespace":"$NAMESPACE","table":"<table>","trigger":"customer"}'
+
+  Make sure the cluster gateway can reach this node on :8181 (security group / firewall).
+==========================================================================
+OUT
+  echo; bold "setup done — validate with:  blimp --query    (and  blimp --storage )"
+}
+
+# ---- tests: source the saved wiring, then hand off to the suites -------------
+# No wiring yet? Offer to run --setup right here (interactive terminals only)
+# instead of just erroring — a first-time user can type `blimp --query` and be
+# walked through setup, then the test runs. Non-interactive callers still die
+# with the clear message.
+need_env(){
+  if [ ! -f "$ENVF" ]; then
+    if [ -t 0 ] || [ -e /dev/tty ]; then
+      printf 'No wiring yet. Run blimp --setup now? [Y/n] ' >&2
+      local yn; read -r yn </dev/tty 2>/dev/null || yn=n
+      case "${yn:-Y}" in n|N) die "run 'blimp --setup' first (or set BLIMP_ENV)";; esac
+      cmd_setup
+    else
+      die "no wiring yet — run 'blimp --setup' first (or set BLIMP_ENV)."
+    fi
+  fi
+  # shellcheck disable=SC1090
+  . "$ENVF"
+  GW="${GW:-${GATEWAY:-}}"; export GW GATEWAY="$GW"
+}
+
+cmd_storage(){
+  need_env
+  : "${GW:?gateway missing in wiring}" "${REGION:?}"
+  [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
+  [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
+  ORIGIN_BUCKET="${ORIGIN_BUCKET:-$(ask ORIGIN_BUCKET "Origin S3 bucket (read-through cache)")}"
+  exec env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
+    REGION="$REGION" NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh"
+}
+
+cmd_query(){
+  need_env
+  : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
+  exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
+    NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" bash "$HERE/test_query.sh"
+}
+
+cmd_bench(){
+  need_env
+  : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
+  # statistical profile: one-time author_ms + materialize_ms, and per-append
+  # delta_merge_ms + materialize_ms (min/median/avg/max). Tune ITERS / AUTHOR_ITERS
+  # / CDC_ROWS to size the sweep and the delta.
+  exec env GW="$GW" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" CLUSTER_ID="$CLUSTER_ID" \
+    ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" NAMESPACE="${NAMESPACE:-tpcds}" \
+    REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-5}" AUTHOR_ITERS="${AUTHOR_ITERS:-5}" \
+    CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh"
+}
+
+case "${1:-}" in
+  --setup)            cmd_setup ;;
+  --storage|storage)  cmd_storage ;;
+  --query|query)      cmd_query ;;
+  --bench|bench)      cmd_bench ;;
+  --all|all)          ( "$0" --storage ); "$0" --query ;;
+  ""|-h|--help|help)  usage ;;
+  *)                  echo "unknown command: $1"; echo; usage; exit 2 ;;
+esac

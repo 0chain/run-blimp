@@ -1,7 +1,20 @@
-# Blimp prod-source kit — an Iceberg REST catalog + S3 warehouse you run in YOUR
-# environment, so a Blimp cloud-native cluster can query it via the Production tab
-# (BYO source). Mirrors the reference prod-test setup: tabulario/iceberg-rest
-# (JDBC/SQLite catalog) over an S3 (or MinIO) warehouse.
+# Blimp prod-source kit — one `docker compose up` on ANY Docker host gives you
+# both halves the client node needs, with zero host prep:
+#
+#   • iceberg-rest : your Iceberg REST catalog (:8181) over an S3 warehouse —
+#                    the endpoint you point the Blimp cluster at (Production tab).
+#   • blimp        : the CLI image (python+pyiceberg, aws, duckdb, the kit) —
+#                    connects the cluster to your data and validates it.
+#
+# Zero-touch usage on an EC2 node in the cluster's VPC (IAM instance role, no keys):
+#
+#   export CLUSTER_ID=1784970467881 WAREHOUSE=s3://my-bucket/wh AWS_REGION=ap-south-1
+#   docker compose up -d iceberg-rest         # catalog comes up on :8181
+#   docker compose run --rm blimp --setup     # connect + save wiring (once)
+#   docker compose run --rm blimp --query     # author → CDC delta-merge
+#   docker compose run --rm blimp --storage   # storage & cache suite
+#
+# Cross-cloud / cross-account? set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY too.
 services:
   iceberg-rest:
     image: tabulario/iceberg-rest:latest
@@ -19,12 +32,36 @@ services:
       CATALOG_JDBC_PASSWORD: password
       CATALOG_WAREHOUSE: ${WAREHOUSE}                 # e.g. s3://my-bucket/iceberg_wh
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      AWS_REGION: ${AWS_REGION}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      # Blank in vpc/same-account mode → the catalog uses the node's IAM role.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       # For MinIO / S3-compatible stores, also set:
       #   CATALOG_S3_ENDPOINT: http://minio:9000
       #   CATALOG_S3_PATH__STYLE__ACCESS: "true"
     volumes:
       - ./catalog:/catalog             # sqlite db — MUST be writable (dir + file)
     restart: unless-stopped
+
+  blimp:
+    build: .
+    image: 0chaindev/blimp-kit:latest
+    # host networking so the CLI reaches the cluster gateway's PRIVATE IP and the
+    # EC2 instance metadata service (169.254.169.254) for the IAM-role creds —
+    # that's what makes vpc mode truly key-free.
+    network_mode: host
+    environment:
+      CLUSTER_ID: ${CLUSTER_ID:-}
+      REGION: ${AWS_REGION:-ap-south-1}
+      WAREHOUSE: ${WAREHOUSE:-}
+      ORIGIN_BUCKET: ${ORIGIN_BUCKET:-}
+      NAMESPACE: ${NAMESPACE:-tpcds}
+      # The catalog above is reachable on the host at :8181.
+      ICEBERG_URL: ${ICEBERG_URL:-http://localhost:8181}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    volumes:
+      - ./state:/kit/state             # persists ~/.blimp_env wiring across runs
+      - ./tpcds_queries:/root/tpcds_queries   # generated query set (reused)
+    # ENTRYPOINT is `blimp`; args come from `docker compose run blimp <args>`.
+    profiles: ["cli"]                  # only runs on explicit `run`, never `up`

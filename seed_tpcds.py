@@ -49,6 +49,50 @@ def main():
             "ss_ext_sales_price":D(1,5000),"ss_ext_wholesale_cost":D(1,3000),"ss_net_profit":D(-500,4000),
             "ss_sales_price":D(1,300),"ss_list_price":D(1,400),"ss_ext_discount_amt":D(0,1000),
             "ss_ext_list_price":D(1,6000)},schema=schema)
+    elif a.table=="catalog_sales":
+        # keys+measures for the catalog-fact CDC queries (q15: bill_customer/
+        # sold_date/sales_price; q99: ship_date/warehouse/ship_mode/call_center)
+        store_col="cs_call_center_sk"
+        schema=pa.schema([("cs_sold_date_sk",pa.int32()),("cs_ship_date_sk",pa.int32()),
+            ("cs_item_sk",pa.int32()),("cs_bill_customer_sk",pa.int32()),
+            ("cs_warehouse_sk",pa.int32()),("cs_ship_mode_sk",pa.int32()),
+            ("cs_call_center_sk",pa.int32()),("cs_quantity",pa.int32()),
+            ("cs_sales_price",pa.decimal128(7,2)),("cs_ext_sales_price",pa.decimal128(7,2)),
+            ("cs_net_profit",pa.decimal128(7,2))])
+        cc_pool=[a.upsert_store_sk]*n if a.mode=="upsert" else [random.randint(1,6) for _ in range(n)]
+        sold=[random.randint(2451545,2451910) for _ in range(n)]
+        tbl_data=pa.table({
+            "cs_sold_date_sk":sold,
+            "cs_ship_date_sk":[d+random.randint(2,90) for d in sold],
+            "cs_item_sk":[random.randint(1,300000) for _ in range(n)],
+            "cs_bill_customer_sk":[random.randint(1,2000000) for _ in range(n)],
+            "cs_warehouse_sk":[random.randint(1,20) for _ in range(n)],
+            "cs_ship_mode_sk":[random.randint(1,20) for _ in range(n)],
+            "cs_call_center_sk":cc_pool,
+            "cs_quantity":[random.randint(1,100) for _ in range(n)],
+            "cs_sales_price":D(1,300),"cs_ext_sales_price":D(1,5000),"cs_net_profit":D(-500,4000)},schema=schema)
+    elif a.table=="web_sales":
+        # q45: bill_customer/sold_date/item/sales_price; q62: ship_date/warehouse/
+        # ship_mode/web_site
+        store_col="ws_web_site_sk"
+        schema=pa.schema([("ws_sold_date_sk",pa.int32()),("ws_ship_date_sk",pa.int32()),
+            ("ws_item_sk",pa.int32()),("ws_bill_customer_sk",pa.int32()),
+            ("ws_warehouse_sk",pa.int32()),("ws_ship_mode_sk",pa.int32()),
+            ("ws_web_site_sk",pa.int32()),("ws_quantity",pa.int32()),
+            ("ws_sales_price",pa.decimal128(7,2)),("ws_ext_sales_price",pa.decimal128(7,2)),
+            ("ws_net_profit",pa.decimal128(7,2))])
+        ws_pool=[a.upsert_store_sk]*n if a.mode=="upsert" else [random.randint(1,30) for _ in range(n)]
+        sold=[random.randint(2451545,2451910) for _ in range(n)]
+        tbl_data=pa.table({
+            "ws_sold_date_sk":sold,
+            "ws_ship_date_sk":[d+random.randint(2,90) for d in sold],
+            "ws_item_sk":[random.randint(1,300000) for _ in range(n)],
+            "ws_bill_customer_sk":[random.randint(1,2000000) for _ in range(n)],
+            "ws_warehouse_sk":[random.randint(1,20) for _ in range(n)],
+            "ws_ship_mode_sk":[random.randint(1,20) for _ in range(n)],
+            "ws_web_site_sk":ws_pool,
+            "ws_quantity":[random.randint(1,100) for _ in range(n)],
+            "ws_sales_price":D(1,300),"ws_ext_sales_price":D(1,5000),"ws_net_profit":D(-500,4000)},schema=schema)
     else:  # store_returns (default)
         store_col="sr_store_sk"
         schema=pa.schema([("sr_customer_sk",pa.int32()),("sr_store_sk",pa.int32()),
