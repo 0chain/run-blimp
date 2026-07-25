@@ -180,8 +180,8 @@ serves without re-author, CDC keeps merging.
 
 - **[WALKTHROUGH.md](WALKTHROUGH.md)** — the same flow as a full transcript: every
   command and its real output, start to finish, on a fresh node.
-- Product docs: [blimp.software](https://blimp.software) — the optimizer, incremental
-  MVs (CDC), and the Prod-Query & MV API.
+- Product docs: [docs.zus.network/zus-docs/webapps/blimp](https://docs.zus.network/zus-docs/webapps/blimp)
+  — the optimizer, incremental MVs (CDC), and the Prod-Query & MV API.
 
 ---
 
