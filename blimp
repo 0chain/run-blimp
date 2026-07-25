@@ -12,10 +12,9 @@
 #   blimp --query         TEST: query + CDC suite (author → append → delta-merge).
 #   blimp --bench         BENCH: statistical author / materialize / delta-merge
 #                         timing profile (min/median/avg/max over N iterations).
-#   blimp --all           TEST: --storage then --query.
 #
 # Wiring is saved to ~/.blimp_env (override path with BLIMP_ENV). --setup writes
-# it; --storage/--query/--all read it (and prompt for anything still missing).
+# it; --storage/--query read it (and prompt for anything still missing).
 # Non-interactive: pre-set the env vars (REGION, CLUSTER_ID, GW, ICEBERG_URL,
 # WAREHOUSE, ORIGIN_BUCKET, NAMESPACE, GW_AK, GW_SK) and they won't be asked.
 # ==============================================================================
@@ -47,7 +46,6 @@ usage(){
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
   blimp --bench      Bench: author / materialize / delta-merge timing profile
                      (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
-  blimp --all        Test: storage then query.
 
   Wiring is read from / written to ~/.blimp_env  (set BLIMP_ENV to relocate).
 H
@@ -436,7 +434,6 @@ case "${1:-}" in
   --storage|storage)  cmd_storage ;;
   --query|query)      cmd_query ;;
   --bench|bench)      cmd_bench ;;
-  --all|all)          ( "$0" --storage ); "$0" --query ;;
   ""|-h|--help|help)  usage ;;
   *)                  echo "unknown command: $1"; echo; usage; exit 2 ;;
 esac

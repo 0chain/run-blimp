@@ -2,31 +2,29 @@
 
 ## Blimp
 
-**Efficient data. Simple, small, scalable cache and MVs — autonomous operation as a sidecar to your existing production pipeline.**
+Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per Blimp node) that keeps your AI/ML context fresh with CDC delta-merges in seconds. One small, simple, scalable Blimp node runs in your own VPC; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost. → [blimp.software](https://blimp.software)
 
-Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per node) that keeps your AI/ML context fresh with CDC delta-merges in seconds. One small, simple, scalable node runs in your own VPC; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost — no data migration, no rewrites. → [blimp.software](https://blimp.software)
-
-
-`blimp` connects a Blimp cloud-native cluster to **your** data and keeps it fresh.
-Run it on your own node — same VPC as the cluster, a peered / different-region VPC,
-or a different cloud entirely. It wires the cluster's query optimizer + read-through
-cache to your Iceberg + S3 data (or **stands the source up for you** if you have
-none), authors materialized views, and delta-merges each change via a webhook your
-pipeline fires on commit. Your data stays in your environment; Blimp only reads it.
+`blimp` connects a **Blimp node** to **your** data and keeps it fresh. Run it on
+your own **Iceberg node** — same VPC as the Blimp node, a peered / different-region
+VPC, or a different cloud entirely. It wires the Blimp node's query optimizer +
+read-through cache to your Iceberg + S3 data (or **stands the source up for you** if
+you have none), authors materialized views, and delta-merges each change via a
+webhook your pipeline fires on commit. Your data stays in your environment; Blimp
+only reads it.
 
 ```
-   ┌─ your node (any cloud) ─┐         ┌── Blimp cluster (AWS) ──┐
-   │  blimp CLI              │         │  gateway                │
-   │  Iceberg REST  :8181  ──┼────────▶│   S3 :9000 · router     │
-   │  your S3 / MinIO data   │  wire   │   eblobbers             │
-   └───────────┬─────────────┘         └───────────┬─────────────┘
-               └───── snapshot_changed webhook ─────┘
-                     (your pipeline, on each Iceberg commit)
+   ┌─ your Iceberg node (any cloud) ─┐     ┌──── Blimp node (AWS) ────┐
+   │  blimp CLI                      │     │  gateway                 │
+   │  Iceberg REST  :8181  ──────────┼────▶│   S3 :9000 · router      │
+   │  your S3 / MinIO data           │ wire│   eblobbers              │
+   └───────────────┬─────────────────┘     └───────────┬──────────────┘
+                   └────── snapshot_changed webhook ─────┘
+                          (your pipeline, on each Iceberg commit)
 ```
 
-Vpc-mode reaches the gateway on its private IP with the node's IAM role (no keys);
-cross-region / cross-account / non-AWS reach it over public DNS. `blimp --setup`
-detects which and wires it accordingly.
+Vpc-mode reaches the Blimp node's gateway on its private IP with the Iceberg node's
+IAM role (no keys); cross-region / cross-account / non-AWS reach it over public DNS.
+`blimp --setup` detects which and wires it accordingly.
 
 
 ## Install
@@ -39,7 +37,7 @@ prerequisites on first `--setup`. Two supported ways to get it:
 curl -fsSL https://raw.githubusercontent.com/0chain/run-blimp/main/install.sh | sh
 
 # 2. or just clone and run in place
-git clone https://github.com/0chain/run-blimp && cd test-blimp && ./blimp
+git clone https://github.com/0chain/run-blimp && cd run-blimp && ./blimp
 ```
 
 You need **nothing** pre-installed — `blimp --setup` installs what it uses
@@ -60,21 +58,20 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 
 ```
 blimp                 list the commands
-blimp --setup         connect a Blimp cluster to this node's data (interactive)
-blimp --query         test: query optimizer + incremental CDC (q1 delta-merge)
-blimp --storage       test: storage & read-through cache suite
-blimp --bench         bench: author / materialize / delta-merge timing profile
-blimp --all           --storage then --query
+blimp --setup         connect a Blimp node to your data (interactive)
+blimp --query         query optimizer + incremental CDC (q1 delta-merge)
+blimp --storage       storage & read-through cache suite
+blimp --bench         author / materialize / delta-merge timing profile
 ```
 
-Wiring is saved to `~/.blimp_env` by `--setup`; every test command reads it.
-**Running a test with no wiring offers to run `--setup` for you first.**
+Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
+**Running a command with no wiring offers to run `--setup` for you first.**
 
-### Step 1 — create a cluster
+### Step 1 — create a Blimp node
 
-blimp.software → Create Cluster. Note the **cluster id**.
+blimp.software → Create a Blimp node. Note the **node id**.
 
-### Step 2 — `./blimp --setup` on your node
+### Step 2 — `./blimp --setup` on your Iceberg node
 
 Fully **interactive** — every value is prompted with a default (Enter accepts);
 any env var already set skips its prompt (that's the zero-touch/CI path):
@@ -108,7 +105,7 @@ Guardrails `--setup` enforces (each is a real failure mode):
 3. **Blank keys = IAM instance role** — the correct vpc answer; real keys are
    only ever typed in external mode.
 
-At the end it prints the exact values for the cluster UI (Query Optimizer →
+At the end it prints the exact values for the Blimp node UI (Query Optimizer →
 Production) and the `snapshot_changed` webhook for your pipeline.
 
 ### Step 3 — register your tables (if not already Iceberg)
@@ -121,9 +118,9 @@ venv/bin/python3 register_tpcds_tables.py \
 
 (`add_files` registration — no data copy.)
 
-### Step 4 — point the cluster at the source
+### Step 4 — point the Blimp node at the source
 
-Paste `--setup`'s printed values into the cluster UI (Production tab) — or,
+Paste `--setup`'s printed values into the Blimp node UI (Production tab) — or,
 scripted (SSH/SSM as root on the gateway):
 
 ```
@@ -132,7 +129,7 @@ ORIGIN_BUCKET=my-bucket S3_REGION=ap-south-1 bash hookup_cluster_source.sh
 ```
 
 > Firewall: the gateway must reach this node on the catalog port. If the
-> cluster SG doesn't open 8181, serve the catalog on an open port
+> Blimp node security group doesn't open 8181, serve the catalog on an open port
 > (e.g. `docker run -p 8081:8181 …`) and use that URL.
 
 ### Step 5 — `./blimp --query` (prove authoring + CDC)
@@ -163,7 +160,7 @@ proves both invariants: **router ON** → an append still changes the served
 result (immutable Iceberg files = new keys = no stale hit); **router OFF** →
 a source read writes **zero** bytes to the cache.
 
-### Step 8 — cluster stop/start (self-heal, no touch)
+### Step 8 — Blimp node stop/start (self-heal, no touch)
 
 Raw EC2 stop/start: private IPs survive (in-VPC wiring reconnects untouched);
 public IPs change and the control plane's 60s cron reconciles the DB + every
@@ -175,8 +172,8 @@ persist — re-run `--query`: the MV serves without re-author, CDC keeps merging
 - **vpc mode: nothing typed.** Node + gateway each use their IAM instance
   role (EC2 metadata); bucket access is a policy naming the role.
 - **external mode:** S3 keys typed once into `--setup` (`~/.blimp_env`,
-  mode 600); pasted into the cluster UI they are stored in **AWS Secrets
-  Manager** — only the ARN reaches cluster config, never state/logs.
+  mode 600); pasted into the Blimp node UI they are stored in **AWS Secrets
+  Manager** — only the ARN reaches Blimp node config, never state/logs.
 - Gateway admin API: `Authorization: Bearer zus-<CLUSTER_ID>`.
 
 ---
