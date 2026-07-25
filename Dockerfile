@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir "pyiceberg[s3fs]" pyarrow boto3 duckdb
 
 # --- the kit
 WORKDIR /kit
-COPY blimp register_tpcds_tables.py seed_tpcds.py hookup_cluster_source.sh \
+COPY blimp register_tpcds_tables.py seed_tpcds.py hookup_cluster_source.sh standup_data.sh \
      test_query.sh bench_cdc.sh bench_incremental.sh test_cache.sh \
      run_cluster.sh run_router.sh test_router_freshness.sh /kit/
 RUN chmod +x /kit/blimp /kit/*.sh || true; \

@@ -285,16 +285,28 @@ cmd_setup(){
   echo; bold "Iceberg REST catalog"
   ICEBERG_URL=$(ask ICEBERG_URL "  Existing Iceberg REST URL (blank = stand one up here)")
 
-  # --- S3 endpoint + data bucket + warehouse: BYO or stand up ---
+  # --- S3 endpoint + data bucket + warehouse ---
+  # Two scenarios: (a) you HAVE data — give the bucket; (b) you have NONE — leave
+  # it blank and we generate a real TPC-DS SF1 (~1 GB) source for you: an S3 bucket
+  # in THIS box's region (AWS), or a MinIO server on this box (non-AWS). Either way
+  # standup_data emits ORIGIN_BUCKET/WAREHOUSE/S3_ENDPOINT/keys/REGION, and we
+  # auto-register the 24 tables after the catalog is up (DATA_GENERATED gate).
   echo; bold "S3 / warehouse"
-  S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint (blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
-  # Ask the DATA bucket first — the warehouse (Iceberg metadata) then co-locates
-  # INSIDE it (guardrail 1). Blank data bucket + blank warehouse = mint one.
-  ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (your source S3 data lives here)")
+  DATA_GENERATED=0
+  ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (blank = generate a TPC-DS SF1 source here)")
+  if [ -z "$ORIGIN_BUCKET" ]; then
+    bold "  no data bucket given — generating a TPC-DS SF1 (~1 GB) source"
+    local gen; gen=$(REGION="$REGION" CLUSTER_ID="$CLUSTER_ID" ADVERTISE_HOST="${ADVERTISE_HOST:-}" \
+      bash "$HERE/standup_data.sh") || die "SF1 data standup failed"
+    eval "$gen"                      # sets ORIGIN_BUCKET WAREHOUSE S3_ENDPOINT [S3_KEY S3_SECRET] REGION
+    DATA_GENERATED=1
+    bold "  SF1 source → bucket $ORIGIN_BUCKET · endpoint $S3_ENDPOINT · region $REGION"
+  else
+    S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint (blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
+  fi
+  # Warehouse (Iceberg metadata) co-locates INSIDE the data bucket (guardrail 1).
   WAREHOUSE=$(ask WAREHOUSE "  Warehouse s3://bucket/prefix (blank = s3://<data-bucket>/wh)" \
     "${ORIGIN_BUCKET:+s3://$ORIGIN_BUCKET/wh}")
-  [ -n "$WAREHOUSE" ] || standup_bucket
-  [ -n "$ORIGIN_BUCKET" ] || ORIGIN_BUCKET=$(echo "$WAREHOUSE" | sed -E 's#^s3://([^/]+).*#\1#')
   # Guardrail 1 enforcement: warn loudly if warehouse and data bucket diverge — a
   # split makes the gateway's catalog-metadata reads 500 and the MV author refuse.
   local wh_bkt; wh_bkt=$(echo "$WAREHOUSE" | sed -E 's#^s3://([^/]+).*#\1#')
@@ -322,6 +334,19 @@ cmd_setup(){
 
   # stand up the catalog now that WAREHOUSE is known
   [ -n "$ICEBERG_URL" ] || standup_iceberg
+
+  # Scenario (b): we generated an SF1 source — register its 24 tables into the
+  # catalog now (BYO-data users register their own with register_tpcds_tables.py).
+  # register runs LOCALLY, so it reaches the catalog + MinIO on localhost.
+  if [ "${DATA_GENERATED:-0}" = 1 ]; then
+    bold "registering the 24 TPC-DS SF1 tables into the catalog"
+    local reg_ep=""; case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint http://localhost:9000";; esac
+    AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+      "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog http://localhost:8181 \
+      --warehouse "$WAREHOUSE" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
+      --namespace "$NAMESPACE" $reg_ep 2>&1 | tail -3 \
+      || bold "  (auto-register had issues — re-run register_tpcds_tables.py manually)"
+  fi
 
   save_env
 
