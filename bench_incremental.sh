@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # bench_incremental.sh — statistical timing profile for the MV lifecycle:
-#   A) one-time author+shape+materialize × AUTHOR_ITERS — STRUCTURALLY distinct
-#      TPC-DS queries not yet on this cluster (constant-varied clones of an
-#      existing query scheme-match to the same MV in ~50 ms and never author).
+#   A) COLD author+shape+materialize of q1 × AUTHOR_ITERS — same query each time,
+#      but the MV is EVICTED (deleted) after every build so the next iteration
+#      re-authors from scratch (force_author). A repeatable cold-build measurement.
 #   B) append → incremental refresh × ITERS
 # Measured INLINE: commit + snapshot_changed, then POST query/run — the serve-time
 # freshness gate re-materializes and reports materialize_ms + query_ms; the wave
@@ -44,7 +44,15 @@ order by c_customer_id limit 100'
 
 run_sql(){ curl -s -m 900 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer"}))' "$1")"; }
+  -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","force_author":len(sys.argv)>2 and sys.argv[2]=="1"}))' "$1" "${2:-0}")"; }
+
+# evict an MV so the NEXT identical query re-authors from scratch (clears the
+# sigcache row + warehouse bytes — copied from run.sh's \evict). The author-timing
+# loop calls this after each build so every iteration is a genuine COLD author.
+evict_mv(){ # <namespace> <table>
+  [ -n "${2:-}" ] || return 0
+  curl -s -m 30 -X DELETE "$QAPI/admin/mv/delete?namespace=${1:-tpcds_mv}&table=$2" \
+    -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1; }
 
 stats(){ python3 -c "
 import sys,statistics as st
@@ -58,27 +66,25 @@ registered_sigs(){ curl -s -m 20 "$QAPI/admin/mv/registered_queries" -H "Authori
 
 echo "== MV lifecycle benchmark v2: cluster $CLUSTER_ID (authors=$AUTHOR_ITERS, appends=$ITERS, upserts=$ITERS, rows/cycle=$CDC_ROWS) =="
 
-# ---- A) one-time author+shape+materialize on structurally distinct queries --------
-# Pick TPC-DS queries not yet registered here; a fresh author reports
-# author_ms>0 (fastpath reuse reports none and is EXCLUDED, printed as 'reused').
+# ---- A) COLD author of q1, AUTHOR_ITERS times, EVICTING after each ----------------
+# Same query (q1) every iteration, but the MV is DELETED right after it's built, so
+# the next iteration re-authors from scratch — a repeatable COLD author+materialize
+# measurement (not a warm fastpath reuse, which reports no author_ms). force_author
+# forces the deterministic build even before the evict has propagated.
 A_AUTH=(); A_MAT=(); A_WALL=(); A_DONE=0
-if [ -d "$Q_DIR" ]; then
-  for qf in $(ls "$Q_DIR"/q*.sql 2>/dev/null | sort -V); do
-    [ "$A_DONE" -ge "$AUTHOR_ITERS" ] && break
-    SQL=$(cat "$qf")
-    T0=$(now); R=$(run_sql "$SQL"); T1=$(now)
-    ST=$(echo "$R" | J status); AU=$(echo "$R" | J author_ms); MA=$(echo "$R" | J materialize_ms)
-    W=$(el "$T0" "$T1")
-    if [ -n "$AU" ] && [ "${AU%.*}" -gt 0 ] 2>/dev/null; then
-      A_AUTH+=("$AU"); A_MAT+=("${MA:-0}"); A_WALL+=("$W"); A_DONE=$((A_DONE+1))
-      echo "  author[$A_DONE] $(basename "$qf") status=$ST author_ms=$AU materialize_ms=${MA:-?} wall_ms=$W"
-    else
-      echo "  skip $(basename "$qf") status=$ST (reused/no-author, wall_ms=$W)"
-    fi
-  done
-else
-  echo "  WARN: $Q_DIR missing — generate with the duckdb tpcds extension; skipping author class"
-fi
+for i in $(seq 1 "$AUTHOR_ITERS"); do
+  T0=$(now); R=$(run_sql "$Q1" 1); T1=$(now)            # force_author=1
+  ST=$(echo "$R" | J status); AU=$(echo "$R" | J author_ms); MA=$(echo "$R" | J materialize_ms)
+  MVNS=$(echo "$R" | J mv_namespace); MVTB=$(echo "$R" | J mv_table); W=$(el "$T0" "$T1")
+  if [ -n "$AU" ] && [ "${AU%.*}" -gt 0 ] 2>/dev/null; then
+    A_AUTH+=("$AU"); A_MAT+=("${MA:-0}"); A_WALL+=("$W"); A_DONE=$((A_DONE+1))
+    echo "  author[$i] q1 COLD status=$ST author_ms=$AU materialize_ms=${MA:-?} wall_ms=$W mv=${MVTB:-?}"
+  else
+    echo "  author[$i] q1 status=$ST (no author_ms — served warm; evicting to force cold next) wall_ms=$W"
+  fi
+  evict_mv "${MVNS:-tpcds_mv}" "$MVTB"                  # drop it → next iteration is cold
+  sleep 1
+done
 
 cycle(){ # cycle <label> <seed-extra-args...> — commit, webhook, inline re-serve
   local label="$1"; shift
