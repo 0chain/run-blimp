@@ -84,6 +84,8 @@ vals["ZS3_SRC_CUSTOMER_S3_SECRET"]     = os.environ["HK_SECRET"]
 vals["ZS3_SRC_CUSTOMER_S3_REGION"]     = os.environ["HK_REGION"]
 vals["ZS3_SRC_CUSTOMER_BUCKET"]        = os.environ["HK_BUCKET"]
 vals["ZS3_SRC_CUSTOMER_APPEND_ENABLED"]= "true"
+vals["ZS3_SRC_CUSTOMER_VIA_ROUTER"]    = "1"
+vals["ZS3_SRC_CUSTOMER_ROUTER_BASE"]   = "http://" + os.environ["HK_GWPRIV"] + ":8088"
 missing = []
 for k, v in vals.items():
     pat = re.compile(r'^(\s+%s:\s*).*$' % re.escape(k), re.M)
