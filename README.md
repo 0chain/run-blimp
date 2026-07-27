@@ -114,8 +114,35 @@ Guardrails `--setup` enforces (each is a real failure mode):
 3. **Blank keys = IAM instance role** — the correct vpc answer; real keys are
    only ever typed in external mode.
 
-At the end it prints the exact values for the Blimp node UI (Query Optimizer →
-Production) and the `snapshot_changed` webhook for your pipeline.
+**What `--setup` does, in order:**
+
+1. **Deps bootstrap** — installs docker / python venv + pyiceberg / aws CLI /
+   unzip if missing (`BLIMP_SKIP_DEPS=1` to manage yourself).
+2. **Network assessment** — probes the gateway's private IP → picks vpc mode
+   (IAM role, no keys) or external mode (public DNS, explicit keys).
+3. **Catalog** — reuses your Iceberg REST URL, or stands one up here via
+   `docker run` (iceberg-rest on :8181 over your warehouse).
+4. **Bucket grant** (vpc/same-account) — applies the bucket policy so the
+   gateway role can read; skipped in external mode (bring your own grant).
+5. **Saves the wiring** to `~/.blimp_env` (mode 600) for every later command.
+6. **Wires the Blimp node over its admin API** — no SSH, no restart:
+
+   ```
+   POST http://<gateway>:9000/admin/source/configure
+   Authorization: Bearer zus-<CLUSTER_ID>
+   {"source":"customer","iceberg_url":"http://<node>:8181","warehouse":"s3://…/wh",
+    "namespace":"…","bucket":"…","s3_key":"…","s3_secret":"…","s3_region":"…"}
+   ```
+
+   The gateway applies this to its **live** source config (`ZS3_SRC_CUSTOMER_*`)
+   — the very next query reads your data — and persists it so restarts keep the
+   wiring. Keys travel over the authenticated admin API and are stored root-only
+   on the gateway volume. On success `--setup` prints
+   `✓ cluster wired: source=customer … (live, no restart)`.
+
+Finally it prints the same values for the Blimp node UI (Query Optimizer →
+Production, the manual path) and the `snapshot_changed` webhook for your
+pipeline.
 
 ### Step 3 — register your tables (if not already Iceberg)
 
