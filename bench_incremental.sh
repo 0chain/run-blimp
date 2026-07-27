@@ -42,6 +42,16 @@ where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
   and ctr1.ctr_customer_sk = c_customer_sk
 order by c_customer_id limit 100'
 
+# BENCH_QNR: bench a different TPC-DS query (reads $Q_DIR/q<N>.sql, e.g.
+# BENCH_QNR=64). Default stays the built-in q1. Labels below follow suit.
+BENCH_QNR="${BENCH_QNR:-1}"
+if [ "$BENCH_QNR" != "1" ]; then
+  QF="$Q_DIR/q${BENCH_QNR}.sql"
+  [ -f "$QF" ] || { echo "FATAL: BENCH_QNR=$BENCH_QNR but no $QF"; exit 1; }
+  Q1="$(cat "$QF")"
+fi
+QLABEL="q${BENCH_QNR}"
+
 run_sql(){ curl -s -m 900 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","force_author":len(sys.argv)>2 and sys.argv[2]=="1"}))' "$1" "${2:-0}")"; }
@@ -78,9 +88,9 @@ for i in $(seq 1 "$AUTHOR_ITERS"); do
   MVNS=$(echo "$R" | J mv_namespace); MVTB=$(echo "$R" | J mv_table); W=$(el "$T0" "$T1")
   if [ -n "$AU" ] && [ "${AU%.*}" -gt 0 ] 2>/dev/null; then
     A_AUTH+=("$AU"); A_MAT+=("${MA:-0}"); A_WALL+=("$W"); A_DONE=$((A_DONE+1))
-    echo "  author[$i] q1 COLD status=$ST author_ms=$AU materialize_ms=${MA:-?} wall_ms=$W mv=${MVTB:-?}"
+    echo "  author[$i] $QLABEL COLD status=$ST author_ms=$AU materialize_ms=${MA:-?} wall_ms=$W mv=${MVTB:-?}"
   else
-    echo "  author[$i] q1 status=$ST (no author_ms — served warm; evicting to force cold next) wall_ms=$W"
+    echo "  author[$i] $QLABEL status=$ST (no author_ms — served warm; evicting to force cold next) wall_ms=$W"
   fi
   evict_mv "${MVNS:-tpcds_mv}" "$MVTB"                  # drop it → next iteration is cold
   sleep 1
@@ -110,7 +120,7 @@ for i in $(seq 1 "$ITERS"); do
 done
 
 echo
-echo "== SUMMARY (q1-scale MV over ${CDC_ROWS}-row commits) =="
+echo "== SUMMARY ($QLABEL-scale MV over ${CDC_ROWS}-row commits) =="
 echo "  one-time author_ms (fresh queries):   $(stats "${A_AUTH[@]:-}")"
 echo "  one-time materialize_ms:              $(stats "${A_MAT[@]:-}")"
 echo "  one-time wall_ms:                     $(stats "${A_WALL[@]:-}")"
