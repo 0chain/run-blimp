@@ -46,7 +46,14 @@ clean_bkt(){ export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGI
 disk_guard(){ mountpoint -q "$MNT" || return 0; local p; p=$(df --output=pcent "$MNT" 2>/dev/null|tail -1|tr -dc 0-9)
   echo "  [$MNT ${p:-?}% used]"; [ "${p:-0}" -ge 90 ] && { echo "!! ${p}% >=90% — abort (disk-fill guard)"; exit 1; }; }
 mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
-  sudo mount -t nfs4 -o nconnect=16,rsize=1048576,wsize=1048576 "$NFS":/ "$MNT" && echo "mounted $NFS:/ -> $MNT"; }
+  if ! sudo mount -t nfs4 -o nconnect=16,rsize=1048576,wsize=1048576 "$NFS":/ "$MNT"; then
+    # Fail LOUD and make callers skip: falling through would run fio against
+    # the local disk under the mountpoint dir and report the client box's
+    # speed as the cluster's (observed on an external-mode host, 2026-07-27).
+    echo "SKIP: NFS $NFS:/ unreachable (external-mode host? NFS is VPC-only)"
+    return 1
+  fi
+  echo "mounted $NFS:/ -> $MNT"; }
 
 # --- 1KiB TTFB: PUT conc=EC_CONC keep-data, then conc=1 GET (pure first-byte) ----
 bench_ttfb(){ echo "== 1KiB TTFB (PUT conc=$EC_CONC 10s, GET conc=1 ${TTFB_DUR}s) =="
@@ -77,7 +84,7 @@ bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
 # achievable rate. A CLIENT box can't restart the gateway container or drop its page
 # cache, so cold is instead guaranteed by a working set > gateway RAM: NJ*FSZ (2/1 =
 # 16*2304M = 36 GiB > an 8-vCPU gw's ~31 GB), read sequentially and buffered.
-bench_fio(){ mount_nfs; disk_guard; local D="$MNT/bench-fio"; sudo mkdir -p "$D"
+bench_fio(){ mount_nfs || return 0; disk_guard; local D="$MNT/bench-fio"; sudo mkdir -p "$D"
   echo "== fio WRITE ($FJ jobs x $FSZ, bs=1M, iodepth=$FID, direct/libaio, full pass) =="
   sudo fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$FJ" --iodepth="$FID" --direct=1 --fallocate=none --ioengine=libaio --group_reporting 2>&1 | grep -iE 'WRITE:'
   disk_guard; sync

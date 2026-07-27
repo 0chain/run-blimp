@@ -98,12 +98,23 @@ done
 
 cycle(){ # cycle <label> <seed-extra-args...> — commit, webhook, inline re-serve
   local label="$1"; shift
+  # BENCH_FACT: which fact the append hits (default store_returns; use
+  # catalog_sales for q64-class join-CTE MVs — the seeder appends referential
+  # catalog_returns rows alongside so the join actually gains delta rows).
+  local ft="${BENCH_FACT:-store_returns}"
+  # Source-bucket creds must win over any stale ~/.aws/credentials profile.
+  AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
   "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
-    --namespace "$NAMESPACE" --table store_returns --rows "$CDC_ROWS" \
+    --namespace "$NAMESPACE" --table "$ft" --rows "$CDC_ROWS" \
     --s3-region "$REGION" "$@" >/dev/null 2>&1
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"store_returns\",\"trigger\":\"bench-$label\"}" >/dev/null
+    -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"$ft\",\"trigger\":\"bench-$label\"}" >/dev/null
+  if [ "$ft" = catalog_sales ]; then
+    curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"catalog_returns\",\"trigger\":\"bench-$label\"}" >/dev/null
+  fi
   local T0 R T1
   T0=$(now); R=$(run_sql "$Q1"); T1=$(now)
   CY_MAT=$(echo "$R" | J materialize_ms); CY_Q=$(echo "$R" | J query_ms)

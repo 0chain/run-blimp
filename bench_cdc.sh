@@ -60,7 +60,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS S_MS I_QMS MERGE MODE MVTBL MV_ROWS
+declare -A A_MS M_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS
 
 run(){ # run <sql> <label> [force]  -> echoes the JSON
   # AUTHOR_TIMEOUT: graft-primary cold authors probe + materialize the WIDEST
@@ -86,15 +86,27 @@ for ft in $(facts_of); do
     echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} cold_serve=${S_MS[$n]:-?}ms mv_rows=${MV_ROWS[$n]:-?} mv=${MVTBL[$n]:-none}"
   done
   echo ">> phase 2: append +$CDC_ROWS to $ft + snapshot_changed"
+  # Source-bucket creds must win over any stale ~/.aws/credentials profile.
+  AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
   "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
     --namespace "$NAMESPACE" --table "$ft" --rows "$CDC_ROWS" --s3-region "$REGION" 2>&1 | tail -1
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"$ft\",\"trigger\":\"cdc-bench\"}" >/dev/null
+  # catalog_sales appends are referential (seed also appends matching
+  # catalog_returns rows — q64's cs_ui joins the two) → notify both tables.
+  if [ "$ft" = catalog_sales ]; then
+    curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"catalog_returns\",\"trigger\":\"cdc-bench\"}" >/dev/null
+  fi
   echo ">> phase 3: re-run all (incremental)"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:incr"); I_QMS[$n]=$(echo "$R" | J query_ms)
-    echo "   $n: incr_query=${I_QMS[$n]:-?}ms"
+    # Lazy CDC model: snapshot_changed only MARKS the MV stale; the delta-merge
+    # happens ON this query and is reported inline as merge_ms.
+    I_MERGE[$n]=$(echo "$R" | J merge_ms)
+    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms"
   done
 done
 sleep 4
@@ -116,6 +128,11 @@ real=[x for x in rows if x.get('mode') in ('incremental','full')]
 x=(real or rows or [{}])[0]
 print(x.get('merge_ms', x.get('materialize_ms','')) or '-', x.get('mode','-'))")
   MERGE[$n]="$m"; MODE[$n]="$md"
+  # Lazy CDC: the query-time inline merge_ms is authoritative — the wave log
+  # only sees proactive merges, which the lazy default no longer performs.
+  if [ -n "${I_MERGE[$n]:-}" ] && [ "${I_MERGE[$n]}" != "null" ]; then
+    MERGE[$n]="${I_MERGE[$n]}"; MODE[$n]="incremental"
+  fi
 done
 
 # ---- SUMMARY TABLE (== the CDC "contributions" table) --------------------------

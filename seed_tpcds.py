@@ -57,10 +57,13 @@ def main():
             ("cs_item_sk",pa.int32()),("cs_bill_customer_sk",pa.int32()),
             ("cs_warehouse_sk",pa.int32()),("cs_ship_mode_sk",pa.int32()),
             ("cs_call_center_sk",pa.int32()),("cs_quantity",pa.int32()),
+            ("cs_order_number",pa.int64()),
             ("cs_sales_price",pa.decimal128(7,2)),("cs_ext_sales_price",pa.decimal128(7,2)),
+            ("cs_ext_list_price",pa.decimal128(7,2)),
             ("cs_net_profit",pa.decimal128(7,2))])
         cc_pool=[a.upsert_store_sk]*n if a.mode=="upsert" else [random.randint(1,6) for _ in range(n)]
         sold=[random.randint(2451545,2451910) for _ in range(n)]
+        ordbase=random.randint(10**9,9*10**9)
         tbl_data=pa.table({
             "cs_sold_date_sk":sold,
             "cs_ship_date_sk":[d+random.randint(2,90) for d in sold],
@@ -70,7 +73,10 @@ def main():
             "cs_ship_mode_sk":[random.randint(1,20) for _ in range(n)],
             "cs_call_center_sk":cc_pool,
             "cs_quantity":[random.randint(1,100) for _ in range(n)],
-            "cs_sales_price":D(1,300),"cs_ext_sales_price":D(1,5000),"cs_net_profit":D(-500,4000)},schema=schema)
+            "cs_order_number":[ordbase+i for i in range(n)],
+            "cs_sales_price":D(1,300),"cs_ext_sales_price":D(1,5000),
+            "cs_ext_list_price":D(100,6000),
+            "cs_net_profit":D(-500,4000)},schema=schema)
     elif a.table=="web_sales":
         # q45: bill_customer/sold_date/item/sales_price; q62: ship_date/warehouse/
         # ship_mode/web_site
@@ -128,4 +134,26 @@ def main():
         pq.write_table(tbl_data,f,store_decimal_as_integer=True)
     t.add_files(file_paths=[key]); t.refresh()
     print(f"{a.namespace}.{a.table}: +{n} rows -> snapshot {t.current_snapshot().snapshot_id}")
+    if a.table=="catalog_sales" and a.mode=="append":
+        # Referential CDC (q64-class): cs_ui joins catalog_sales×catalog_returns on
+        # (item_sk, order_number) — a sales-only append contributes NO cs_ui delta.
+        # Append matching returns for ~1/3 of the new sales, refunds small enough
+        # that the HAVING sale > 2*refund band keeps the groups.
+        m=max(1,n//3)
+        ridx=random.sample(range(n),m)
+        r_item=[tbl_data["cs_item_sk"][i].as_py() for i in ridx]
+        r_ord=[tbl_data["cs_order_number"][i].as_py() for i in ridx]
+        RD=lambda lo,hi:[decimal.Decimal(str(round(random.uniform(lo,hi),2))) for _ in range(m)]
+        rschema=pa.schema([("cr_item_sk",pa.int32()),("cr_order_number",pa.int64()),
+            ("cr_refunded_cash",pa.decimal128(7,2)),("cr_reversed_charge",pa.decimal128(7,2)),
+            ("cr_store_credit",pa.decimal128(7,2))])
+        rdata=pa.table({"cr_item_sk":r_item,"cr_order_number":r_ord,
+            "cr_refunded_cash":RD(0,20),"cr_reversed_charge":RD(0,10),
+            "cr_store_credit":RD(0,10)},schema=rschema)
+        rt=cat.load_table((a.namespace,"catalog_returns"))
+        rkey=f"{rt.location().rstrip('/')}/data/seed-{uuid.uuid4().hex}.parquet"
+        with fs.open(rkey.replace("s3://","",1),"wb") as f:
+            pq.write_table(rdata,f,store_decimal_as_integer=True)
+        rt.add_files(file_paths=[rkey]); rt.refresh()
+        print(f"{a.namespace}.catalog_returns: +{m} referential rows -> snapshot {rt.current_snapshot().snapshot_id}")
 if __name__=="__main__": main()

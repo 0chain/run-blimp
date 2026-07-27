@@ -67,6 +67,15 @@ blimp --bench         author / materialize / delta-merge timing profile
 Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 **Running a command with no wiring offers to run `--setup` for you first.**
 
+**Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
+export these (or source a file with `set -a`) and `--setup` runs unattended:
+
+```
+REGION CLUSTER_ID ICEBERG_URL WAREHOUSE ORIGIN_BUCKET NAMESPACE \
+S3_KEY S3_SECRET        # external mode only; blank/unset in vpc mode
+GW GW_AK GW_SK          # optional — auto-derived from CLUSTER_ID when unset
+```
+
 ### Step 1 — create a Blimp node
 
 blimp.software → Create a Blimp node. Note the **node id**.
@@ -125,8 +134,13 @@ scripted (SSH/SSM as root on the gateway):
 
 ```
 ICEBERG_URL=http://<node>:8181 WAREHOUSE=s3://my-bucket/wh NAMESPACE=myns \
-ORIGIN_BUCKET=my-bucket S3_REGION=ap-south-1 bash hookup_cluster_source.sh
+ORIGIN_BUCKET=my-bucket S3_REGION=ap-south-1 \
+S3_KEY=<key> S3_SECRET=<secret> bash hookup_cluster_source.sh   # keys: external mode only
 ```
+
+External / cross-account mode **requires** `S3_KEY`/`S3_SECRET` (the script
+wires the gateway's full `ZS3_SRC_CUSTOMER_*` source spec from them); in vpc
+mode leave them unset — the gateway reads via its IAM role.
 
 > Firewall: the gateway must reach this node on the catalog port. If the
 > Blimp node security group doesn't open 8181, serve the catalog on an open port
@@ -135,9 +149,10 @@ ORIGIN_BUCKET=my-bucket S3_REGION=ap-south-1 bash hookup_cluster_source.sh
 ### Step 5 — `./blimp --query` (prove authoring + CDC)
 
 Defaults to **q1** on `store_returns`: ① cold author (`force_author`) →
-② append rows + fire the webhook → ③ verify the gateway **delta-merged**
-incrementally (the refresh runs async on the webhook; the gate reads
-`/admin/mv/wave/report` and requires `mode=incremental`):
+② append rows + fire the webhook → ③ verify the gateway **delta-merged**.
+CDC is **lazy**: the webhook only marks the MV stale — the *next query* pays
+the merge and reports `merge_ms` inline (the gate reads the phase-3 query
+response, with `/admin/mv/wave/report` as fallback):
 
 ```
 q1  store_returns  merge_ms=3523  mode=incremental   RESULT: PASS
@@ -145,13 +160,21 @@ q1  store_returns  merge_ms=3523  mode=incremental   RESULT: PASS
 
 Wider: `SUITES="store_sales:3 19 43 52 55;store_returns:1" ./blimp --query`
 
+Join-CTE queries (q64-class, `SUITES="catalog_sales:64"`) only see a delta
+when the append touches **both** sides of the join — the seeder therefore
+appends `catalog_sales` **referentially** (matching `catalog_returns` rows,
+keys copied). A sales-only append correctly reports `no-delta`, not a bug.
+
 ### Step 6 — `./blimp --storage` / `./blimp --bench`
 
 Storage = warp S3 PUT/GET + TTFB, fio NFS, mlperf (needs `warp`, `fio`,
-`mount-s3` on the node). Cap sizes on small nodes:
+`mount-s3` on the node — sections whose tool is missing are **skipped and
+print empty numbers**, so check the tool is installed before reading a blank
+warp row as a result). Cap sizes on small nodes:
 `WARP_BUDGET_MIB=5120 FIO_JOBS=4 FIO_SIZE=1280M MLPERF_NUM_FILES=35 ./blimp --storage`.
 Bench = min/median/avg/max author / materialize / delta-merge profile
-(`ITERS AUTHOR_ITERS CDC_ROWS`).
+(`ITERS AUTHOR_ITERS CDC_ROWS`; `BENCH_QNR=64` benches a different TPC-DS
+query from `$Q_DIR/q<N>.sql` instead of the built-in q1).
 
 ## Notes
 
