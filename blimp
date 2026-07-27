@@ -366,9 +366,15 @@ cmd_setup(){
   # (pre-2026-07-27 gateway image) or unreachable.
   if [ -n "${GW:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
     bold "== wiring the cluster over the admin API (no SSH) =="
+    # VIA_ROUTER=1: route the gateway's source reads through the cluster's
+    # read-through cache router — every re-scan (verify/replay/merge) comes off
+    # the eblobbers' local disks instead of re-paying the S3 read. Only enable
+    # when the cluster router fronts YOUR bucket (hookup_cluster_source.sh);
+    # off by default for a fresh BYO wire.
     HOOK_BODY=$(HB_IRC="$ICEBERG_URL" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
       HB_BKT="$ORIGIN_BUCKET" HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_REG="$REGION" \
-      python3 -c 'import json,os;print(json.dumps({"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"]}))' 2>/dev/null)
+      HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
+      python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"]};b.update({"via_router":True,**({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_RB") else {})} if os.environ.get("HB_VR")=="1" else {});print(json.dumps(b))' 2>/dev/null)
     HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
       -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \
       -d "$HOOK_BODY" || true)
