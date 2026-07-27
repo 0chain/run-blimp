@@ -129,8 +129,17 @@ venv/bin/python3 register_tpcds_tables.py \
 
 ### Step 4 — point the Blimp node at the source
 
-Paste `--setup`'s printed values into the Blimp node UI (Production tab) — or,
-scripted (SSH/SSM as root on the gateway):
+**Automatic (no SSH):** `--setup` wires the cluster itself over the
+authenticated admin API — `POST http://<gw>:9000/admin/source/configure`
+(`Authorization: Bearer zus-<CLUSTER_ID>`). The gateway applies the source in
+its live env (effective on the next query, **no restart**) and persists it
+across reboots. Requires a gateway image ≥ 2026-07-27; on older images the
+call fails gracefully and `--setup` prints the manual steps.
+
+Manual fallback: paste `--setup`'s printed values into the Blimp node UI
+(Production tab) — or, scripted (SSH/SSM as root on the gateway; also
+retargets the read-through cache router at the new bucket, which the API
+path leaves to the operator):
 
 ```
 ICEBERG_URL=http://<node>:8181 WAREHOUSE=s3://my-bucket/wh NAMESPACE=myns \
