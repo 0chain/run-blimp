@@ -400,8 +400,50 @@ need_env(){
   GW="${GW:-${GATEWAY:-}}"; export GW GATEWAY="$GW"
 }
 
+# ensure_storage_tools — the --storage suite's benchmark tools, installed
+# self-contained like ensure_deps: warp (pinned ≥1.1.4 — older warp's output
+# format parses as blank numbers), fio, and mount-s3 + dlio for mlperf.
+# BLIMP_SKIP_DEPS=1 opts out on hardened/offline hosts.
+ensure_storage_tools(){
+  [ "${BLIMP_SKIP_DEPS:-0}" = 1 ] && return 0
+  bold "== checking storage-bench tools =="
+  # warp: pin v1.1.4 (parser-compatible). Replace older installs.
+  local wv; wv=$(warp --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ "$wv" != "1.1.4" ]; then
+    bold "  installing warp v1.1.4 (found: ${wv:-none})…"
+    local arch; arch=$(uname -m); [ "$arch" = aarch64 ] && arch=arm64 || arch=x86_64
+    curl -fsSL "https://github.com/minio/warp/releases/download/v1.1.4/warp_Linux_${arch}.tar.gz" \
+      -o /tmp/warp.tgz && tar xzf /tmp/warp.tgz -C /tmp warp \
+      && sudo install /tmp/warp /usr/local/bin/warp && rm -f /tmp/warp.tgz /tmp/warp \
+      || echo "  ! warp install failed — warp sections will be skipped"
+  fi
+  command -v fio >/dev/null || {
+    bold "  installing fio…"
+    if command -v apt-get >/dev/null; then sudo apt-get install -y -qq fio 2>&1 | tail -1 || true
+    elif command -v yum >/dev/null; then sudo yum install -y -q fio 2>&1 | tail -1 || true; fi
+  }
+  command -v mount-s3 >/dev/null || {
+    bold "  installing mount-s3 (mlperf read path)…"
+    local arch; arch=$(uname -m)
+    if command -v apt-get >/dev/null; then
+      curl -fsSL "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch}/mount-s3.deb" \
+        -o /tmp/mount-s3.deb && sudo apt-get install -y -qq /tmp/mount-s3.deb 2>&1 | tail -1 && rm -f /tmp/mount-s3.deb \
+        || echo "  ! mount-s3 install failed — mlperf section will be skipped"
+    fi
+  }
+  # dlio (mlperf resnet50 driver) — venv install, one-time, best-effort.
+  if [ ! -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ]; then
+    bold "  installing dlio-benchmark (one-time, mlperf)…"
+    sudo mkdir -p /opt/dlio && sudo python3 -m venv /opt/dlio/venv_mlperf 2>/dev/null \
+      && sudo /opt/dlio/venv_mlperf/bin/pip install -q dlio-benchmark 2>&1 | tail -1 \
+      || echo "  ! dlio install failed — mlperf section will be skipped"
+  fi
+  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing)"
+}
+
 cmd_storage(){
   need_env
+  ensure_storage_tools
   : "${GW:?gateway missing in wiring}" "${REGION:?}"
   [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
   [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
