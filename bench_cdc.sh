@@ -67,7 +67,10 @@ run(){ # run <sql> <label> [force]  -> echoes the JSON
   # feasible candidate first with cap-backoff — several full-fact CTAS attempts
   # can exceed 400s at SF1000; a shorter curl -m SIGKILLs the in-flight CTAS
   # (request ctx cancel) and every queued candidate with it (2026-07-22).
-  curl -s -m "${AUTHOR_TIMEOUT:-1500}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
+  # 1500 killed the q64 cross_sales fine-grain build (a 2.88B-group aggregate,
+  # 19+ min of CTAS compute) at exactly 25 min (2026-07-27) — a cold branch
+  # author + verify is two full source scans; give it two hours.
+  curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","label":sys.argv[2],"skip_verify":True,"force_author":sys.argv[3]=="1"}))' "$1" "$2" "${3:-0}")"
 }
