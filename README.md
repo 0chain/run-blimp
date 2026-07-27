@@ -155,7 +155,14 @@ mode leave them unset — the gateway reads via its IAM role.
 > Blimp node security group doesn't open 8181, serve the catalog on an open port
 > (e.g. `docker run -p 8081:8181 …`) and use that URL.
 
-### Step 5 — `./blimp --query` (prove authoring + CDC)
+## Testing the Blimp node
+
+The `--query`, `--storage`, and `--bench` commands are **testing/validation
+tools** — they prove the wiring, measure the node, and gate a rollout. They are
+not part of production operation (production is your pipeline + the
+`snapshot_changed` webhook from Step 4).
+
+### A — `./blimp --query` (prove authoring + CDC)
 
 Defaults to **q1** on `store_returns`: ① cold author (`force_author`) →
 ② append rows + fire the webhook → ③ verify the gateway **delta-merged**.
@@ -174,7 +181,7 @@ when the append touches **both** sides of the join — the seeder therefore
 appends `catalog_sales` **referentially** (matching `catalog_returns` rows,
 keys copied). A sales-only append correctly reports `no-delta`, not a bug.
 
-### Step 6 — `./blimp --storage` / `./blimp --bench`
+### B — `./blimp --storage` (storage & cache suite)
 
 Storage = warp S3 PUT/GET + TTFB, fio NFS, mlperf. The suite is
 **self-contained**: it installs its own tools first (warp pinned v1.1.4, fio,
@@ -182,9 +189,13 @@ mount-s3, dlio) — `BLIMP_SKIP_DEPS=1` opts out on hardened hosts, and a
 section whose tool still can't install is skipped loudly. Cap sizes on small
 nodes:
 `WARP_BUDGET_MIB=5120 FIO_JOBS=4 FIO_SIZE=1280M MLPERF_NUM_FILES=35 ./blimp --storage`.
+
+### C — `./blimp --bench` (timing profile)
+
 Bench = min/median/avg/max author / materialize / delta-merge profile
 (`ITERS AUTHOR_ITERS CDC_ROWS`; `BENCH_QNR=64` benches a different TPC-DS
-query from `$Q_DIR/q<N>.sql` instead of the built-in q1).
+query from `$Q_DIR/q<N>.sql` instead of the built-in q1; `BENCH_FACT=catalog_sales`
+appends referentially for join-CTE queries).
 
 ## Notes
 
@@ -268,7 +279,12 @@ $ ~/.blimp_venv/bin/python3 register_tpcds_tables.py --catalog http://localhost:
 registered 24/24 tables into http://localhost:8181 ns=tpcds_sf1x
 ```
 
-**4. `blimp --query` — author + incremental CDC:**
+### Testing the Blimp node (walkthrough)
+
+The remaining items are the TESTING commands — validation of the wired node,
+not production operation.
+
+**A. `blimp --query` — author + incremental CDC:**
 ```
 == CDC bench: cluster=1784970467881 gw=10.10.12.249 rows/append=20000 suites=[store_returns:1] ==
 >> phase 1: author all (force_author)
@@ -283,7 +299,7 @@ q1         store_returns      271490           ?       3523 incremental      255
 RESULT: PASS (1/1 authored + delta-merged)
 ```
 
-**5. Router corner cases** (operator, via SSM):
+**B. Router corner cases** (operator, via SSM):
 ```
 TEST A+B — router ON: append visible through warm cache
   PASS router ON: result changed after append (93707b6c… -> 1e21abc5…)
@@ -292,7 +308,7 @@ TEST C — router OFF: source not cached on blobbers
 RESULT: 2 passed, 0 failed
 ```
 
-**6. Raw stop/start (all 4 instances) → self-heal + re-validate:**
+**C. Raw stop/start (all 4 instances) → self-heal + re-validate:**
 ```
 private IPs unchanged; all 4 public IPs changed
 DNS reconciled by the 60s cron (no touch):
@@ -303,14 +319,14 @@ DNS reconciled by the 60s cron (no touch):
 post-restart q1: merge_ms=5138 mode=incremental   RESULT: PASS
 ```
 
-**7. External-cloud host** (non-AWS box, over public DNS):
+**D. External-cloud host** (non-AWS box, over public DNS):
 ```
 network assessment → MODE=external (gateway private unknown reachable: no)
 live query over zus-1784970467881-0.zus.network:9000
   {status: ok, rows: 1, author_ms: 575, query_ms: 2447, md5: 7a26dcec…}
 ```
 
-**8. `blimp --storage` numbers** (2/1 cluster, 5 GB warp set):
+**E. `blimp --storage` numbers** (2/1 cluster, 5 GB warp set):
 ```
 warp   S3 PUT 749 MiB/s · GET 1673 MiB/s   (0 errors)
 fio    NFS write 1137 MiB/s · read 937 MiB/s
