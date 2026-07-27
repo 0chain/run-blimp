@@ -359,6 +359,27 @@ cmd_setup(){
   else
     cred_lines="    S3 credentials   : none — gateway reads via its IAM instance role"
   fi
+  # Wire the cluster DIRECTLY over the authenticated admin API (no SSH):
+  # POST /admin/source/configure sets the gateway's live source env — takes
+  # effect on the next query, no restart. Bearer = zus-<CLUSTER_ID>. Falls
+  # back to the manual UI/SSH instructions below when the endpoint is absent
+  # (pre-2026-07-27 gateway image) or unreachable.
+  if [ -n "${GW:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
+    bold "== wiring the cluster over the admin API (no SSH) =="
+    HOOK_BODY=$(HB_IRC="$ICEBERG_URL" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
+      HB_BKT="$ORIGIN_BUCKET" HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_REG="$REGION" \
+      python3 -c 'import json,os;print(json.dumps({"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"]}))' 2>/dev/null)
+    HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
+      -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \
+      -d "$HOOK_BODY" || true)
+    case "$HOOK_RESP" in
+      *'"status": "ok"'*|*'"status":"ok"'*)
+        bold "  ✓ cluster wired: source=customer ns=$NAMESPACE bucket=$ORIGIN_BUCKET (live, no restart)"
+        echo "    (read-through cache retarget is optional — see hookup_cluster_source.sh)";;
+      *)
+        echo "  ! API wiring unavailable ($(printf %s "$HOOK_RESP" | head -c 120)) — use the UI/manual steps below";;
+    esac
+  fi
   echo; bold "================= POINT THE BLIMP CLUSTER AT THIS SOURCE ================="
   cat <<OUT
   In the cluster UI → Query Optimizer → Production (BYO Iceberg source):
