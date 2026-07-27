@@ -71,6 +71,19 @@ vals["ZS3_SOURCE_S3_REGION"] = os.environ["HK_REGION"]
 vals["ZS3_SOURCE_VIA_ROUTER"] = "1"
 vals["ZS3_SOURCE_ROUTER_BASE"] = "http://" + os.environ["HK_GWPRIV"] + ":8088"
 vals["ZS3_SOURCE_CATALOG"] = "source"
+# tab-source registry: the query API's source="customer" resolves the
+# ZS3_SRC_CUSTOMER_* set (resolveSourceEnv), NOT the legacy ZS3_SOURCE_* keys —
+# without these every "Run on Prod" errors "no external Prod source is wired".
+vals["ZS3_SRC_CUSTOMER_SCHEMA"]        = os.environ["HK_NAMESPACE"]
+vals["ZS3_SRC_CUSTOMER_CATALOG"]       = "source"
+vals["ZS3_SRC_CUSTOMER_IRC_URL"]       = os.environ["HK_ICEBERG_URL"] + "|" + os.environ["HK_WAREHOUSE"]
+vals["ZS3_SRC_CUSTOMER_IRC_NAMESPACE"] = os.environ["HK_NAMESPACE"]
+vals["ZS3_SRC_CUSTOMER_S3_ENDPOINT"]   = os.environ["HK_EP"]
+vals["ZS3_SRC_CUSTOMER_S3_KEY_ID"]     = os.environ["HK_KEY"]
+vals["ZS3_SRC_CUSTOMER_S3_SECRET"]     = os.environ["HK_SECRET"]
+vals["ZS3_SRC_CUSTOMER_S3_REGION"]     = os.environ["HK_REGION"]
+vals["ZS3_SRC_CUSTOMER_BUCKET"]        = os.environ["HK_BUCKET"]
+vals["ZS3_SRC_CUSTOMER_APPEND_ENABLED"]= "true"
 missing = []
 for k, v in vals.items():
     pat = re.compile(r'^(\s+%s:\s*).*$' % re.escape(k), re.M)
