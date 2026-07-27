@@ -167,10 +167,11 @@ keys copied). A sales-only append correctly reports `no-delta`, not a bug.
 
 ### Step 6 — `./blimp --storage` / `./blimp --bench`
 
-Storage = warp S3 PUT/GET + TTFB, fio NFS, mlperf (needs `warp`, `fio`,
-`mount-s3` on the node — sections whose tool is missing are **skipped and
-print empty numbers**, so check the tool is installed before reading a blank
-warp row as a result). Cap sizes on small nodes:
+Storage = warp S3 PUT/GET + TTFB, fio NFS, mlperf. The suite is
+**self-contained**: it installs its own tools first (warp pinned v1.1.4, fio,
+mount-s3, dlio) — `BLIMP_SKIP_DEPS=1` opts out on hardened hosts, and a
+section whose tool still can't install is skipped loudly. Cap sizes on small
+nodes:
 `WARP_BUDGET_MIB=5120 FIO_JOBS=4 FIO_SIZE=1280M MLPERF_NUM_FILES=35 ./blimp --storage`.
 Bench = min/median/avg/max author / materialize / delta-merge profile
 (`ITERS AUTHOR_ITERS CDC_ROWS`; `BENCH_QNR=64` benches a different TPC-DS
