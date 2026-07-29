@@ -9,10 +9,13 @@
 # materialize (not result-shaped). See CDC_INCREMENTAL.md. Multi-fact (q25/q29)
 # and AVG/CTE queries are NOT here — they fall back to full re-author by design.
 #
-# Every call is labeled (<name>:author / <name>:incr) and uses skip_verify so the
-# panel is readable and the row-hash verify doesn't blow the request budget on big
-# MVs. It also EVICTS these MVs first so `snapshot_changed` only wakes them, not a
-# herd of stale multi-fact MVs from earlier runs.
+# Every call is labeled (<name>:author / <name>:incr). Verification follows the
+# product's own model: the cold author (force_author) IS verified — that is the
+# one point where an MV's values are proven against the source — and the merge
+# calls pass skip_verify, because a delta-merge re-verify is another full source
+# scan per query and a merge that goes wrong falls back to force_author (which
+# verifies) on its own. It also EVICTS these MVs first so `snapshot_changed`
+# only wakes them, not a herd of stale multi-fact MVs from earlier runs.
 #
 # Env: GW CLUSTER_ID ICEBERG_URL WAREHOUSE [NAMESPACE=tpcds] [REGION=ap-south-1]
 #      [CDC_ROWS=5000] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
@@ -20,7 +23,10 @@
 set -u
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
 NAMESPACE="${NAMESPACE:-tpcds}"; REGION="${REGION:-ap-south-1}"; CDC_ROWS="${CDC_ROWS:-5000}"
-QAPI="http://$GW:9000"; TOKEN="zus-$CLUSTER_ID"; HERE="$(cd "$(dirname "$0")" && pwd)"
+# QAPI/TOKEN overridable for non-cluster gateways (e.g. the test2 manual stack:
+# QAPI=http://localhost:9100 TOKEN=<ZS3_ADMIN_TOKEN>); defaults keep the
+# run-blimp cluster convention.
+QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-zus-$CLUSTER_ID}"; HERE="$(cd "$(dirname "$0")" && pwd)"
 PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
 J(){ python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('$1',''))
@@ -63,6 +69,9 @@ names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = 
 declare -A A_MS M_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS
 
 run(){ # run <sql> <label> [force]  -> echoes the JSON
+  # force=1 is the cold author → VERIFY it (skip_verify false); every other call
+  # is a warm serve / delta-merge → skip_verify. Passing skip_verify on the
+  # author too suppressed the single verification the CDC model relies on.
   # AUTHOR_TIMEOUT: graft-primary cold authors probe + materialize the WIDEST
   # feasible candidate first with cap-backoff — several full-fact CTAS attempts
   # can exceed 400s at SF1000; a shorter curl -m SIGKILLs the in-flight CTAS
@@ -72,7 +81,7 @@ run(){ # run <sql> <label> [force]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","label":sys.argv[2],"skip_verify":True,"force_author":sys.argv[3]=="1"}))' "$1" "$2" "${3:-0}")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","label":sys.argv[2],"skip_verify":sys.argv[3]!="1","force_author":sys.argv[3]=="1"}))' "$1" "$2" "${3:-0}")"
 }
 
 echo "== CDC bench: cluster=$CLUSTER_ID gw=$GW rows/append=$CDC_ROWS suites=[$SUITES] =="
@@ -92,7 +101,8 @@ for ft in $(facts_of); do
   # Source-bucket creds must win over any stale ~/.aws/credentials profile.
   AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
   "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
-    --namespace "$NAMESPACE" --table "$ft" --rows "$CDC_ROWS" --s3-region "$REGION" 2>&1 | tail -1
+    --namespace "$NAMESPACE" --table "$ft" --rows "$CDC_ROWS" --s3-region "$REGION" \
+    ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1 | tail -1
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"$ft\",\"trigger\":\"cdc-bench\"}" >/dev/null
