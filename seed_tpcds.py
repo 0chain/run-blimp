@@ -10,20 +10,62 @@ Point Blimp's Production tab at:  Iceberg REST URL = http://<this-host>:8181,
 Warehouse = your warehouse, Namespace = tpcds. Leave S3 keys blank if the Blimp
 cluster runs in the same AWS account (it reads via its instance role)."""
 import argparse, random, decimal
+def conform_to_table_schema(tbl, table, n):
+    """Expand a synthesized subset delta to the target table's FULL physical
+    schema, null-filling the columns we don't synthesize. WITHOUT this the delta
+    parquet carried only the ~12 measure/key columns; a query that reads the fact
+    as a raw base+delta parquet glob (q64's cross_sales scans store_sales for
+    ss_cdemo_sk etc.) then hits "schema mismatch in glob: column X was read from
+    the original file ... but could not be found in <seed>.parquet" -> duckdb exit
+    1. add_files null-fills for iceberg-schema reads, but a physical glob needs the
+    files uniform. Conforming to table.schema() makes every delta file identical
+    in shape to the base chunks."""
+    import pyarrow as pa
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+    aschema = schema_to_pyarrow(table.schema())
+    have = {name: tbl[name] for name in tbl.column_names}
+    cols = []
+    for field in aschema:
+        if field.name in have:
+            arr = have[field.name]
+            if not arr.type.equals(field.type):
+                arr = arr.cast(field.type)
+            cols.append(arr)
+        else:
+            cols.append(pa.nulls(n, field.type))
+    return pa.table(cols, schema=aschema)
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--catalog",required=True); ap.add_argument("--warehouse",required=True)
     ap.add_argument("--namespace",default="tpcds"); ap.add_argument("--table",default="store_returns")
     ap.add_argument("--rows",type=int,default=100000); ap.add_argument("--s3-region",default="us-east-1")
+    ap.add_argument("--s3-endpoint",default="",help="custom S3 endpoint (MinIO etc.); blank = AWS (same convention as register_tpcds_tables.py)")
     ap.add_argument("--mode",choices=["append","upsert"],default="append",
         help="append = add_files only (incremental-mergeable). upsert = copy-on-write "
              "DELETE of an sr_store_sk slice + replacement rows: rewrites data files, so "
              "the snapshot has REMOVED files and the gateway must full-rematerialize.")
     ap.add_argument("--upsert-store-sk",type=int,default=7,help="store slice replaced in upsert mode")
     a=ap.parse_args()
+    if not a.s3_endpoint:
+        # env fallback so callers that export AWS_ENDPOINT_URL (bench launchers)
+        # get MinIO routing without a CLI change
+        import os
+        a.s3_endpoint=os.environ.get("S3_ENDPOINT") or os.environ.get("AWS_ENDPOINT_URL") or ""
     from pyiceberg.catalog.rest import RestCatalog
     import pyarrow as pa
-    cat=RestCatalog("kit",uri=a.catalog,warehouse=a.warehouse,**{"s3.region":a.s3_region})
+    props={"s3.region":a.s3_region}
+    if a.s3_endpoint:
+        # Custom endpoint: point BOTH pyiceberg's file IO and the writer at it
+        # (without this, PyArrow S3 IO resolves bucket names against real AWS ->
+        # ACCESS_DENIED on a local-only bucket; observed q64 bench 2026-07-29).
+        # Same convention as register_tpcds_tables.py: s3.endpoint always; path-
+        # style ONLY for non-AWS endpoints (MinIO needs it; forcing it on real
+        # AWS would regress newer buckets — S3_ENDPOINT is commonly the AWS
+        # regional URL on blimp nodes, per standup_data.sh).
+        props["s3.endpoint"]=a.s3_endpoint
+        if "amazonaws.com" not in a.s3_endpoint:
+            props["s3.path-style-access"]="true"
+    cat=RestCatalog("kit",uri=a.catalog,warehouse=a.warehouse,**props)
     try: cat.create_namespace((a.namespace,))
     except Exception: pass
     # per-table minimal schema — just the measure/key columns the CDC queries
@@ -127,9 +169,14 @@ def main():
     # "Unexpected physical type FIXED_LEN_BYTE_ARRAY ... expected INT32".
     # store_decimal_as_integer matches the table's physical encoding exactly.)
     import uuid, s3fs, pyarrow.parquet as pq
+    # Full-schema delta: null-fill every column the fact has but we didn't
+    # synthesize, so base+delta parquet are physically uniform (glob-safe).
+    tbl_data=conform_to_table_schema(tbl_data,t,n)
     loc=t.location().rstrip("/")
     key=f"{loc}/data/seed-{uuid.uuid4().hex}.parquet"
-    fs=s3fs.S3FileSystem(client_kwargs={"region_name":a.s3_region})
+    fs_kwargs={"region_name":a.s3_region}
+    if a.s3_endpoint: fs_kwargs["endpoint_url"]=a.s3_endpoint
+    fs=s3fs.S3FileSystem(client_kwargs=fs_kwargs)
     with fs.open(key.replace("s3://","",1),"wb") as f:
         pq.write_table(tbl_data,f,store_decimal_as_integer=True)
     t.add_files(file_paths=[key]); t.refresh()
@@ -151,6 +198,7 @@ def main():
             "cr_refunded_cash":RD(0,20),"cr_reversed_charge":RD(0,10),
             "cr_store_credit":RD(0,10)},schema=rschema)
         rt=cat.load_table((a.namespace,"catalog_returns"))
+        rdata=conform_to_table_schema(rdata,rt,m)
         rkey=f"{rt.location().rstrip('/')}/data/seed-{uuid.uuid4().hex}.parquet"
         with fs.open(rkey.replace("s3://","",1),"wb") as f:
             pq.write_table(rdata,f,store_decimal_as_integer=True)
