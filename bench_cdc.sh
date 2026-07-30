@@ -18,7 +18,7 @@
 # only wakes them, not a herd of stale multi-fact MVs from earlier runs.
 #
 # Env: GW CLUSTER_ID ICEBERG_URL WAREHOUSE [NAMESPACE=tpcds] [REGION=ap-south-1]
-#      [CDC_ROWS=5000] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
+#      [CDC_ROWS=5000] [FORCE_AUTHOR=0] [VERIFY=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
 #      runs on the gateway; set the gateway's duckdb threads there to change it.)
 set -u
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
@@ -66,12 +66,25 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS
+declare -A A_MS M_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS MV_COLS
 
-run(){ # run <sql> <label> [force]  -> echoes the JSON
-  # force=1 is the cold author → VERIFY it (skip_verify false); every other call
+run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
+  # VERIFY=1 (blimp --query --verify) turns verification ON for the whole run;
+  # default 0 is PROD-LIKE, because the gateway does no verification in the serving
+  # path — correctness checking is a full source scan and production must not pay it
+  # per request. Verification is a TEST-TIME option here, and a separate background
+  # sampler is what catches drift in prod.
+  #
+  # arg3=1 marks the AUTHOR phase: verify it when VERIFY=1; every other call
   # is a warm serve / delta-merge → skip_verify. Passing skip_verify on the
   # author too suppressed the single verification the CDC model relies on.
+  #
+  # force_author is NO LONGER implied by arg3. A forced author is not what
+  # production does: a real query arrives, the matcher finds (or does not find) an
+  # MV, and CDC merges lazily before serving. Forcing made phase 1 rebuild MVs that
+  # already existed — measured on test2 2026-07-30, q64 spent 497s re-authoring an
+  # MV it already had (mv_h_95a7b7fa888f, 300k rows) before the append it was
+  # supposed to be measuring. Set FORCE_AUTHOR=1 only to deliberately rebuild.
   # AUTHOR_TIMEOUT: graft-primary cold authors probe + materialize the WIDEST
   # feasible candidate first with cap-backoff — several full-fact CTAS attempts
   # can exceed 400s at SF1000; a shorter curl -m SIGKILLs the in-flight CTAS
@@ -81,7 +94,7 @@ run(){ # run <sql> <label> [force]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","label":sys.argv[2],"skip_verify":sys.argv[3]!="1","force_author":sys.argv[3]=="1"}))' "$1" "$2" "${3:-0}")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","label":sys.argv[2],"skip_verify":not(sys.argv[3]=="1" and sys.argv[5]=="1"),"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}")"
 }
 
 echo "== CDC bench: cluster=$CLUSTER_ID gw=$GW rows/append=$CDC_ROWS suites=[$SUITES] =="
@@ -94,8 +107,8 @@ for ft in $(facts_of); do
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
     S_MS[$n]=$(echo "$R" | J query_ms);  MVTBL[$n]=$(echo "$R" | J mv_table)
-    MV_ROWS[$n]=$(echo "$R" | J mv_rows)
-    echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} cold_serve=${S_MS[$n]:-?}ms mv_rows=${MV_ROWS[$n]:-?} mv=${MVTBL[$n]:-none}"
+    MV_ROWS[$n]=$(echo "$R" | J mv_rows); MV_COLS[$n]=$(echo "$R" | J mv_cols)
+    echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
   done
   echo ">> phase 2: append +$CDC_ROWS to $ft + snapshot_changed"
   # Source-bucket creds must win over any stale ~/.aws/credentials profile.
@@ -121,6 +134,27 @@ for ft in $(facts_of); do
     I_MERGE[$n]=$(echo "$R" | J merge_ms)
     echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms"
   done
+  # ---- phase 4 (OPT-IN): verify the MERGED MV against the source -------------
+  # A delta-merge is NOT verified anywhere: phase 3 passes skip_verify, and the
+  # gateway deliberately does no verification in the serving path — correctness
+  # checking is a full source scan and production must not pay it per request.
+  # So a wrong delta is SERVED, unlike a wrong author which the row-hash gate
+  # rejects. VERIFY_AFTER_MERGE=1 re-runs each query with verification ON, which
+  # re-scans the source and row-hash-compares it to the merged MV.
+  #
+  # Costs a full original scan per query (measured at SF1000: 36s for q9, 1m27s
+  # for q23, ~1m10s for q4) because the append INVALIDATES the 24h original-hash
+  # cache — the answer changed, so the cached hash cannot be reused. Budget
+  # ~1.5 min per query. Still far cheaper than a Spark job, which stays the
+  # independent third check on a select few.
+  if [ "${VERIFY:-0}" = "1" ]; then
+    echo ">> phase 4: verify merged MVs against source (opt-in)"
+    for n in $FNAMES; do
+      R=$(run "${SQL[$n]}" "$n:verify" 1)
+      V=$(echo "$R" | J status); VM=$(echo "$R" | J mv_table)
+      echo "   $n: verify_status=${V:-?} mv=${VM:-none}"
+    done
+  fi
 done
 sleep 4
 
@@ -154,14 +188,14 @@ done
 # MV size), which is exactly why delta-merge (reads only |MV|+|delta|) wins big.
 echo ""
 echo "============================== CDC CONTRIBUTIONS =============================="
-printf '%-10s %-14s %10s %11s %10s %8s %9s\n' query fact mv_rows author_ms merge_ms mode incr_ms
-printf '%-10s %-14s %10s %11s %10s %8s %9s\n' ---------- -------------- ---------- ----------- ---------- -------- ---------
+printf '%-10s %-14s %16s %11s %10s %8s %9s\n' query fact 'mv_rows x cols' author_ms merge_ms mode incr_ms
+printf '%-10s %-14s %16s %11s %10s %8s %9s\n' ---------- -------------- ---------------- ----------- ---------- -------- ---------
 for n in "${NAMES[@]}"; do
   # author time = shape+materialize; when phase-1 reused a warm MV, author_ms is
   # blank — fall back to materialize_ms so the cold-build cost is still shown.
   au="${A_MS[$n]}"; [ -z "$au" -o "$au" = "0" ] && au="${M_MS[$n]:-?}"
-  printf '%-10s %-14s %10s %11s %10s %8s %9s\n' \
-    "$n" "${FACT[$n]}" "${MV_ROWS[$n]:-?}" "$au" "${MERGE[$n]:-?}" "${MODE[$n]:-?}" "${I_QMS[$n]:-?}"
+  printf '%-10s %-14s %16s %11s %10s %8s %9s\n' \
+    "$n" "${FACT[$n]}" "${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}" "$au" "${MERGE[$n]:-?}" "${MODE[$n]:-?}" "${I_QMS[$n]:-?}"
 done
 echo "=============================================================================="
 echo "mode=incremental → delta-merged (merge_ms, reads |MV|+|delta|); fallback/no-delta"
