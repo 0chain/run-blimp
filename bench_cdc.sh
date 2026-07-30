@@ -102,12 +102,21 @@ echo "== CDC bench: cluster=$CLUSTER_ID gw=$GW rows/append=$CDC_ROWS suites=[$SU
 for ft in $(facts_of); do
   FNAMES=$(names_for_fact "$ft"); [ -n "$FNAMES" ] || continue
   echo "==== fact: $ft (${FNAMES% }) ===="
-  echo ">> phase 1: author all (force_author)"
+  echo ">> phase 1: serve/author all (force_author=${FORCE_AUTHOR:-0})"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
     S_MS[$n]=$(echo "$R" | J query_ms);  MVTBL[$n]=$(echo "$R" | J mv_table)
     MV_ROWS[$n]=$(echo "$R" | J mv_rows); MV_COLS[$n]=$(echo "$R" | J mv_cols)
+    # A WARM serve reports no mv_rows/mv_cols — only an author does — so the
+    # dimensions were blank for exactly the queries that reused an MV, i.e. the
+    # normal production case. Read them off the MV parquet instead (also proves the
+    # file is really there). MV_DIMS_CMD is the hook: it receives the bare MV table
+    # name and must echo "<rows> <cols>"; unset = leave as reported.
+    if [ -z "${MV_ROWS[$n]}" ] && [ -n "${MVTBL[$n]}" ] && [ -n "${MV_DIMS_CMD:-}" ]; then
+      D=$($MV_DIMS_CMD "${MVTBL[$n]##*.}" 2>/dev/null)
+      MV_ROWS[$n]="${D%% *}"; MV_COLS[$n]="${D##* }"
+    fi
     echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
   done
   echo ">> phase 2: append +$CDC_ROWS to $ft + snapshot_changed"
