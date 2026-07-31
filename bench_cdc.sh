@@ -32,11 +32,16 @@ J(){ python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('$1',''))
 except: print('')"; }
 
-# ---- CDC-friendly suite over the appended fact: single-fact SUM/COUNT group-by
-# queries whose ONE fact is the table we append to, so a delta on it merges.
-# Default = the store_sales queries that both delta-merge AND are independently
-# confirmed correct (see CDC_INCREMENTAL.md "Verified set"):
-#   q3 q19 q43 q52 q55.
+# ---- The delta-merge suite. Default = the five queries the merge work is
+# actually being proven on (2026-07-31):
+#   q9 q88   single-MV store_sales group-bys — sub-second merges, the easy rung
+#   q14      3-fact (store_sales + catalog_sales + web_sales), Spark-verified
+#   q64      multi-CTE, decomposes into branch MVs / whole-query recipe
+#   q4       multi-CTE year_total over all three sales facts
+# The old default (q3 q19 q43 q52 q55) proved single-fact CDC and now proves
+# nothing new: every one of them merges. These five are where it still breaks.
+# They are multi-fact by design, so CDC_APPEND_TABLES below appends to ALL the
+# facts they read — a single-table append cannot exercise a k>1 merge.
 # Deliberately EXCLUDED (flaky or not incrementally mergeable, verified as such):
 #   q34/q59/q68 (derived-grain result-shapes), q73/q79 (needle queries, no reusable
 #   MV), q42/q46 (verifier can't confirm — self-aliased agg / derived-grain EXISTS).
@@ -50,7 +55,7 @@ Q_DIR="${Q_DIR:-$HOME/tpcds_queries}"
 if [ -n "${QNRS:-}" ]; then
   SUITES="${CDC_TABLE:-store_sales}:$QNRS"
 else
-  SUITES="${SUITES:-store_returns:1}"
+  SUITES="${SUITES:-store_sales:9 88 14 64 4}"
 fi
 declare -A SQL FACT; NAMES=()
 IFS=';' read -ra SUITE_ARR <<< "$SUITES"
@@ -119,22 +124,31 @@ for ft in $(facts_of); do
     fi
     echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
   done
-  echo ">> phase 2: append +$CDC_ROWS to $ft + snapshot_changed"
+  # MULTI-TABLE APPEND. CDC_APPEND_TABLES lets one cycle append to SEVERAL facts
+  # before phase 3, so a multi-fact query actually exercises a multi-fact merge.
+  # Without it every cycle touched exactly one fact, so q14 (store_sales +
+  # catalog_sales + web_sales) and q64 (catalog_sales + catalog_returns) only ever
+  # merged a single-table delta -- the k>1 path went untested. Defaults to $ft, so
+  # unset behaviour is byte-identical to before.
+  APPEND_TABLES="${CDC_APPEND_TABLES:-store_sales store_returns catalog_sales catalog_returns web_sales}"
+  echo ">> phase 2: append +$CDC_ROWS to [$APPEND_TABLES] + snapshot_changed"
+  for at in $APPEND_TABLES; do
   # Source-bucket creds must win over any stale ~/.aws/credentials profile.
   AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
   "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
-    --namespace "$NAMESPACE" --table "$ft" --rows "$CDC_ROWS" --s3-region "$REGION" \
+    --namespace "$NAMESPACE" --table "$at" --rows "$CDC_ROWS" --s3-region "$REGION" \
     ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1 | tail -1
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"$ft\",\"trigger\":\"cdc-bench\"}" >/dev/null
+    -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"$at\",\"trigger\":\"cdc-bench\"}" >/dev/null
   # catalog_sales appends are referential (seed also appends matching
   # catalog_returns rows — q64's cs_ui joins the two) → notify both tables.
-  if [ "$ft" = catalog_sales ]; then
+  if [ "$at" = catalog_sales ]; then
     curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
       -H "Content-Type: application/json" \
       -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"catalog_returns\",\"trigger\":\"cdc-bench\"}" >/dev/null
   fi
+  done
   echo ">> phase 3: re-run all (incremental)"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:incr"); I_QMS[$n]=$(echo "$R" | J query_ms)
