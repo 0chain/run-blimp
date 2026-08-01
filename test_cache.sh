@@ -42,13 +42,17 @@ REGION="${REGION:-ap-south-1}"
 # summary reported the router as slower than direct S3 purely from per-request
 # overhead. Pick the LARGEST prefix actually present instead; a bigger dataset
 # makes the cache leg meaningful, and an explicit CACHE_TABLE still wins.
+# run_router.sh already defaults to `store_sales catalog_sales` (~163 GiB at
+# SF1000, deliberately larger than RAM so warm reads cannot be page-cache-served).
+# Passing ONE small prefix here overrode that good default with the WORST case.
+# Take the largest few prefixes actually present instead, and pass them all.
 if [ -z "${CACHE_TABLE:-}" ]; then
   CACHE_TABLE=$(for t in store_sales catalog_sales web_sales inventory store_returns catalog_returns web_returns; do
       sz=$(aws s3 ls "s3://$ORIGIN_BUCKET/$t/" --recursive --region "$REGION" 2>/dev/null | awk '{s+=$3} END{print s+0}')
       [ "${sz:-0}" -gt 0 ] && echo "$sz $t"
-    done | sort -rn | head -1 | cut -d' ' -f2)
+    done | sort -rn | head -3 | awk '{printf "%s%s", (NR>1?" ":""), $2}')
   CACHE_TABLE="${CACHE_TABLE:-store_returns}"   # nothing probed (no aws creds / empty bucket)
-  echo "[cache] auto-selected largest origin prefix: $CACHE_TABLE"
+  echo "[cache] auto-selected origin prefixes: $CACHE_TABLE"
 fi
 export GW GW_AK GW_SK ROUTER NFS_MNT EC ORIGIN_BUCKET REGION
 

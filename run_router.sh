@@ -44,7 +44,12 @@ TABLES="${TABLES:-${TABLE:-store_sales catalog_sales}}"
 TABLE="${TABLES%% *}"   # first prefix — kept for the summary/JSON label
 ROUTER="${ROUTER:-http://$GW:8088}"
 MNT="${NFS_MNT:-/mnt/zusnfs}"
-PAR="${PAR:-$(( $(nproc) * 2 ))}"
+# These readers are NETWORK-bound (S3 GET / NFS read), not CPU-bound, so sizing
+# concurrency off core count throttles a small node for no reason: on a 2-vCPU
+# client PAR came out 4 while warp drove the SAME gateway at concurrency 16 and
+# measured 574 MiB/s, versus 26 MB/s here. Floor it at 16 so the comparison is
+# against the cache, not against the client's core count.
+PAR="${PAR:-$(( $(nproc) * 2 < 16 ? 16 : $(nproc) * 2 ))}"
 MAX_BYTES="${MAX_BYTES:-0}"   # 0 = read the whole prefix
 
 # drop the CLIENT page/dentry cache + a fresh NFS mount so every warm path is
