@@ -550,7 +550,110 @@ $cred_lines
   Make sure the cluster gateway can reach this node on :8181 (security group / firewall).
 ==========================================================================
 OUT
-  echo; bold "setup done — validate with:  blimp --query    (and  blimp --storage )"
+  # ---- finish the job HERE, once ------------------------------------------
+  # Everything below used to be discovered LATER, one item per 25-minute suite
+  # run: the gateway S3 keys (warp/mlperf silently measured nothing without
+  # them), the benchmark tools (mount-s3 was apt-only so mlperf never ran on an
+  # rpm host), the router's cache (never enabled, so every cache leg read zero
+  # objects). Four full runs to learn four things. Do them all now, at setup,
+  # so a customer types ONE command once and every suite works first time.
+  bold "== finishing setup: credentials + tools =="
+
+  # 1. Gateway S3 credentials. NOT the source-bucket keys — vpc mode leaves those
+  #    blank on purpose (IAM instance role), but the gateway's own S3 endpoint
+  #    authenticates by key and warp/mlperf/cache-mp-s3 are useless without it.
+  if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
+    echo "  The storage suite benchmarks the GATEWAY's S3 endpoint, which needs the"
+    echo "  cluster's own S3 access key/secret (Blimp UI → cluster → S3 credentials)."
+    GW_AK=$(ask GW_AK "  Gateway S3 access key (blank = skip warp/mlperf/mp-s3)")
+    GW_SK=$(ask GW_SK "  Gateway S3 secret key")
+  fi
+  if [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ]; then
+    sed -i.bak '/^GW_AK=/d;/^GW_SK=/d' "$ENVF" 2>/dev/null || true
+    printf 'GW_AK=%s\nGW_SK=%s\n' "$GW_AK" "$GW_SK" >> "$ENVF"
+    rm -f "$ENVF.bak"
+    echo "  ✓ gateway S3 credentials saved to $ENVF"
+  else
+    echo "  ! no gateway S3 credentials — warp, mlperf and cache-mp-s3 will be skipped."
+    echo "    Add GW_AK= / GW_SK= to $ENVF later and re-run; nothing else needs redoing."
+  fi
+
+  # 2. Benchmark tools, up front. They take minutes to install and used to be
+  #    installed at the START of --storage, so a failure cost a whole run.
+  if [ "${BLIMP_SKIP_DEPS:-0}" != "1" ]; then
+    ensure_storage_tools
+  fi
+
+  # 3. Read-through cache. The router only caches buckets named in its
+  #    -cache-buckets flag, and setup never set it — so on every cluster the
+  #    router ran as a pass-through and the cache legs measured nothing. Report
+  #    it here, at setup, instead of after a 25-minute benchmark.
+  local io act
+  io=$(curl -s -m 10 "http://$GW:8088/iostats" 2>/dev/null || true)
+  if [ -n "$io" ]; then
+    act=$(printf '%s' "$io" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(""); raise SystemExit
+print((d.get("cache_hits",0) or 0)+(d.get("cache_misses",0) or 0)+(d.get("bytes_written_to_cache",0) or 0))' 2>/dev/null || echo "")
+    if [ "${act:-0}" = "0" ]; then
+      echo "  ! the cluster's read-through cache is NOT enabled for this bucket."
+      echo "    The router is running with an empty -cache-buckets, so it proxies to"
+      echo "    origin and caches nothing; blimp --storage's cache legs will read 0"
+      echo "    objects. Enable it ON THE GATEWAY (once):"
+      echo "        sudo ICEBERG_URL=$ICEBERG_URL WAREHOUSE=$WAREHOUSE NAMESPACE=$NAMESPACE \\"
+      echo "             ORIGIN_BUCKET=$ORIGIN_BUCKET S3_REGION=$REGION \\"
+      echo "             bash hookup_cluster_source.sh"
+    else
+      echo "  ✓ read-through cache is active"
+    fi
+  fi
+
+  echo; bold "setup done — everything is wired. Validate with:  blimp --query    (and  blimp --storage )"
+}
+
+# preflight — verify EVERY prerequisite in seconds, before any long benchmark,
+# and report them ALL at once.
+#
+# This exists because the suites checked prerequisites lazily: each ~25-minute
+# run died on the next missing thing, so four runs were burned discovering four
+# problems that a ten-second check would have listed together. Fail fast, fail
+# complete, and name the fix for each.
+preflight(){
+  local need_gw_creds="${1:-0}" need_tools="${2:-0}" problems=0
+  bold "== preflight =="
+  if ! curl -s -o /dev/null -m 10 "http://$GW:9000/minio/health/live" 2>/dev/null; then
+    echo "  ✗ gateway $GW:9000 unreachable — check the security group / GW= in $ENVF"
+    problems=$((problems+1))
+  else
+    echo "  ✓ gateway reachable"
+  fi
+  if [ "$need_gw_creds" = "1" ]; then
+    if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
+      echo "  ✗ gateway S3 credentials missing (GW_AK/GW_SK in $ENVF)"
+      echo "    → warp, mlperf and cache-mp-s3 cannot run. Get them from the Blimp UI."
+      problems=$((problems+1))
+    else
+      echo "  ✓ gateway S3 credentials present"
+    fi
+  fi
+  if [ "$need_tools" = "1" ]; then
+    local miss=""
+    command -v warp     >/dev/null || miss="$miss warp"
+    command -v fio      >/dev/null || miss="$miss fio"
+    command -v mount-s3 >/dev/null || miss="$miss mount-s3"
+    [ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] || miss="$miss dlio"
+    if [ -n "$miss" ]; then
+      echo "  ✗ missing benchmark tools:$miss  → run 'blimp --setup' (installs them)"
+      problems=$((problems+1))
+    else
+      echo "  ✓ benchmark tools present (warp fio mount-s3 dlio)"
+    fi
+  fi
+  if [ "$problems" -gt 0 ]; then
+    die "$problems prerequisite(s) missing — fix the above and re-run. Nothing was benchmarked, so no time was wasted."
+  fi
+  echo "  all prerequisites met"
 }
 
 # ---- tests: source the saved wiring, then hand off to the suites -------------
@@ -659,8 +762,13 @@ ensure_storage_tools(){
 
 cmd_storage(){
   need_env
-  ensure_storage_tools
   : "${GW:?gateway missing in wiring}" "${REGION:?}"
+  # Everything the ~25-minute suite needs, checked in seconds and reported
+  # together. --setup installs the tools and saves the keys, so this normally
+  # just confirms; when it doesn't, you learn ALL of it now rather than one item
+  # per run.
+  preflight 1 1
+  ensure_storage_tools
   [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
   [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
   # REFUSE to run unauthenticated. These are the GATEWAY's own S3 credentials,
@@ -690,6 +798,7 @@ cmd_storage(){
 cmd_query(){
   need_env
   : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
+  preflight 0 0
   exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
     NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
     VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" bash "$HERE/test_query.sh"
@@ -698,6 +807,7 @@ cmd_query(){
 cmd_bench(){
   need_env
   : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
+  preflight 0 0
   # statistical profile: one-time author_ms + materialize_ms, and per-append
   # delta_merge_ms + materialize_ms (min/median/avg/max). Tune ITERS / AUTHOR_ITERS
   # / CDC_ROWS to size the sweep and the delta.
