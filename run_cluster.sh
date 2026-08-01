@@ -135,9 +135,19 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
     echo "== mlperf resnet50: REUSING existing dataset ($HAVE train files in $NG) =="
   else
     echo "== mlperf resnet50: generate $NF train + $NE eval via NFS (~$(( NF*143/1024 ))GiB) =="
+    # TIME THE WRITE. Generation is the mlperf WRITE path (dlio -> NFS -> blobbers)
+    # and the read (training over mountpoint-s3) was the only side ever reported,
+    # so a dataset that took many minutes to land showed up nowhere. Measure both
+    # directions: write here, read in the TRAIN step below.
+    local g0 g1 gsec gbytes
+    g0=$(date +%s)
     "$DLIO" workload=resnet50_h100 ++workload.dataset.data_folder="$NG" \
       ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
       ++workload.workflow.generate_data=True ++workload.workflow.train=False 2>&1 | grep -iE 'Generation done|error' | tail -1
+    g1=$(date +%s); gsec=$(( g1 - g0 )); [ "$gsec" -lt 1 ] && gsec=1
+    gbytes=$(du -sb "$NG" 2>/dev/null | awk '{print $1+0}')
+    [ "${gbytes:-0}" -gt 0 ] && \
+      echo "  mlperf write-NFS: $(( gbytes / gsec / 1000000 )) MB/s (${gsec}s, $(( gbytes / 1048576 )) MiB generated)"
   fi
   disk_guard
   # TRAIN interface: MLPERF_IFACE=mps3 (default, reads via mountpoint-s3 FUSE) or

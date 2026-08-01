@@ -219,3 +219,58 @@ for v in "$WARM_S3" "$WARM_MPS3" "$WARM_NFS"; do
 done
 printf '{"table":"%s","bytes":%s,"objects":%s,"mbps":{"direct_s3":%s,"cache_s3":%s,"cache_mp_s3":"%s","cache_nfs":"%s"}}\n' \
   "$TABLE" "$BYTES" "$NOBJ" "$DIRECT" "$WARM_S3" "$WARM_MPS3" "$WARM_NFS"
+
+# ============ WRITE → READ over a CONTROLLED set (NFS write, S3 reads) ==========
+# The legs above are bounded by the customer's dataset SHAPE, not by the cluster:
+# at SF1 the origin is one parquet file per table (3 objects, 0.26 GiB), so no S3
+# read path can parallelise and every number is per-request-latency bound — which
+# is why "cache" read 26 MB/s while warp drove the same gateway at 574 MiB/s.
+#
+# So do what the mlperf leg does: WRITE a purpose-built set through NFS (POSIX,
+# and the gateway exports one namespace over both faces so the objects are then
+# visible over S3 with no second copy), then READ it back over the two S3 faces.
+# Object count and size are ours to choose, so the read is genuinely concurrent
+# and the number reflects the cluster instead of the dataset. Both directions are
+# measured — write once, read twice.
+#
+# NOTE this is a READ-PATH measurement, not a read-through-cache one: the objects
+# are written straight into the gateway namespace, so there is no origin miss to
+# fill. The cache legs above remain the read-through test.
+RW_OBJS="${RW_OBJS:-64}"; RW_MIB="${RW_MIB:-16}"; RW_BKT="${RW_BKT:-blimp-rw-bench}"
+if [ "${RW_BENCH:-1}" = "1" ] && mountpoint -q "$MNT" 2>/dev/null; then
+  echo ""
+  echo "==================== write→read ($RW_OBJS × ${RW_MIB} MiB = $(( RW_OBJS * RW_MIB )) MiB) ===================="
+  RW_DIR="$MNT/$RW_BKT"; sudo mkdir -p "$RW_DIR" 2>/dev/null; sudo chown "$(id -u)" "$RW_DIR" 2>/dev/null
+  RW_BYTES=$(( RW_OBJS * RW_MIB * 1048576 ))
+  # 1) WRITE via NFS, PAR-parallel
+  t0=$(now)
+  seq 1 "$RW_OBJS" | xargs -P"$PAR" -I{} dd if=/dev/zero of="$RW_DIR/obj-{}.bin" bs=1M count="$RW_MIB" 2>/dev/null
+  sync 2>/dev/null || true
+  t1=$(now); RW_W=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
+  echo "  write-NFS   : $RW_W MB/s ($(el "$t0" "$t1")s, $RW_OBJS objects)"
+  # 2) READ back over S3 (gateway :9000 direct)
+  drop_client_cache
+  t0=$(now)
+  seq 1 "$RW_OBJS" | AWS_ACCESS_KEY_ID="${GW_AK:-}" AWS_SECRET_ACCESS_KEY="${GW_SK:-}" \
+    xargs -P"$PAR" -I{} aws --endpoint-url "http://$GW:9000" s3api get-object \
+      --bucket "$RW_BKT" --key "obj-{}.bin" /dev/stdout >/dev/null 2>&1
+  t1=$(now); RW_R_S3=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
+  echo "  read-S3     : $RW_R_S3 MB/s ($(el "$t0" "$t1")s, gateway :9000)"
+  # 3) READ back over mountpoint-s3
+  RW_R_MPS3="n/a"
+  if command -v mount-s3 >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then
+    RWMP=/mnt/mps3_rw; sudo mkdir -p "$RWMP"; sudo chown "$(id -u)" "$RWMP"; fusermount -u "$RWMP" 2>/dev/null || true
+    if AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" \
+       mount-s3 --endpoint-url "http://$GW:9000" --region us-east-1 "$RW_BKT" "$RWMP" 2>/dev/null; then
+      drop_client_cache
+      t0=$(now)
+      seq 1 "$RW_OBJS" | xargs -P"$PAR" -I{} dd if="$RWMP/obj-{}.bin" of=/dev/null bs=1M 2>/dev/null
+      t1=$(now); RW_R_MPS3=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
+      fusermount -u "$RWMP" 2>/dev/null || true
+    fi
+  fi
+  echo "  read-mp-s3  : $RW_R_MPS3 MB/s (mountpoint-s3 over gateway :9000)"
+  rm -f "$RW_DIR"/obj-*.bin 2>/dev/null || true
+  printf '{"rw_bench":{"objects":%s,"bytes":%s,"mbps":{"write_nfs":%s,"read_s3":%s,"read_mp_s3":"%s"}}}\n' \
+    "$RW_OBJS" "$RW_BYTES" "$RW_W" "$RW_R_S3" "$RW_R_MPS3"
+fi
