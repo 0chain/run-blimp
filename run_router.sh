@@ -66,6 +66,50 @@ mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
 
 echo "[cache-bench] origin=s3://$BKT/{$TABLES}/  region=$REGION  router=$ROUTER  par=$PAR"
 
+# --- the set MUST exceed 2x the gateway's RAM ------------------------------------
+# Otherwise the "warm" read is served from the gateway's page cache and the number
+# says nothing about the cache: at SF1 the whole origin is 328 MB against ~3.7 GiB
+# of gateway RAM, so every byte fits in memory several times over.
+#
+# The origin is the customer's data and we cannot make it bigger, so replicate it
+# SERVER-SIDE (S3 copy — no bytes cross the client) into a bench prefix until the
+# set clears the bar. Same objects, more of them: it also lifts object count, which
+# is what gives the read any concurrency (one parquet file per table cannot
+# parallelise).
+#
+# MIN_SET_BYTES defaults to 8 GiB = 2x a 4 GiB gateway. Set it explicitly to
+# 2x YOUR gateway's RAM on a bigger node, or 0 to skip the check entirely.
+MIN_SET_BYTES="${MIN_SET_BYTES:-8589934592}"
+BENCH_PREFIX="${BENCH_PREFIX:-_blimp_cachebench}"
+if [ "$MIN_SET_BYTES" -gt 0 ]; then
+  cur=$(for T in $TABLES $BENCH_PREFIX; do
+          aws s3 ls "s3://$BKT/$T/" --recursive --region "$REGION" 2>/dev/null
+        done | awk '{s+=$3} END{print s+0}')
+  if [ "${cur:-0}" -lt "$MIN_SET_BYTES" ]; then
+    # biggest single object as the replication unit — fewest copies, and it keeps
+    # the objects large enough that per-request overhead stays negligible.
+    src=$(for T in $TABLES; do
+            aws s3 ls "s3://$BKT/$T/" --recursive --region "$REGION" 2>/dev/null
+          done | sort -k3 -rn | head -1)
+    src_key=$(printf '%s' "$src" | awk '{print $4}')
+    src_sz=$(printf '%s' "$src" | awk '{print $3+0}')
+    if [ -n "$src_key" ] && [ "${src_sz:-0}" -gt 0 ]; then
+      need=$(( (MIN_SET_BYTES - cur + src_sz - 1) / src_sz ))
+      echo "[cache-bench] set is $(awk -v b="$cur" 'BEGIN{printf "%.2f",b/1073741824}') GiB, under the $(awk -v b="$MIN_SET_BYTES" 'BEGIN{printf "%.1f",b/1073741824}') GiB floor (2x gateway RAM)"
+      echo "[cache-bench] replicating $need x $(awk -v b="$src_sz" 'BEGIN{printf "%.0f",b/1048576}') MiB server-side into $BENCH_PREFIX/ (no client transfer)…"
+      i=0
+      while [ "$i" -lt "$need" ]; do
+        i=$((i+1))
+        aws s3 cp "s3://$BKT/$src_key" "s3://$BKT/$BENCH_PREFIX/copy-$i.bin" \
+          --region "$REGION" --only-show-errors 2>/dev/null &
+        [ $((i % 8)) -eq 0 ] && wait
+      done
+      wait
+    fi
+  fi
+  case " $TABLES " in *" $BENCH_PREFIX "*) ;; *) TABLES="$TABLES $BENCH_PREFIX";; esac
+fi
+
 # --- enumerate the object set (key<TAB>size), optionally capped to MAX_BYTES -------
 MAP=""
 for T in $TABLES; do

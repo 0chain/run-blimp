@@ -133,25 +133,47 @@ run "5/5 eviction (drive the cache past the high watermark; watch the evictor)" 
 
 echo ""
 echo "============================ STORAGE/CACHE SUMMARY ============================"
+# Print a line ONLY when that leg actually produced numbers. Unconditional
+# printf emitted "warp S3 PUT  MiB/s · GET  MiB/s" with empty fields whenever a
+# leg was skipped (or failed), which reads as a broken tool rather than a leg
+# that never ran — and with STORAGE_LEGS that is now the normal case.
+# Also surface the WRITE side of each test, not just the read: the cache-miss
+# fill, the write→read leg, and mlperf's dataset generation were all measured but
+# never reached the summary.
 awk '
   / TTFB: Avg/                { ttfb=$0 }
   /== warp PUT/               { sect="put" } /== warp GET/ { sect="get" }
   / \* Average:.*MiB\/s/      { if (sect=="put" && !put) put=$3; else if (sect=="get" && !get) get=$3 }
   /^  write: IOPS.*BW=/       { sub(/.*BW=/,""); sub(/ .*/,""); fw=$0 }
   /^  read: IOPS.*BW=/        { sub(/.*BW=/,""); sub(/ .*/,""); fr=$0 }
+  /mlperf write-NFS:/         { mw=$3 }
   /\[METRIC\] Training Accelerator/      { au=$NF; sub(/\(.*/,"",au); au=$(NF-1) }
   /\[METRIC\] Training Throughput/       { sm=$(NF-1) }
   /\[METRIC\] Training I\/O Throughput/  { io=$(NF-1) }
+  /cache-bench\] set:/        { setsz=$0; sub(/^.*set: /,"",setsz) }
+  /cache-MISS→write:/         { cw=$2 }
   /direct-S3 \(origin\)/      { d=$3 }  /cache-S3 \(router/   { c=$4 }
   /cache-mp-s3 \(warm\)/      { m=$3 }  /cache-NFS \(Ganesha/ { n=$4 }
   /speedup vs direct-S3/      { sp=$0; sub(/^ */,"",sp) }
+  /^  write-NFS   :/          { rww=$3 }
+  /^  read-S3     :/          { rwr=$3 }
+  /^  read-mp-s3  :/          { rwm=$3 }
   END{
-    printf "  warp   S3 PUT %s MiB/s · GET %s MiB/s\n", put, get
-    if (ttfb) { sub(/^ *\* */,"",ttfb); printf "  %s\n", ttfb }
-    printf "  fio    NFS write %s · read %s\n", fw, fr
-    if (io) printf "  mlperf AU %s%% · %s samples/s · %s MB/s\n", au, sm, io
-    printf "  cache  direct-S3 %s · router %s · mp-s3 %s · NFS %s MB/s\n", d, c, m, n
-    if (sp) printf "  %s\n", sp
+    any=0
+    if (put || get) { printf "  warp    S3 PUT %s MiB/s · GET %s MiB/s\n", put, get; any=1
+                      if (ttfb) { sub(/^ *\* */,"",ttfb); printf "  %s\n", ttfb } }
+    if (fw || fr)   { printf "  fio     NFS write %s · read %s\n", fw, fr; any=1 }
+    if (mw || io)   { printf "  mlperf  write-NFS %s MB/s", (mw?mw:"n/a")
+                      if (io) printf " · read AU %s%% · %s samples/s · %s MB/s", au, sm, io
+                      else    printf " · read (train produced no metrics)"
+                      printf "\n"; any=1 }
+    if (d || c || m) {
+      printf "  cache   set %s · direct-S3 %s · MISS→write %s · hit-S3 %s · hit-mp-s3 %s MB/s\n",
+             (setsz?setsz:"?"), d, (cw?cw:"n/a"), c, m
+      if (sp) printf "  %s\n", sp
+      any=1 }
+    if (rww || rwr) { printf "  wr→rd   write-NFS %s · read-S3 %s · read-mp-s3 %s\n", rww, rwr, rwm; any=1 }
+    if (!any) print "  (no leg produced numbers — see the log above for the failure)"
   }' "$CAP"
 echo "==============================================================================="
 echo "==================== suite complete — compare to EXPECTED_TEST_RESULTS.md ===================="
