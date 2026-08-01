@@ -206,10 +206,38 @@ grant_bucket_access(){
   local princ="\"arn:aws:iam::${acct}:root\""
   [ -n "$role_arn" ] && princ="$princ, \"$role_arn\""
   bold "  granting s3 access on s3://$bkt to account $acct${role_arn:+ + gateway role}"
-  local pol; pol=$(cat <<J
-{"Version":"2012-10-17","Statement":[{"Sid":"BlimpSourceAccess","Effect":"Allow","Principal":{"AWS":[${princ}]},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::${bkt}","arn:aws:s3:::${bkt}/*"]}]}
-J
+  # MERGE, don't clobber. This used to build a single-statement document and
+  # put-bucket-policy it, which REPLACES the whole policy — so a second --setup
+  # silently deleted every other statement on the bucket. Measured on
+  # 2026-08-01: an operator-added grant for the gateway role (the only thing
+  # making reads work) was wiped by a re-run, and the gateway went back to 403
+  # with "no identity-based policy allows the s3:ListBucket action".
+  #
+  # Keep every statement that is not ours, replace only Sid BlimpSourceAccess.
+  local existing; existing=$(aws s3api get-bucket-policy --bucket "$bkt" --query Policy --output text 2>/dev/null)
+  local pol; pol=$(EXISTING="$existing" PRINC="$princ" BKT="$bkt" python3 - <<'PYEOF'
+import json, os
+princ = json.loads("[" + os.environ["PRINC"] + "]")
+bkt = os.environ["BKT"]
+ours = {
+    "Sid": "BlimpSourceAccess", "Effect": "Allow",
+    "Principal": {"AWS": princ},
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"],
+    "Resource": [f"arn:aws:s3:::{bkt}", f"arn:aws:s3:::{bkt}/*"],
+}
+doc = {"Version": "2012-10-17", "Statement": []}
+raw = os.environ.get("EXISTING", "").strip()
+if raw:
+    try:
+        prev = json.loads(raw)
+        doc["Statement"] = [st for st in prev.get("Statement", []) if st.get("Sid") != "BlimpSourceAccess"]
+    except Exception:
+        pass  # unparseable policy: fall through to ours alone rather than fail the setup
+doc["Statement"].append(ours)
+print(json.dumps(doc))
+PYEOF
 )
+  [ -n "$existing" ] && bold "  (merging into the bucket's existing policy — other statements are preserved)"
   if aws s3api put-bucket-policy --bucket "$bkt" --policy "$pol" >/dev/null 2>&1; then
     if [ -n "$role_arn" ]; then
       bold "  ✓ bucket policy applied to s3://$bkt (account + gateway role $role_arn)"
