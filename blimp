@@ -32,6 +32,13 @@ die(){ printf '\033[31m[blimp] FATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 # ask VAR "prompt" [default] — keep an already-set value; else prompt (default on empty)
 ask(){ local var="$1" prompt="$2" def="${3:-}" cur="${!1:-}" v
   [ -n "$cur" ] && { printf '%s' "$cur"; return; }
+  # No terminal (CI, `ssh host cmd`, nohup) → take the default instead of dying.
+  # `read </dev/tty` on such a host printed "/dev/tty: No such device or address"
+  # for EVERY prompt and the run ended with no wiring written.
+  if [ ! -r /dev/tty ]; then
+    printf '%s%s: <no tty, using default>\n' "$prompt" "${def:+ [$def]}" >&2
+    printf '%s' "$def"; return
+  fi
   printf '%s%s: ' "$prompt" "${def:+ [$def]}" >&2; read -r v </dev/tty || true
   printf '%s' "${v:-$def}"; }
 
@@ -84,6 +91,21 @@ E
 # same-VPC / same-account AWS run, or to a stable DNS name you control.
 this_host(){
   [ -n "${ADVERTISE_HOST:-}" ] && { printf '%s' "$ADVERTISE_HOST"; return; }
+  # VPC MODE: advertise the PRIVATE address, and specifically the one that
+  # ROUTES TO THE GATEWAY. The public IP is unreachable from inside the VPC —
+  # the gateway hung for 411s on every metadata GET to a catalog advertised at
+  # the client's public IP, then died on a read timeout with no error surfaced
+  # (cluster 1785550395356, 2026-08-01). `ip route get` picks the right source
+  # address on a multi-NIC host, where "first hostname -I" is a coin flip.
+  if [ "${MODE:-}" = vpc ]; then
+    local src=""
+    [ -n "${GW_PRIV:-}" ] && src=$(ip route get "$GW_PRIV" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+    [ -z "$src" ] && src="${CLIENT_PRIV:-}"
+    [ -z "$src" ] && src=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$src" ] && { printf '%s' "$src"; return; }
+  fi
+  # EXTERNAL (cross-region / cross-account / cross-cloud / on-prem): the gateway
+  # can only come back over a public path, so advertise the public address.
   local ip; ip=$(curl -s -m 3 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')
   [ -n "$ip" ] && { printf '%s' "$ip"; return; }
   hostname -I 2>/dev/null | awk '{print $1}'
@@ -97,6 +119,21 @@ standup_iceberg(){
   local DKR=docker; command -v docker >/dev/null || DKR="sudo docker"
   $DKR info >/dev/null 2>&1 || DKR="sudo docker"
   $DKR info >/dev/null 2>&1 || die "docker not available — needed to stand up the Iceberg catalog. Install docker, or pass an existing Iceberg REST URL."
+  # IDEMPOTENT: a healthy catalog already serving THIS warehouse is reused. The
+  # previous behaviour was `rm -f` then recreate on every --setup, which tore
+  # down a working catalog (and anything mid-flight against it) to rebuild an
+  # identical one. Only a missing, unhealthy, or differently-pointed container is
+  # replaced.
+  if curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1; then
+    local cur; cur=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
+                     | sed -n 's/^CATALOG_WAREHOUSE=//p' | head -1)
+    if [ "$cur" = "$WAREHOUSE" ]; then
+      ICEBERG_URL="http://$(this_host):8181"
+      bold "  Iceberg catalog already up over $WAREHOUSE — reusing it ($ICEBERG_URL)"
+      return 0
+    fi
+    bold "  catalog on :8181 points at ${cur:-<unknown>}, not $WAREHOUSE — replacing it"
+  fi
   bold "standing up an Iceberg REST catalog on :8181 over $WAREHOUSE"
   $DKR rm -f iceberg-rest >/dev/null 2>&1 || true
   $DKR run -d --name iceberg-rest --restart unless-stopped -p 8181:8181 \
@@ -160,6 +197,10 @@ grant_bucket_access(){
       --query 'InstanceProfile.Roles[0].Arn' --output text 2>/dev/null)
   fi
   [ "$role_arn" = None ] && role_arn=""
+  # Explicit override for the cases discovery cannot cover: cross-account, a
+  # gateway not tagged cluster-<id>-zs3server, or (the case that bit us) a client
+  # whose own IAM role lacks ec2:DescribeInstances / iam:GetInstanceProfile.
+  [ -z "$role_arn" ] && role_arn="${GATEWAY_ROLE_ARN:-}"
   # principals: account root (covers the catalog IAM user + aws-cli writer in this
   # account) plus the gateway role explicitly (belt & suspenders if it's assumed).
   local princ="\"arn:aws:iam::${acct}:root\""
@@ -169,9 +210,25 @@ grant_bucket_access(){
 {"Version":"2012-10-17","Statement":[{"Sid":"BlimpSourceAccess","Effect":"Allow","Principal":{"AWS":[${princ}]},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::${bkt}","arn:aws:s3:::${bkt}/*"]}]}
 J
 )
-  aws s3api put-bucket-policy --bucket "$bkt" --policy "$pol" >/dev/null 2>&1 \
-    && bold "  ✓ bucket policy applied to s3://$bkt" \
-    || bold "  (could not set bucket policy on s3://$bkt — may already be owned cross-account; ensure the owner grants the gateway role + catalog user)"
+  if aws s3api put-bucket-policy --bucket "$bkt" --policy "$pol" >/dev/null 2>&1; then
+    if [ -n "$role_arn" ]; then
+      bold "  ✓ bucket policy applied to s3://$bkt (account + gateway role $role_arn)"
+    else
+      # A policy naming ONLY <acct>:root grants the gateway NOTHING: for
+      # same-account access :root merely DELEGATES to IAM, so a role without its
+      # own s3 allow still gets 403. Saying "✓ applied" here is how a broken
+      # grant looked successful while every read failed 403 (2026-08-01).
+      bold "  ! bucket policy applied to s3://$bkt, but the GATEWAY ROLE could not be discovered"
+      bold "    (this client's IAM has no ec2:DescribeInstances / iam:GetInstanceProfile, or the"
+      bold "     gateway is in another account). A policy naming only <account>:root does NOT grant"
+      bold "     the gateway access — it delegates to IAM, and the gateway role has no s3 allow."
+      bold "    Fix with either:"
+      bold "      GATEWAY_ROLE_ARN=arn:aws:iam::<acct>:role/<gateway-role> ./blimp --setup"
+      bold "      or have the bucket owner add that role as a Principal on s3://$bkt"
+    fi
+  else
+    bold "  (could not set bucket policy on s3://$bkt — may already be owned cross-account; ensure the owner grants the gateway role + catalog user)"
+  fi
 }
 
 # ---- auto-assess network mode: same-VPC (private) vs external cloud (public) --
@@ -192,6 +249,23 @@ assess_mode(){
       --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
       --query 'Reservations[0].Instances[0].[PrivateIpAddress,PublicIpAddress]' --output text 2>/dev/null)"
     [ "$GW_PRIV" = None ] && GW_PRIV=""; [ "$GW_PUB" = None ] && GW_PUB=""
+  fi
+  # FALLBACK when the EC2 lookup is unavailable. Discovery above needs
+  # ec2:DescribeInstances, which a client's own instance role often lacks — and
+  # when it silently returned nothing, GW_PRIV stayed empty, the probe below
+  # never ran, MODE fell to external, and the node advertised its PUBLIC address
+  # to a gateway that can only reach it privately. Every catalog read then hung
+  # until timeout (cluster 1785550395356, 2026-08-01). So: if the operator
+  # already told us the gateway address and it is a private one, probe THAT.
+  if [ -z "$GW_PRIV" ] && [ -n "${GW:-}" ]; then
+    case "$GW" in
+      10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) GW_PRIV="$GW" ;;
+    esac
+  fi
+  if [ -z "$GW_PRIV" ]; then
+    bold "  ! gateway private IP not discoverable (this client's IAM may lack ec2:DescribeInstances)."
+    bold "    Assuming EXTERNAL mode. If this node IS in the cluster's VPC, re-run with"
+    bold "    GW=<gateway-private-ip> so the catalog is advertised on a reachable address."
   fi
   # authoritative probe: reach the gateway PRIVATE IP (covers same-VPC AND peered)
   if [ -n "$GW_PRIV" ] && [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$GW_PRIV:9000/minio/health/live" 2>/dev/null)" = 200 ]; then
@@ -246,6 +320,30 @@ ensure_deps(){
     command -v docker >/dev/null && sudo systemctl enable --now docker >/dev/null 2>&1 || true
     # aws CLI: prefer snap (newer) when apt's awscli is absent
     command -v aws >/dev/null || { command -v snap >/dev/null && sudo snap install aws-cli --classic >/dev/null 2>&1 || true; }
+  elif command -v dnf >/dev/null || command -v yum >/dev/null; then
+    # RPM hosts — Amazon Linux 2023, RHEL, Fedora, Rocky. Without this branch the
+    # kit printed a hint and then died at the catalog step ("docker not
+    # available"), which contradicts the README's "you need nothing
+    # pre-installed" on the single most likely AWS AMI (AL2023, 2026-08-01).
+    local PKG; PKG=$(command -v dnf >/dev/null && echo dnf || echo yum)
+    local want=()
+    command -v docker >/dev/null || want+=(docker)
+    command -v unzip  >/dev/null || want+=(unzip)
+    python3 -c 'import ensurepip' 2>/dev/null || want+=(python3-pip)
+    if [ "${#want[@]}" -gt 0 ]; then
+      bold "  installing: ${want[*]}"
+      sudo "$PKG" install -y -q "${want[@]}" 2>&1 | tail -1 || true
+    fi
+    if command -v docker >/dev/null; then
+      sudo systemctl enable --now docker >/dev/null 2>&1 || true
+      # AL2023 does not add the invoking user to the docker group, so every
+      # later `docker` call would need sudo. Add it AND fall back to sudo for
+      # this session, since a new group only applies to a new login.
+      sudo usermod -aG docker "$(id -un)" >/dev/null 2>&1 || true
+      # a fresh group needs a new login, so this session keeps using sudo — the
+      # catalog step already falls back to `sudo docker` when `docker info` fails.
+    fi
+    command -v aws >/dev/null || sudo "$PKG" install -y -q awscli 2>&1 | tail -1 || true
   else
     command -v docker >/dev/null || echo "  ! docker not found (needed to stand up the catalog) — install it or pass an existing Iceberg URL"
     command -v aws    >/dev/null || echo "  ! aws CLI not found (needed to create/grant the S3 bucket) — install it or pass an existing warehouse"
@@ -343,6 +441,13 @@ cmd_setup(){
   # catalog now (BYO-data users register their own with register_tpcds_tables.py).
   # register runs LOCALLY, so it reaches the catalog + MinIO on localhost.
   if [ "${DATA_GENERATED:-0}" = 1 ]; then
+    # IDEMPOTENT: registration is add_files against the catalog, so re-running it
+    # on an already-populated namespace is wasted work that ends in a warning.
+    local have; have=$(curl -s -m 8 "http://localhost:8181/v1/namespaces/$NAMESPACE/tables" 2>/dev/null \
+                       | grep -o '"name"' | wc -l | tr -d ' ')
+    if [ "${have:-0}" -ge 24 ]; then
+      bold "  ✓ $NAMESPACE already has $have tables registered — skipping registration"
+    else
     bold "registering the 24 TPC-DS SF1 tables into the catalog"
     local reg_ep=""; case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint http://localhost:9000";; esac
     AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
@@ -350,6 +455,7 @@ cmd_setup(){
       --warehouse "$WAREHOUSE" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
       --namespace "$NAMESPACE" $reg_ep 2>&1 | tail -3 \
       || bold "  (auto-register had issues — re-run register_tpcds_tables.py manually)"
+    fi
   fi
 
   save_env
