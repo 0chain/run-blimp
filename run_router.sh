@@ -132,18 +132,28 @@ if command -v mount-s3 >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then
 fi
 
 # ============================ 4) CACHE-NFS (warm) ================================
-# The same cached objects live at <MNT>/<BKT>/<key> (the cache bucket is a gateway S3
-# bucket == NFS namespace). Read them via Ganesha to /dev/null. Fresh mount + client
-# cache drop; throughput over the bytes that are actually present (see 3b note).
-remount_nfs
-drop_client_cache
-NHITMAP=$(echo "$MAP" | awk -v m="$MNT/$BKT" -F'\t' '{ if (system("test -f \"" m "/" $1 "\"")==0) print }')
-NHITB=$(echo "$NHITMAP" | awk -F'\t' '{s+=$2}END{print s+0}'); NHITN=$(echo "$NHITMAP" | awk 'NF' | wc -l | tr -d ' ')
-[ "$NHITN" -lt "$NOBJ" ] && echo "  (note: only $NHITN/$NOBJ objects present on NFS — measuring those $(awk -v b="$NHITB" 'BEGIN{printf "%.1f",b/1073741824}') GiB)"
-t0=$(now)
-echo "$NHITMAP" | cut -f1 | xargs -P"$PAR" -I{} sh -c 'dd if="$1/$2" of=/dev/null bs=1M 2>/dev/null' _ "$MNT/$BKT" "{}"
-t1=$(now); WARM_NFS=$(mbps "$NHITB" "$(el "$t0" "$t1")"); WARM_NFS_S=$(el "$t0" "$t1")
-echo "  cache-NFS : $WARM_NFS MB/s (${WARM_NFS_S}s, eblobber cache via Ganesha, $NHITN objs)"
+# OFF BY DEFAULT (CACHE_NFS=1 to include). The cache is measured over the two S3
+# paths only — the router (:8088) and mountpoint-s3 against the gateway (:9000) —
+# because S3 is the fastest read path and the one customers actually use.
+#
+# The Ganesha view reads the SAME bytes (the cache bucket is a gateway S3 bucket,
+# and the gateway exports that one namespace over both S3 and NFS — there is no
+# second copy), so it adds a third number for the same stored object while
+# introducing a POSIX/FUSE path that is neither the fast path nor the shipped one.
+# Keep it available for diagnosing the NFS face specifically; the raw NFS
+# throughput of the cluster is already covered by the fio leg of --storage.
+WARM_NFS="n/a"
+if [ "${CACHE_NFS:-0}" = "1" ]; then
+  remount_nfs
+  drop_client_cache
+  NHITMAP=$(echo "$MAP" | awk -v m="$MNT/$BKT" -F'\t' '{ if (system("test -f \"" m "/" $1 "\"")==0) print }')
+  NHITB=$(echo "$NHITMAP" | awk -F'\t' '{s+=$2}END{print s+0}'); NHITN=$(echo "$NHITMAP" | awk 'NF' | wc -l | tr -d ' ')
+  [ "$NHITN" -lt "$NOBJ" ] && echo "  (note: only $NHITN/$NOBJ objects present on NFS — measuring those $(awk -v b="$NHITB" 'BEGIN{printf "%.1f",b/1073741824}') GiB)"
+  t0=$(now)
+  echo "$NHITMAP" | cut -f1 | xargs -P"$PAR" -I{} sh -c 'dd if="$1/$2" of=/dev/null bs=1M 2>/dev/null' _ "$MNT/$BKT" "{}"
+  t1=$(now); WARM_NFS=$(mbps "$NHITB" "$(el "$t0" "$t1")"); WARM_NFS_S=$(el "$t0" "$t1")
+  echo "  cache-NFS : $WARM_NFS MB/s (${WARM_NFS_S}s, eblobber cache via Ganesha, $NHITN objs)"
+fi
 
 # ===================== is the cache even TURNED ON? ==============================
 # The router only caches buckets listed in its -cache-buckets flag. `blimp --setup`
@@ -175,13 +185,13 @@ if [ "$CACHE_ON" = "off" ]; then
   echo "    The router reports 0 hits AND 0 misses, i.e. these reads never entered the"
   echo "    cache path — it is started with an empty -cache-buckets and is proxying"
   echo "    straight to the origin. So 'cache-S3' below is NOT a cache hit, and"
-  echo "    cache-mp-s3 / cache-NFS find 0 objects because nothing was ever cached."
+  echo "    cache-mp-s3 finds 0 objects because nothing was ever cached."
   echo "    Enable it, then re-run:   ./hookup_cluster_source.sh"
 fi
 printf '  %-26s %8s MB/s\n' "direct-S3 (origin)"        "$DIRECT"
 printf '  %-26s %8s MB/s\n' "cache-S3 (router, warm)"   "$WARM_S3"
 printf '  %-26s %8s MB/s\n' "cache-mp-s3 (warm)"        "$WARM_MPS3"
-printf '  %-26s %8s MB/s\n' "cache-NFS (Ganesha, warm)" "$WARM_NFS"
+[ "$WARM_NFS" != "n/a" ] && printf '  %-26s %8s MB/s\n' "cache-NFS (Ganesha, warm)" "$WARM_NFS"
 # A speedup ratio over a tiny set is NOISE, not a measurement. At SF1 the whole
 # origin bucket is ~330 MB and the default table prefix is ONE 17 MB object, so
 # both legs are dominated by per-request latency and the ratio swings wildly —
@@ -197,7 +207,7 @@ if [ "${BYTES:-0}" -lt "$MIN_RATIO_BYTES" ] 2>/dev/null; then
     printf "    Point CACHE_TABLE at a larger prefix, or set MIN_RATIO_BYTES to override.\n"}'
 else
   awk -v d="$DIRECT" -v s="$WARM_S3" -v m="$WARM_MPS3" -v n="$WARM_NFS" 'BEGIN{
-    if(d>0){ printf "  speedup vs direct-S3: cache-S3 %.1fx  mp-s3 %s  cache-NFS %.1fx\n", s/d, (m=="n/a"?"n/a":sprintf("%.1fx",m/d)), n/d }}'
+    if(d>0){ printf "  speedup vs direct-S3: cache-S3 %.1fx  mp-s3 %s%s\n", s/d, (m=="n/a"?"n/a":sprintf("%.1fx",m/d)), (n=="n/a"?"":sprintf("  cache-NFS %.1fx", n/d)) }}'
 fi
 # physics gate: c6in.4xlarge networking is 25 Gbps baseline, "up to 50 Gbps"
 # burst ≈ 6250 MB/s absolute ceiling — any single-path number above it means
@@ -207,5 +217,5 @@ for v in "$WARM_S3" "$WARM_MPS3" "$WARM_NFS"; do
   case "$v" in n/a) continue;; esac
   [ "${v:-0}" -gt 6400 ] 2>/dev/null && echo "  ⚠ SUSPECT: $v MB/s exceeds the 50 Gbps NIC burst ceiling — treat as invalid"
 done
-printf '{"table":"%s","bytes":%s,"objects":%s,"mbps":{"direct_s3":%s,"cache_s3":%s,"cache_mp_s3":"%s","cache_nfs":%s}}\n' \
+printf '{"table":"%s","bytes":%s,"objects":%s,"mbps":{"direct_s3":%s,"cache_s3":%s,"cache_mp_s3":"%s","cache_nfs":"%s"}}\n' \
   "$TABLE" "$BYTES" "$NOBJ" "$DIRECT" "$WARM_S3" "$WARM_MPS3" "$WARM_NFS"

@@ -729,6 +729,21 @@ ensure_storage_tools(){
       echo "  ! no apt/dnf/yum — cannot install mount-s3; mlperf + cache-mp-s3 will be skipped"
     fi
   }
+  # dlio imports mpi4py at startup, which dlopen()s a real MPI runtime. Without
+  # one it dies with "RuntimeError: cannot load MPI library" during dataset
+  # GENERATION, so mlperf produced no numbers at all even with dlio installed
+  # (AL2023, 2026-08-01) — and `mpirun` is required for accel>1 on top of that.
+  # Amazon Linux ships it as openmpi/openmpi-devel; Debian as openmpi-bin +
+  # libopenmpi-dev. Neither puts it on PATH/LD_LIBRARY_PATH — run_cluster.sh
+  # prepends /usr/lib64/openmpi/{bin,lib} itself.
+  if ! ls /usr/lib64/openmpi/bin/mpirun /usr/bin/mpirun >/dev/null 2>&1; then
+    bold "  installing openmpi (dlio/mlperf needs an MPI runtime)…"
+    if command -v dnf >/dev/null; then sudo dnf install -y -q openmpi openmpi-devel >/dev/null 2>&1
+    elif command -v yum >/dev/null; then sudo yum install -y -q openmpi openmpi-devel >/dev/null 2>&1
+    elif command -v apt-get >/dev/null; then sudo apt-get install -y -qq openmpi-bin libopenmpi-dev >/dev/null 2>&1; fi
+    ls /usr/lib64/openmpi/bin/mpirun /usr/bin/mpirun >/dev/null 2>&1 \
+      || echo "  ! openmpi install failed — mlperf will fail with 'cannot load MPI library'"
+  fi
   # dlio (mlperf resnet50 driver) — venv install, one-time.
   if [ ! -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ]; then
     bold "  installing dlio-benchmark (one-time, mlperf)…"

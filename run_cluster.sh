@@ -96,6 +96,25 @@ bench_fio(){ mount_nfs || return 0; disk_guard; local D="$MNT/bench-fio"; sudo m
 # NOT the NFS mount: mlperf reads via mount-s3 (FUSE over the gateway S3), same as
 # the cluster's mlperf-mp-s3 button.
 bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
+  # dlio imports mpi4py, which dlopen()s libmpi at startup. Distro OpenMPI is NOT
+  # on the default PATH/LD_LIBRARY_PATH (Amazon Linux keeps it under
+  # /usr/lib64/openmpi), so dlio died with "RuntimeError: cannot load MPI library"
+  # during dataset generation and mlperf produced NO numbers at all — the suite
+  # printed its two banner lines and moved on. Prepend whichever prefix exists.
+  local mpidir
+  for mpidir in /usr/lib64/openmpi /usr/lib/x86_64-linux-gnu/openmpi /usr/lib64/mpich; do
+    if [ -x "$mpidir/bin/mpirun" ]; then
+      PATH="$mpidir/bin:$PATH"
+      LD_LIBRARY_PATH="$mpidir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      export PATH LD_LIBRARY_PATH
+      break
+    fi
+  done
+  if ! /opt/dlio/venv_mlperf/bin/python -c 'from mpi4py import MPI' >/dev/null 2>&1; then
+    echo "!! mlperf SKIPPED: no working MPI runtime (dlio needs mpi4py + libmpi)."
+    echo "   install it:  sudo dnf install -y openmpi openmpi-devel   (or openmpi-bin libopenmpi-dev)"
+    return 0
+  fi
   local BKT="${MLPERF_BUCKET:-mlperf-bench}" MPS3="${MPS3_MNT:-/mnt/mps3}" DLIO=/opt/dlio/venv_mlperf/bin/dlio_benchmark
   # EXACT run_bench resnet50 profile (zs3-init line 10936 / train line 11173):
   #   2/1 -> accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain 34*7=238 / neval 64
