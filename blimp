@@ -736,12 +736,15 @@ ensure_storage_tools(){
   # Amazon Linux ships it as openmpi/openmpi-devel; Debian as openmpi-bin +
   # libopenmpi-dev. Neither puts it on PATH/LD_LIBRARY_PATH — run_cluster.sh
   # prepends /usr/lib64/openmpi/{bin,lib} itself.
-  if ! ls /usr/lib64/openmpi/bin/mpirun /usr/bin/mpirun >/dev/null 2>&1; then
+  # `ls a b` exits non-zero when EITHER path is missing, so the old check always
+  # claimed MPI was absent — it reinstalled every run and then reported failure
+  # even on a host where OpenMPI was already installed and working.
+  if ! { [ -x /usr/lib64/openmpi/bin/mpirun ] || [ -x /usr/bin/mpirun ] || command -v mpirun >/dev/null; }; then
     bold "  installing openmpi (dlio/mlperf needs an MPI runtime)…"
     if command -v dnf >/dev/null; then sudo dnf install -y -q openmpi openmpi-devel >/dev/null 2>&1
     elif command -v yum >/dev/null; then sudo yum install -y -q openmpi openmpi-devel >/dev/null 2>&1
     elif command -v apt-get >/dev/null; then sudo apt-get install -y -qq openmpi-bin libopenmpi-dev >/dev/null 2>&1; fi
-    ls /usr/lib64/openmpi/bin/mpirun /usr/bin/mpirun >/dev/null 2>&1 \
+    { [ -x /usr/lib64/openmpi/bin/mpirun ] || [ -x /usr/bin/mpirun ] || command -v mpirun >/dev/null; } \
       || echo "  ! openmpi install failed — mlperf will fail with 'cannot load MPI library'"
   fi
   # dlio (mlperf resnet50 driver) — venv install, one-time.

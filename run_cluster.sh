@@ -105,7 +105,11 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   # NVIDIA DALI (a CUDA package with no place on a CPU-only client). Without it
   # generation died with FileNotFoundError before producing a single number. The
   # kit carries its own implementation — put the kit dir on PATH so dlio finds it.
-  PATH="$HERE:$PATH"; export PATH
+  # NOTE: resolve the kit dir HERE. This script runs under `set -u` and has no
+  # $HERE of its own (that lives in test_cache.sh), so referencing it aborted the
+  # whole leg with "HERE: unbound variable" before mlperf ran a single step.
+  local kitdir; kitdir="$(cd "$(dirname "$0")" && pwd)"
+  PATH="$kitdir:$PATH"; export PATH
   local mpidir
   for mpidir in /usr/lib64/openmpi /usr/lib/x86_64-linux-gnu/openmpi /usr/lib64/mpich; do
     if [ -x "$mpidir/bin/mpirun" ]; then
