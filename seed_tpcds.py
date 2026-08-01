@@ -23,6 +23,14 @@ def conform_to_table_schema(tbl, table, n):
     import pyarrow as pa
     from pyiceberg.io.pyarrow import schema_to_pyarrow
     aschema = schema_to_pyarrow(table.schema())
+    # schema_to_pyarrow stamps PARQUET:field_id on every field, and pq.write_table
+    # then writes those IDs into the file — which add_files refuses outright:
+    # "Cannot add file ... because it has field IDs. `add_files` only supports
+    # addition of files without field_ids". That aborted the CDC append for all
+    # five facts (AWS SF1, 2026-08-01), so every delta-merge measured 0 rows.
+    # Only the metadata is a problem; names/types/nullability are what both the
+    # physical glob and the iceberg-schema read actually need, so keep those.
+    aschema = pa.schema([pa.field(f.name, f.type, f.nullable) for f in aschema])
     have = {name: tbl[name] for name in tbl.column_names}
     cols = []
     for field in aschema:
@@ -163,6 +171,14 @@ def main():
         from pyiceberg.expressions import EqualTo
         t.delete(EqualTo(store_col,a.upsert_store_sk)); t.refresh()
         print(f"upsert: deleted {store_col}={a.upsert_store_sk} slice -> snapshot {t.current_snapshot().snapshot_id}")
+    # write_statistics=False: conform_to_table_schema null-fills every column we
+    # don't synthesize, so the delta carries all-null decimal columns. parquet
+    # writes their stats with min_raw=None, and pyiceberg's stats reader calls
+    # Decimal(None) on it unguarded -> "conversion from NoneType to Decimal is not
+    # supported" (pyiceberg/io/pyarrow.py:2344), aborting add_files for every fact
+    # whose synthesized set doesn't cover its decimals. The delta files are tiny,
+    # so the lost row-group pruning costs nothing.
+    #
     # Write the delta parquet OURSELVES with int-backed decimals and add_files it.
     # (t.append's writer emits FIXED_LEN_BYTE_ARRAY decimals, which clashes with a
     # table registered from int32-backed parquet — pyiceberg 0.9 raises
@@ -178,7 +194,7 @@ def main():
     if a.s3_endpoint: fs_kwargs["endpoint_url"]=a.s3_endpoint
     fs=s3fs.S3FileSystem(client_kwargs=fs_kwargs)
     with fs.open(key.replace("s3://","",1),"wb") as f:
-        pq.write_table(tbl_data,f,store_decimal_as_integer=True)
+        pq.write_table(tbl_data,f,store_decimal_as_integer=True,write_statistics=False)
     t.add_files(file_paths=[key]); t.refresh()
     print(f"{a.namespace}.{a.table}: +{n} rows -> snapshot {t.current_snapshot().snapshot_id}")
     if a.table=="catalog_sales" and a.mode=="append":
@@ -201,7 +217,7 @@ def main():
         rdata=conform_to_table_schema(rdata,rt,m)
         rkey=f"{rt.location().rstrip('/')}/data/seed-{uuid.uuid4().hex}.parquet"
         with fs.open(rkey.replace("s3://","",1),"wb") as f:
-            pq.write_table(rdata,f,store_decimal_as_integer=True)
+            pq.write_table(rdata,f,store_decimal_as_integer=True,write_statistics=False)
         rt.add_files(file_paths=[rkey]); rt.refresh()
         print(f"{a.namespace}.catalog_returns: +{m} referential rows -> snapshot {rt.current_snapshot().snapshot_id}")
 if __name__=="__main__": main()
