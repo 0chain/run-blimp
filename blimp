@@ -78,6 +78,7 @@ save_env(){
   cat > "$ENVF" <<E
 # written by 'blimp --setup' — the wiring for --storage / --query
 REGION=$REGION
+CLUSTER_REGION=${CLUSTER_REGION:-$REGION}
 CLUSTER_ID=$CLUSTER_ID
 GW=$GW
 GATEWAY=$GW
@@ -85,6 +86,13 @@ ICEBERG_URL=$ICEBERG_URL
 WAREHOUSE=$WAREHOUSE
 ORIGIN_BUCKET=$ORIGIN_BUCKET
 NAMESPACE=$NAMESPACE
+# WHERE the origin bucket actually lives. Without these three, --storage's cache
+# legs sent every origin GET/PUT to real AWS S3 in \$REGION — which is wrong for
+# any non-AWS origin, and flatly broken for the MinIO source standup_data puts on
+# this box (bucket blimp-sf1 does not exist on AWS). Blank = AWS S3 + IAM role.
+S3_ENDPOINT=${S3_ENDPOINT:-}
+S3_KEY=${S3_KEY:-}
+S3_SECRET=${S3_SECRET:-}
 GW_AK=${GW_AK:-}
 GW_SK=${GW_SK:-}
 BLIMP_PY=${BLIMP_PY:-python3}
@@ -132,9 +140,16 @@ standup_iceberg(){
   # identical one. Only a missing, unhealthy, or differently-pointed container is
   # replaced.
   if curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1; then
-    local cur; cur=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
-                     | sed -n 's/^CATALOG_WAREHOUSE=//p' | head -1)
-    if [ "$cur" = "$WAREHOUSE" ]; then
+    local cur cur_ep want_ep
+    cur=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
+          | sed -n 's/^CATALOG_WAREHOUSE=//p' | head -1)
+    # Reuse must also match the S3 endpoint, not just the warehouse: a catalog
+    # started before the endpoint was wired points at real AWS and 403s every
+    # registration, and warehouse-only matching would silently keep it.
+    cur_ep=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
+             | sed -n 's/^CATALOG_S3_ENDPOINT=//p' | head -1)
+    case "${S3_ENDPOINT:-}" in ""|*amazonaws.com*) want_ep="";; *) want_ep="$S3_ENDPOINT";; esac
+    if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ]; then
       ICEBERG_URL="http://$(this_host):8181"
       bold "  Iceberg catalog already up over $WAREHOUSE — reusing it ($ICEBERG_URL)"
       return 0
@@ -142,10 +157,24 @@ standup_iceberg(){
     bold "  catalog on :8181 points at ${cur:-<unknown>}, not $WAREHOUSE — replacing it"
   fi
   bold "standing up an Iceberg REST catalog on :8181 over $WAREHOUSE"
+  # NON-AWS S3 (the MinIO source standup_data puts on this box) needs the endpoint
+  # AND path-style access pushed into the catalog's own S3FileIO. Without them the
+  # catalog signs its metadata writes against real s3.<region>.amazonaws.com while
+  # holding the MinIO key, and every table registration fails with
+  #   S3Exception: The AWS Access Key Id you provided does not exist in our records (403)
+  # -> "registered 0/24 tables". The client-side register script already handles
+  # this (--s3-endpoint); the catalog SERVICE did not.
+  local EP_ENV=""
+  case "${S3_ENDPOINT:-}" in
+    ""|*amazonaws.com*) ;;
+    *) EP_ENV="-e CATALOG_S3_ENDPOINT=$S3_ENDPOINT -e CATALOG_S3_PATH__STYLE__ACCESS=true" ;;
+  esac
   $DKR rm -f iceberg-rest >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086  # EP_ENV is an intentional word-split flag pair
   $DKR run -d --name iceberg-rest --restart unless-stopped -p 8181:8181 \
     -e CATALOG_WAREHOUSE="$WAREHOUSE" \
     -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+    $EP_ENV \
     -e AWS_REGION="$REGION" \
     -e AWS_ACCESS_KEY_ID="${S3_KEY:-${CAT_AK:-${AWS_ACCESS_KEY_ID:-}}}" \
     -e AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${CAT_SK:-${AWS_SECRET_ACCESS_KEY:-}}}" \
@@ -195,7 +224,7 @@ grant_bucket_access(){
   local acct; acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
   # gateway instance role ARN (same account) — discover from the running gateway
   local role_arn=""
-  local prof; prof=$(aws ec2 describe-instances --region "$REGION" \
+  local prof; prof=$(aws ec2 describe-instances --region "$CLUSTER_REGION" \
     --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
     --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text 2>/dev/null)
   if [ -n "$prof" ] && [ "$prof" != None ]; then
@@ -271,6 +300,96 @@ PYEOF
 # IP? Yes → vpc mode (private IPs, IAM role, VPC S3 endpoint — no egress). No
 # (non-AWS, cross-VPC, or cross-account) → external mode (stable DNS, explicit
 # creds, public advertise). Sets MODE / GW_DEFAULT / ADVERTISE_DEFAULT / CREDS_HINT.
+# ---- read-through cache: point the cluster router at THIS node's origin ------
+# The Blimp node's router (:8088) is provisioned with its upstream set to the
+# gateway itself (-s3-endpoint http://127.0.0.1:9000) and an EMPTY -cache-buckets.
+# That makes it a degenerate pass-through: a client GET for an origin object is
+# looked up on the gateway (which does not have it) and the evictor never starts
+# ("[evict] disabled (buckets=0)"). Setup used to only PRINT the fix and call it
+# optional, so the cache-miss→write / cache-hit→read legs had no path at all and
+# every cache number was zero.
+#
+# Retarget it here, at setup, so the client can pull its data THROUGH the Blimp
+# node and a miss actually fetches from this node's origin and writes into the
+# eblobber-backed cache. Only the zus-router container is touched — the gateway
+# itself is already wired live over /admin/source/configure and is NOT restarted.
+wire_router_cache(){
+  bold "== read-through cache: pointing the Blimp node's router at s3://$ORIGIN_BUCKET =="
+  # ONE AUTHENTICATED POST. No ssh, no SSM, no docker on the Blimp node — the
+  # client box has none of those, and the kit must not need them.
+  #
+  # The Router is provisioned by zs3-init BEFORE the customer's source is known:
+  # it starts with -s3-endpoint pointing at the gateway itself and an EMPTY
+  # -cache-buckets, so it is a pass-through whose evictor never ran
+  # ("[evict] disabled (buckets=0)"). Those were start-flags, so the only way to
+  # re-point it used to be recreating the container — impossible from here. The
+  # Router now takes them at runtime on /admin/cache/config.
+  local body resp
+  body=$(HB_BKT="$ORIGIN_BUCKET" HB_EP="${S3_ENDPOINT:-}" HB_REG="$REGION" \
+    HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_NS="${NAMESPACE:-tpcds}" \
+    python3 -c 'import json,os;print(json.dumps({"buckets":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_region":os.environ["HB_REG"],"s3_access_key":os.environ["HB_KEY"],"s3_secret_key":os.environ["HB_SEC"],"default_namespace":os.environ["HB_NS"]}))' 2>/dev/null)
+  resp=$(curl -s -m 30 -X POST "http://$GW:8088/admin/cache/config" \
+    -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \
+    -d "$body" 2>/dev/null || true)
+  case "$resp" in
+    *'"upstream"'*)
+      echo "  ✓ router retargeted — $(printf '%s' "$resp" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("upstream=%s buckets=%s ns=%s"%(d.get("upstream"),",".join(d.get("buckets") or []),d.get("default_ns")))' 2>/dev/null)" ;;
+    *unauthorized*)
+      echo "  ! router rejected the admin token — check CLUSTER_ID ($CLUSTER_ID)" ;;
+    "")
+      echo "  ! router :8088 unreachable from this node — the cache stays off and"
+      echo "    blimp --storage's cache legs will read 0 objects." ;;
+    *)
+      echo "  ! router retarget failed: $(printf '%s' "$resp" | head -c 200)"
+      echo "    (an older router image has no runtime cache config — it must be"
+      echo "     re-pointed by the operator, or the image updated)" ;;
+  esac
+}
+
+# ---- the object set the router cache test pulls through the Blimp node -------
+# The customer's own tables are the wrong shape for this: at SF1 the whole origin
+# is 24 single-parquet objects (~370 MB), so a read cannot parallelise and every
+# number is per-request-latency bound rather than a measure of the cluster. So
+# place a purpose-built set in the origin at setup time — it lands in THIS node's
+# storage (the MinIO standup_data stood up, or the customer's own bucket), and
+# `blimp --storage` then pulls it through the Blimp node's router: first pass
+# misses (origin -> router -> blimp node = the cache-fill/write rate), second
+# pass hits (served from the eblobber cache = the cache-read rate).
+seed_router_cache_set(){
+  # 10 GiB / 10 parts — MUST match run_router.sh's defaults, or --setup seeds a
+  # set the storage leg then regenerates at a different size. See the sizing
+  # rationale there: per-blobber shard share has to exceed per-blobber RAM or the
+  # cache "hit" is served from the eblobbers' page cache.
+  local pfx="${BENCH_PREFIX:-_blimp_cachebench}" gb="${BENCH_GB:-10}" parts="${BENCH_PARTS:-10}"
+  [ "${gb:-0}" -gt 0 ] || return 0
+  local ep=""; [ -n "${S3_ENDPOINT:-}" ] && ep="--endpoint-url $S3_ENDPOINT"
+  local want=$(( gb * 1073741824 )) have
+  # shellcheck disable=SC2086
+  have=$(AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+         aws s3 ls "s3://$ORIGIN_BUCKET/$pfx/" --recursive --region "$REGION" $ep 2>/dev/null | awk '{s+=$3} END{print s+0}')
+  if [ "${have:-0}" -ge "$want" ]; then
+    bold "  ✓ router cache test set already in s3://$ORIGIN_BUCKET/$pfx/ ($(awk -v b="$have" 'BEGIN{printf "%.1f",b/1073741824}') GiB)"
+    return 0
+  fi
+  bold "  placing a ${gb} GB router cache test set in s3://$ORIGIN_BUCKET/$pfx/ ($parts parts)"
+  local part_mb=$(( gb * 1024 / parts )) gen i=0
+  gen=$(mktemp -d /var/tmp/blimp-bench.XXXXXX) || return 0
+  while [ "$i" -lt "$parts" ]; do
+    i=$((i+1))
+    # /dev/urandom, not /dev/zero: zeros are trivially compressible and any layer
+    # that compresses would flatter every number downstream.
+    dd if=/dev/urandom of="$gen/part-$i.bin" bs=1M count="$part_mb" 2>/dev/null &
+    [ $((i % 4)) -eq 0 ] && wait
+  done
+  wait
+  # shellcheck disable=SC2086
+  AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+    aws s3 cp "$gen/" "s3://$ORIGIN_BUCKET/$pfx/" --recursive --region "$REGION" $ep --only-show-errors \
+    || echo "  ! could not upload the router cache test set to s3://$ORIGIN_BUCKET/$pfx/"
+  rm -rf "$gen"
+  bold "  ✓ router cache test set in place — blimp --storage reads it through http://$GW:8088"
+}
+
 assess_mode(){
   MODE=external; GW_PRIV=""; GW_PUB=""
   local imds="http://169.254.169.254/latest/meta-data" tok
@@ -280,7 +399,7 @@ assess_mode(){
   CLIENT_PUB=$(curl -s -m 2 "${H[@]}" "$imds/public-ipv4" 2>/dev/null)
   # discover the cluster gateway's private IP (needs aws CLI + creds + a running gw)
   if command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then
-    read -r GW_PRIV GW_PUB <<<"$(aws ec2 describe-instances --region "$REGION" \
+    read -r GW_PRIV GW_PUB <<<"$(aws ec2 describe-instances --region "$CLUSTER_REGION" \
       --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
       --query 'Reservations[0].Instances[0].[PrivateIpAddress,PublicIpAddress]' --output text 2>/dev/null)"
     [ "$GW_PRIV" = None ] && GW_PRIV=""; [ "$GW_PUB" = None ] && GW_PUB=""
@@ -405,6 +524,11 @@ cmd_setup(){
   ensure_deps
   echo
   REGION=$(ask REGION "AWS region" "ap-south-1")
+  # REGION is overloaded: it is the Blimp CLUSTER's AWS region here, but
+  # standup_data.sh REASSIGNS it to the ORIGIN's S3 region (us-east-1 for the
+  # MinIO source it stands up on this box). Every EC2/SSM lookup for the gateway
+  # must keep using the cluster's region, so pin it now, before that happens.
+  CLUSTER_REGION="${CLUSTER_REGION:-$REGION}"; export CLUSTER_REGION
   CLUSTER_ID=$(ask CLUSTER_ID "Blimp cluster id (from blimp.software)")
   [ -n "$CLUSTER_ID" ] || die "CLUSTER_ID is required (the Blimp cluster to connect)"
   # Zero-touch: probe the private gateway path and pick vpc vs external mode, then
@@ -513,15 +637,24 @@ cmd_setup(){
   # (pre-2026-07-27 gateway image) or unreachable.
   if [ -n "${GW:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
     bold "== wiring the cluster over the admin API (no SSH) =="
-    # VIA_ROUTER=1: route the gateway's source reads through the cluster's
-    # read-through cache router — every re-scan (verify/replay/merge) comes off
-    # the eblobbers' local disks instead of re-paying the S3 read. Only enable
-    # when the cluster router fronts YOUR bucket (hookup_cluster_source.sh);
-    # off by default for a fresh BYO wire.
+    # s3_endpoint MUST be sent. The gateway's API documents its default as
+    # https://s3.<region>.amazonaws.com, and this body used to OMIT the field —
+    # so a non-AWS origin (the MinIO standup_data puts on this box) was wired as
+    # real AWS and every DuckDB read of the source 403'd:
+    #   [duckdb-prelude][source-env] src_endpoint="https://s3.us-east-1.amazonaws.com"
+    #   HTTP GET error on 'https://blimp-sf1.s3.us-east-1.amazonaws.com/...' (403)
+    #
+    # ZS3_SOURCE_VIA_ROUTER=0 — SENT EXPLICITLY, NEVER OMITTED. With it on, the
+    # gateway gives the source bucket a DuckDB secret scoped to the Router, and
+    # the Router read-through-CACHES every source object it pulls into the
+    # eblobbers. Source data must NOT enter the cache: the cache is for the
+    # workload, and filling it with source scans both pollutes it and pushes the
+    # allocation toward the evictor's watermark. Off by default; VIA_ROUTER=1 in
+    # the environment is the deliberate opt-in.
     HOOK_BODY=$(HB_IRC="$ICEBERG_URL" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
       HB_BKT="$ORIGIN_BUCKET" HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_REG="$REGION" \
-      HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
-      python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"]};b.update({"via_router":True,**({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_RB") else {})} if os.environ.get("HB_VR")=="1" else {});print(json.dumps(b))' 2>/dev/null)
+      HB_EP="${S3_ENDPOINT:-}" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
+      python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
     HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
       -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \
       -d "$HOOK_BODY" || true)
@@ -588,26 +721,8 @@ OUT
   #    -cache-buckets flag, and setup never set it — so on every cluster the
   #    router ran as a pass-through and the cache legs measured nothing. Report
   #    it here, at setup, instead of after a 25-minute benchmark.
-  local io act
-  io=$(curl -s -m 10 "http://$GW:8088/iostats" 2>/dev/null || true)
-  if [ -n "$io" ]; then
-    act=$(printf '%s' "$io" | python3 -c '
-import json,sys
-try: d=json.load(sys.stdin)
-except Exception: print(""); raise SystemExit
-print((d.get("cache_hits",0) or 0)+(d.get("cache_misses",0) or 0)+(d.get("bytes_written_to_cache",0) or 0))' 2>/dev/null || echo "")
-    if [ "${act:-0}" = "0" ]; then
-      echo "  ! the cluster's read-through cache is NOT enabled for this bucket."
-      echo "    The router is running with an empty -cache-buckets, so it proxies to"
-      echo "    origin and caches nothing; blimp --storage's cache legs will read 0"
-      echo "    objects. Enable it ON THE GATEWAY (once):"
-      echo "        sudo ICEBERG_URL=$ICEBERG_URL WAREHOUSE=$WAREHOUSE NAMESPACE=$NAMESPACE \\"
-      echo "             ORIGIN_BUCKET=$ORIGIN_BUCKET S3_REGION=$REGION \\"
-      echo "             bash hookup_cluster_source.sh"
-    else
-      echo "  ✓ read-through cache is active"
-    fi
-  fi
+  wire_router_cache
+  seed_router_cache_set
 
   echo; bold "setup done — everything is wired. Validate with:  blimp --query    (and  blimp --storage )"
 }
@@ -747,6 +862,21 @@ ensure_storage_tools(){
     { [ -x /usr/lib64/openmpi/bin/mpirun ] || [ -x /usr/bin/mpirun ] || command -v mpirun >/dev/null; } \
       || echo "  ! openmpi install failed — mlperf will fail with 'cannot load MPI library'"
   fi
+  # NFS client. The gateway exports its namespace over NFS4 and both the fio leg
+  # and mlperf's data generation write through it — but nothing installed the
+  # client, so `mount -t nfs4` failed with "bad option; you might need a
+  # /sbin/mount.nfs4 helper program", mlperf silently generated its dataset onto
+  # the LOCAL disk under the mountpoint, and the write number measured the client
+  # box instead of the cluster.
+  if [ ! -x /sbin/mount.nfs4 ] && [ ! -x /usr/sbin/mount.nfs4 ]; then
+    bold "  installing the NFS client (fio + mlperf write through the gateway's NFS export)…"
+    if command -v dnf >/dev/null; then sudo dnf install -y -q nfs-utils >/dev/null 2>&1
+    elif command -v yum >/dev/null; then sudo yum install -y -q nfs-utils >/dev/null 2>&1
+    elif command -v apt-get >/dev/null; then sudo apt-get install -y -qq nfs-common >/dev/null 2>&1; fi
+    { [ -x /sbin/mount.nfs4 ] || [ -x /usr/sbin/mount.nfs4 ]; } \
+      || echo "  ! NFS client install failed — the fio and mlperf legs will be skipped"
+  fi
+
   # dlio (mlperf resnet50 driver) — venv install, one-time.
   if [ ! -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ]; then
     bold "  installing dlio-benchmark (one-time, mlperf)…"
@@ -788,7 +918,7 @@ ensure_storage_tools(){
       printf '%s\n' "$dout" | tail -3 | sed 's/^/    | /'
     }
   fi
-  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing)"
+  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing) · nfs: $({ [ -x /sbin/mount.nfs4 ] || [ -x /usr/sbin/mount.nfs4 ]; } && echo ok || echo missing)"
 }
 
 cmd_storage(){
@@ -822,16 +952,33 @@ cmd_storage(){
       GW_AK=... GW_SK=... blimp --storage"
   fi
   ORIGIN_BUCKET="${ORIGIN_BUCKET:-$(ask ORIGIN_BUCKET "Origin S3 bucket (read-through cache)")}"
+  # Forward the ORIGIN's location + keys too. This env list is a whitelist, so a
+  # variable absent from it simply does not reach the suite: S3_ENDPOINT/S3_KEY/
+  # S3_SECRET were saved to the wiring file and read by run_router.sh, but never
+  # passed here — so every origin call fell back to the IAM role and MinIO
+  # answered InvalidAccessKeyId. The listing came back empty and the leg died
+  # with "no objects under s3://<bucket>/{_blimp_cachebench}/".
   exec env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
-    REGION="$REGION" NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh"
+    REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
+    S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
+    NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh"
 }
 
 cmd_query(){
   need_env
   : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
   preflight 0 0
+  # S3_ENDPOINT/KEY/SECRET must cross this whitelist. bench_cdc.sh forwards
+  # $S3_KEY/$S3_SECRET to seed_tpcds.py and seed_tpcds.py falls back to
+  # $S3_ENDPOINT — but none of the three were listed here, so the CDC APPEND
+  # resolved the bucket against real AWS and died:
+  #   s3fs ... FileNotFoundError: The specified bucket does not exist
+  # With no append there is no delta, so every query fell back to a full
+  # re-author (mode='no-delta') and the delta-merge path — the whole point of
+  # this suite — was never exercised while the run still reported DONE.
   exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
     NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
+    S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" bash "$HERE/test_query.sh"
 }
 
@@ -845,6 +992,8 @@ cmd_bench(){
   exec env GW="$GW" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" CLUSTER_ID="$CLUSTER_ID" \
     ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" NAMESPACE="${NAMESPACE:-tpcds}" \
     REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-3}" AUTHOR_ITERS="${AUTHOR_ITERS:-3}" \
+    S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
+    BENCH_QNR="${BENCH_QNR:-1}" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
     CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh"
 }
 

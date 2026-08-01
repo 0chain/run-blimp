@@ -150,7 +150,11 @@ for ft in $(facts_of); do
     echo "   !! merge measured below is against UNCHANGED data. Full output:"
     printf '%s\n' "$seed_out" | sed 's/^/   | /'
   else
-    printf '%s\n' "$seed_out" | tail -1
+    # Print EVERY line, not tail -1. catalog_sales emits TWO summaries (its own
+    # append, then the referential catalog_returns rows q64's cs_ui join needs),
+    # and tail -1 kept only the second — so a successful catalog_sales append
+    # looked like it never happened, and the fact appeared to be skipped.
+    printf '%s\n' "$seed_out"
   fi
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \

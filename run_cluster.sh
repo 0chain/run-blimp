@@ -95,7 +95,14 @@ bench_fio(){ mount_nfs || return 0; disk_guard; local D="$MNT/bench-fio"; sudo m
 # --- mlperf resnet50 (dlio 2.0) over MOUNTPOINT-S3 (the mlperf-mp-s3 read path) --
 # NOT the NFS mount: mlperf reads via mount-s3 (FUSE over the gateway S3), same as
 # the cluster's mlperf-mp-s3 button.
-bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
+bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
+  # mount_nfs's return value was DISCARDED here (bench_fio checks it, mlperf did
+  # not). With no NFS client installed the mount fails, `sudo mkdir -p "$NG"`
+  # then creates a plain LOCAL directory under the mountpoint, and dlio generates
+  # the whole dataset onto the client's own disk — 30 GiB of it, reported as
+  # "mlperf write-NFS: N MB/s" as though it had been written to the Blimp node.
+  # A cluster write measurement that never touched the cluster. Skip instead.
+  mount_nfs || return 0
   # dlio imports mpi4py, which dlopen()s libmpi at startup. Distro OpenMPI is NOT
   # on the default PATH/LD_LIBRARY_PATH (Amazon Linux keeps it under
   # /usr/lib64/openmpi), so dlio died with "RuntimeError: cannot load MPI library"
@@ -141,9 +148,15 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   local MEMKB; MEMKB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
   local MLPERF_MEM_CAP="${MLPERF_MEM_CAP:-$(( MEMKB * 45 / 100 ))K}"
   local MLPERF_GEN_MEM_CAP="${MLPERF_GEN_MEM_CAP:-$(( MEMKB * 85 / 100 ))K}"
+  # Carry PATH/LD_LIBRARY_PATH INTO the scope. `sudo systemd-run` starts a fresh
+  # environment (sudo resets PATH via secure_path, systemd-run does not inherit),
+  # so the OpenMPI prefix prepended above was invisible inside the scope and the
+  # train step died with "Failed to find executable mpirun: No such file or
+  # directory" even though mpirun was installed. Pass them through explicitly.
   MEMRUN(){ local cap="$1"; shift
     if command -v systemd-run >/dev/null 2>&1 && [ "${MEMKB:-0}" -gt 0 ]; then
-      sudo systemd-run --scope --quiet -p MemoryMax="$cap" -p MemorySwapMax=0 -- "$@"
+      sudo systemd-run --scope --quiet -p MemoryMax="$cap" -p MemorySwapMax=0 -- \
+        env PATH="$PATH" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" HYDRA_FULL_ERROR=1 "$@"
     else "$@"; fi; }
   # Stale OpenMPI session dirs make mpirun fail on a rerun; the cluster clears
   # them before every generate.
@@ -152,6 +165,21 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   #   2/1 -> accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain 34*7=238 / neval 64
   #   8/1 -> accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain 136*7=952 / neval 64
   local ACC="${MLPERF_ACCELS:-$EC_ACCEL}" RT="${MLPERF_READ_THREADS:-$EC_RT}" PF="${MLPERF_PREFETCH:-$EC_PF}"
+  # ACCEL 1 ON ANY CLIENT SMALLER THAN A *.4xlarge (16 vCPU).
+  # The EC-derived profile (2/1 -> accel 3) is the CLUSTER's run_bench profile and
+  # assumes a cluster-sized driver. On a small client it runs `mpirun -np 3`: three
+  # torch ranks x RT read threads all pulling through ONE mount-s3 daemon, which
+  # lives OUTSIDE the dlio memory cgroup. On a c6in.large (2 vCPU / 3.8 GB) that
+  # drove mount-s3 to 1.58 GB RSS and the kernel global-OOM-killed it mid-train:
+  #   Out of memory: Killed process 29520 (mount-s3) anon-rss:1579852kB
+  #   -> every rank: "Transport endpoint is not connected", no [METRIC] at all.
+  # accel=1 also skips mpirun entirely (see the `ACC > 1` guard below), so there is
+  # no MPI oversubscription of a 2-core box either. MLPERF_ACCELS still overrides.
+  local NCPU; NCPU=$(nproc 2>/dev/null || echo 1)
+  if [ -z "${MLPERF_ACCELS:-}" ] && [ "${NCPU:-1}" -lt 16 ]; then
+    [ "$ACC" -gt 1 ] && echo "  [mlperf] client has $NCPU vCPU (< 16 = *.4xlarge) -> accel 1 instead of $ACC (mount-s3 OOM guard)"
+    ACC=1
+  fi
   local BATCH="${MLPERF_BATCH:-1200}" EP="${MLPERF_EPOCHS:-1}"
   local NF="${MLPERF_NUM_FILES:-$(( EC_DATASET_GB * 7 ))}" NE="${MLPERF_NUM_EVAL:-64}"
   export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=us-east-1
@@ -199,20 +227,32 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
     # A previous run's cleanup (or a killed mount-s3) leaves exactly that behind,
     # so every subsequent mlperf run failed until the box was rebooted.
     fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
-    if ! mount-s3 --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
+    # Mount as ROOT with --allow-other. dlio runs inside the memory scope via
+    # `sudo systemd-run`, i.e. as root, and a FUSE mount is private to the user
+    # that created it — so an ec2-user mount gave every rank
+    #   PermissionError: [Errno 13] Permission denied: '/mnt/mps3/resnet50/train'
+    # The cluster never sees this because its whole driver runs as root.
+    # --allow-other needs user_allow_other in /etc/fuse.conf; add it if absent.
+    grep -qs '^user_allow_other' /etc/fuse.conf || \
+      echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
+    if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
+         mount-s3 --allow-other --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
       echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"
       return 0
     fi
     # Prove the mount is actually readable before handing it to dlio — a mount
     # that reports success but cannot list is the same failure one step later.
-    if ! ls "$MPS3" >/dev/null 2>&1; then
+    if ! sudo ls "$MPS3" >/dev/null 2>&1; then
       echo "!! mlperf SKIPPED: $MPS3 mounted but is not readable (stale endpoint?)"
       fusermount -u "$MPS3" 2>/dev/null || true
       return 0
     fi
     DF="$MPS3/resnet50"
   fi
-  local L="$DLIO"; [ "$ACC" -gt 1 ] && L="mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus --oversubscribe -np $ACC $DLIO"
+  # Absolute mpirun: PATH lookups have already bitten us once inside the memory
+  # scope, and a wrong/absent mpirun fails the leg minutes in rather than at once.
+  local MPIRUN; MPIRUN=$(command -v mpirun || echo /usr/lib64/openmpi/bin/mpirun)
+  local L="$DLIO"; [ "$ACC" -gt 1 ] && L="$MPIRUN --allow-run-as-root --bind-to none --use-hwthread-cpus --oversubscribe -np $ACC $DLIO"
   echo "== mlperf resnet50 TRAIN via $IFACE (accel=$ACC rt=$RT pf=$PF batch=$BATCH epochs=$EP) =="
   # Capture, don't blind-grep. Piping straight into `grep [METRIC]` means a train
   # step that CRASHES prints absolutely nothing — which is exactly what happened
@@ -226,7 +266,20 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
     ++workload.reader.read_threads="$RT" ++workload.reader.batch_size="$BATCH" ++workload.reader.prefetch_size="$PF" \
     ++workload.train.epochs="$EP" 2>&1); trc=$?
   if printf '%s\n' "$tout" | grep -qiE '\[METRIC\]|samples/second|MB/second'; then
-    printf '%s\n' "$tout" | grep -iE '\[METRIC\]|samples/second|MB/second' | tail -5
+    printf '%s\n' "$tout" | grep -iE '\[METRIC\]|samples/second|MB/second' | tail -8
+    # AU% is THE MLPerf Storage verdict — it is what says whether the storage kept
+    # the accelerator fed (>=90% is the passing bar), and it was buried in a
+    # tail -5 of raw dlio lines that could push it off. Pull the three headline
+    # numbers out by name and restate them on one line. Value = everything after
+    # the last ": ", so it survives dlio changing the label's word count.
+    local au sm io
+    # dlio prints "<value> (<stddev>)" — keep the value, drop the parenthesised
+    # stddev, or the summary reads "AU 64.6854 (0.0000)%".
+    metval(){ tail -1 | sed "s/.*: *//; s/ *(.*//"; }
+    au=$(printf '%s\n' "$tout" | grep -i "Accelerator Utilization" | metval)
+    sm=$(printf '%s\n' "$tout" | grep -iE "Training Throughput.*samples" | metval)
+    io=$(printf '%s\n' "$tout" | grep -iE "Training I/O Throughput" | metval)
+    echo "  mlperf read ($IFACE, accel=$ACC rt=$RT pf=$PF): AU ${au:-n/a}% · ${sm:-n/a} samples/s · ${io:-n/a} MB/s"
   else
     echo "!! mlperf TRAIN produced no metrics (exit $trc) — last output:"
     printf '%s\n' "$tout" | tail -12 | sed 's/^/   | /'

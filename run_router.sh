@@ -5,8 +5,9 @@
 # ways and compares throughput:
 #   1. direct-S3     : straight from the external S3 origin bucket (baseline)
 #   2. cache-S3      : through the cluster read-through Router (:8088) — S3 interface
-#   3. cache-mp-s3   : the cached objects via mountpoint-s3 (FUSE) — needs GW_AK/GW_SK
-#   4. cache-NFS     : the same cached objects via the gateway NFS/Ganesha mount
+#   3. cache-NFS     : the same cached objects via the gateway NFS/Ganesha mount
+# (a mountpoint-s3 leg was removed: it mounted the gateway :9000 directly, so the
+#  router was not in the path and it was not measuring the read-through cache.)
 #
 # The Router (zus-router :8088) fronts the origin bucket: on a miss it fetches from
 # the origin and writes the object into the gateway's eblobber-backed cache bucket;
@@ -30,8 +31,8 @@
 #   TABLE=store_returns ./run_router.sh
 # Optional: ROUTER (http://$GW:8088), NFS_MNT (/mnt/zusnfs), PAR (parallel readers),
 #           MAX_BYTES (cap the read set; default = whole prefix), COLD_FILL (1=time
-#           the cold cache-fill too), GW_AK/GW_SK (gateway minio creds — enables the
-#           cache-mp-s3 path via mountpoint-s3 of the gateway cache bucket).
+#           the cold cache-fill too), GW_AK/GW_SK (gateway minio creds — used to
+#           verify the fill actually landed on the blimp node).
 
 set -uo pipefail
 GW="${GW:?set GW (gateway private ip)}"
@@ -51,6 +52,23 @@ MNT="${NFS_MNT:-/mnt/zusnfs}"
 # against the cache, not against the client's core count.
 PAR="${PAR:-$(( $(nproc) * 2 < 16 ? 16 : $(nproc) * 2 ))}"
 MAX_BYTES="${MAX_BYTES:-0}"   # 0 = read the whole prefix
+
+# --- WHERE the origin bucket lives -------------------------------------------
+# The origin is not always AWS S3. When the customer had no data, `blimp --setup`
+# stands a MinIO up ON THIS BOX and the origin bucket lives there — so every
+# origin call below needs its endpoint and keys. Without this, `aws s3 ls/cp/
+# get-object` went to real s3.<REGION>.amazonaws.com for a bucket that only
+# exists in the local MinIO: the bench set could not be created, the object
+# enumeration came back empty, and the leg exited "no objects under s3://…".
+# Blank S3_ENDPOINT = AWS S3, IAM role — the original behaviour, unchanged.
+S3_ENDPOINT="${S3_ENDPOINT:-}"
+OEP=""
+if [ -n "$S3_ENDPOINT" ]; then
+  OEP="--endpoint-url $S3_ENDPOINT"
+  if [ -n "${S3_KEY:-}" ]; then
+    export AWS_ACCESS_KEY_ID="$S3_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET"
+  fi
+fi
 
 # drop the CLIENT page/dentry cache + a fresh NFS mount so every warm path is
 # measured against the CLUSTER, never local RAM.
@@ -79,11 +97,33 @@ echo "[cache-bench] origin=s3://$BKT/{$TABLES}/  region=$REGION  router=$ROUTER 
 #
 # BENCH_GB=0 skips generation and uses whatever is already in the bucket.
 BENCH_PREFIX="${BENCH_PREFIX:-_blimp_cachebench}"
+# 10 GiB in 10 PARTS. The two numbers do different jobs — do not collapse them.
+#
+# TOTAL SIZE defeats the page caches on the read path. A hit is served
+# client <- router <- gateway MinIO <- 3 eblobbers <- disk, and the client can
+# only drop its OWN page cache; the gateway's and the eblobbers' are unreachable
+# without a shell on the Blimp node. So the set has to be too big to sit in them.
+# At EC 2/1 a logical N GiB set lands ~N/2 GiB of data per blobber, so against
+# 3.8 GB per blobber:
+#     10 GiB -> ~5 GiB/blobber  = above RAM, mostly must come off disk
+#      6 GiB -> ~3 GiB/blobber  = fits in RAM
+#      3 GiB -> ~1.5 GiB/blobber = fits easily; the "hit" is then RAM end-to-end
+#                                  and nothing client-side would reveal it.
+# Re-derive this if the cluster shape changes: the bar is per-blobber shard share
+# > per-blobber RAM, NOT total set > gateway RAM.
+#
+# PART COUNT gives concurrency. One 10 GB object is ONE TCP stream, so a single
+# huge file measures one connection rather than the cluster. Set BENCH_PARTS=1
+# only when you deliberately want the single-stream number.
+#
+# Repeating a pass does NOT substitute for size — re-reading a RAM-resident set
+# just measures RAM again. Repeats only quantify variance (worth having: a 3 GiB
+# set swung 696 -> 369 MB/s between identical runs).
 BENCH_GB="${BENCH_GB:-10}"
 BENCH_PARTS="${BENCH_PARTS:-10}"
 if [ "${BENCH_GB:-0}" -gt 0 ]; then
   want_bytes=$(( BENCH_GB * 1073741824 ))
-  have=$(aws s3 ls "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" 2>/dev/null \
+  have=$(aws s3 ls "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" $OEP 2>/dev/null \
          | awk '{s+=$3} END{print s+0}')
   if [ "${have:-0}" -ge "$want_bytes" ]; then
     echo "[cache-bench] reusing existing $(awk -v b="$have" 'BEGIN{printf "%.1f",b/1073741824}') GiB bench set in $BENCH_PREFIX/"
@@ -101,9 +141,19 @@ if [ "${BENCH_GB:-0}" -gt 0 ]; then
     done
     wait
     up0=$(now)
-    aws s3 cp "$gen/" "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" --only-show-errors 2>/dev/null
+    # Do NOT discard the upload's stderr and then report its nominal size as
+    # throughput. A failed cp (wrong endpoint / no origin creds) returned in
+    # ~2s and printed "uploaded 10 GB … 4178 MB/s" for zero bytes transferred —
+    # the same fiction the honest-bytes fix removed from the read legs. Report
+    # the rate over what the origin ACTUALLY holds afterwards, and say so when
+    # the upload failed.
+    if ! aws s3 cp "$gen/" "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" $OEP --only-show-errors; then
+      echo "[cache-bench] !! upload to s3://$BKT/$BENCH_PREFIX/ FAILED (endpoint/creds?) — cannot measure the cache"
+      rm -rf "$gen"; exit 1
+    fi
     up1=$(now)
-    echo "[cache-bench] uploaded $BENCH_GB GB to the origin in $(el "$up0" "$up1")s ($(mbps "$want_bytes" "$(el "$up0" "$up1")") MB/s client→origin)"
+    got=$(aws s3 ls "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" $OEP 2>/dev/null | awk '{s+=$3} END{print s+0}')
+    echo "[cache-bench] uploaded $(awk -v b="${got:-0}" 'BEGIN{printf "%.1f",b/1073741824}') GiB to the origin in $(el "$up0" "$up1")s ($(mbps "${got:-0}" "$(el "$up0" "$up1")") MB/s client→origin)"
     rm -rf "$gen"
   fi
   # Read ONLY the bench set: mixing in the customer's 3 small parquet files would
@@ -114,7 +164,7 @@ fi
 # --- enumerate the object set (key<TAB>size), optionally capped to MAX_BYTES -------
 MAP=""
 for T in $TABLES; do
-  MAP="$MAP$(aws s3 ls "s3://$BKT/$T/" --recursive --region "$REGION" 2>/dev/null | awk '$3+0>0{print $4"\t"$3}')
+  MAP="$MAP$(aws s3 ls "s3://$BKT/$T/" --recursive --region "$REGION" $OEP 2>/dev/null | awk '$3+0>0{print $4"\t"$3}')
 "
 done
 MAP=$(printf '%s' "$MAP" | awk 'NF')
@@ -146,7 +196,7 @@ router_get(){
 # it private + in-region; the box IAM role authenticates.
 t0=$(now)
 echo "$KEYS" | xargs -P"$PAR" -I{} aws s3api get-object --bucket "$BKT" --key "{}" \
-  --region "$REGION" /dev/stdout >/dev/null 2>&1
+  --region "$REGION" $OEP /dev/stdout >/dev/null 2>&1
 t1=$(now); DIRECT=$(mbps "$BYTES" "$(el "$t0" "$t1")"); DIRECT_S=$(el "$t0" "$t1")
 echo "  direct-S3 : $DIRECT MB/s (${DIRECT_S}s)"
 
@@ -169,6 +219,59 @@ FILL_B=${FILL_OUT%% *}; FILL_ERR=${FILL_OUT##* }
   [ "${FILL_B:-0}" -lt "$BYTES" ] && echo "    (transferred $(awk -v b="$FILL_B" 'BEGIN{printf "%.2f",b/1073741824}') of $(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}') GiB${FILL_ERR:+, $FILL_ERR non-200 response(s)}) — rate is over bytes ACTUALLY received"
 }
 
+# ===================== WAIT FOR THE FILL TO ACTUALLY LAND =======================
+# The warm pass used to start the instant the fill pass returned, and therefore
+# measured a SECOND ORIGIN FETCH while reporting it as "router->eblobber cache":
+#   cache_hits 0 · cache_misses 20 · bytes_served_from_cache 0
+#   bytes_served_from_origin 21474836480   (both 10 GiB passes)
+#   bytes_written_to_cache    4294967296   (4 of 10 objects)
+# Two independent reasons, both need waiting out:
+#   1. the Router's cache ingest is ASYNC (ingestWholeObjectOnce) — a 10 GiB fill
+#      into the eblobbers is still in flight when the fill GETs have returned;
+#   2. the Router memoizes cache membership with a NEGATIVE TTL (30s, router
+#      68abcdf), so an object that HAS landed is still assumed absent until that
+#      entry expires.
+# Poll the cache bucket on the gateway until every object is present (or give up
+# loudly), then sleep past the negative TTL. Needs the gateway creds; without
+# them, say the warm number is not a verified hit rather than implying it is.
+CACHE_VERIFIED=0
+cached_count(){ AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" \
+  aws s3 ls "s3://$BKT/$BENCH_PREFIX/" --recursive --region us-east-1 \
+  --endpoint-url "http://$GW:9000" 2>/dev/null | awk '$3+0>0' | wc -l | tr -d ' '; }
+if [ -n "${GW_AK:-}" ]; then
+  # ONE PASS CANNOT FILL THE CACHE. The Router admits only
+  # ZUS_ROUTER_SPOOL_CONCURRENCY (default 4) concurrent spools; every GET beyond
+  # that is served straight from origin and NEVER cached — silently, with no log
+  # line. So a PAR=16 fill over 10 objects caches exactly 4 of them, and the
+  # "warm" pass that follows is mostly origin reads wearing the cache's label
+  # (observed: 4/10, then 8/10, then 4/10 on a fresh prefix; the router logged
+  # exactly four "Successfully cached" lines each time).
+  # Re-drive the set until every object is resident, and say how many passes it
+  # took — that number IS the finding, not an implementation detail to hide.
+  fill_deadline=$(( $(date +%s) + ${CACHE_FILL_TIMEOUT:-900} ))
+  pass=1
+  while :; do
+    incache=$(cached_count)
+    [ "${incache:-0}" -ge "$NOBJ" ] && { CACHE_VERIFIED=1; break; }
+    [ "$(date +%s)" -ge "$fill_deadline" ] && break
+    echo "  cache fill pass $pass: ${incache:-0}/$NOBJ resident — re-driving the set (router admits ${ZUS_ROUTER_SPOOL_CONCURRENCY:-4} spools/pass)"
+    router_get >/dev/null
+    sleep 8
+    pass=$((pass+1))
+  done
+  if [ "$CACHE_VERIFIED" = 1 ]; then
+    echo "  cache fill complete: $incache/$NOBJ objects on the blimp node after $pass pass(es)"
+  else
+    echo "  !! cache fill INCOMPLETE: ${incache:-0}/$NOBJ objects after ${CACHE_FILL_TIMEOUT:-900}s / $pass pass(es)"
+    echo "     the warm pass below will re-fetch the missing ones from origin"
+  fi
+  # Outlast the negative membership memo, or every read below misses regardless.
+  echo "  settling ${CACHE_NEG_TTL_WAIT:-35}s past the router's negative cache-membership TTL…"
+  sleep "${CACHE_NEG_TTL_WAIT:-35}"
+else
+  echo "  (no gateway creds — cannot verify the fill landed; the warm number below is NOT a confirmed cache hit)"
+fi
+
 # ============================ 3) CACHE-S3 (warm) =================================
 # Second GET of the same set through the Router — now served from the eblobber cache.
 drop_client_cache
@@ -177,30 +280,26 @@ WARM_OUT=$(router_get)
 t1=$(now); WARM_S3_S=$(el "$t0" "$t1")
 WARM_B=${WARM_OUT%% *}; WARM_ERR=${WARM_OUT##* }
 WARM_S3=$(mbps "$WARM_B" "$WARM_S3_S")
-echo "  cache-S3  : $WARM_S3 MB/s (${WARM_S3_S}s, router->eblobber cache)"
+# PROVE the warm pass was served from the cache. The router's own counters are
+# the only authority: a number labelled "cache" that the router recorded as a
+# MISS is an origin fetch wearing the cache's label.
+HITS_AFTER=$(curl -s -m10 "$ROUTER/iostats" 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("? ?"); raise SystemExit
+print(d.get("cache_hits",0), d.get("cache_misses",0))' 2>/dev/null || echo "? ?")
+echo "  cache-S3  : $WARM_S3 MB/s (${WARM_S3_S}s, router->eblobber cache; router counters hits/misses=${HITS_AFTER// //})"
+case "$HITS_AFTER" in
+  "0 "*) echo "    ⚠ the router recorded ZERO cache hits — this number is an ORIGIN fetch, not a cache read" ;;
+esac
 [ "${WARM_B:-0}" -lt "$BYTES" ] && echo "    (transferred $(awk -v b="$WARM_B" 'BEGIN{printf "%.2f",b/1073741824}') of $(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}') GiB${WARM_ERR:+, $WARM_ERR non-200 response(s)}) — rate is over bytes ACTUALLY received"
 
-# ============================ 3b) CACHE-mp-s3 (warm) =============================
-# Read the cached objects via mountpoint-s3 (FUSE-over-S3) of the gateway cache
-# bucket. Needs the GATEWAY minio creds (GW_AK/GW_SK) to mount the cache bucket on
-# :9000. Skipped if mount-s3 or the gateway creds are unavailable.
-# HONEST BYTES: throughput = bytes of objects that actually EXIST on the view ÷
-# time (2026-07-22: dividing the FULL set by wall time while dd silently no-opped
-# on missing objects reported 8501 MB/s — 68 Gbit/s on a 25 Gbps NIC, impossible).
-WARM_MPS3="n/a"
-if command -v mount-s3 >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then
-  MPS3=/mnt/mps3_cache; sudo mkdir -p "$MPS3"; sudo chown "$(id -u)" "$MPS3"; fusermount -u "$MPS3" 2>/dev/null || true
-  if AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" mount-s3 --endpoint-url "http://$GW:9000" --region us-east-1 "$BKT" "$MPS3" 2>/dev/null; then
-    drop_client_cache
-    HITMAP=$(echo "$MAP" | awk -v m="$MPS3" -F'\t' '{ if (system("test -f \"" m "/" $1 "\"")==0) print }')
-    HITB=$(echo "$HITMAP" | awk -F'\t' '{s+=$2}END{print s+0}'); HITN=$(echo "$HITMAP" | awk 'NF' | wc -l | tr -d ' ')
-    [ "$HITN" -lt "$NOBJ" ] && echo "  (mp-s3: only $HITN/$NOBJ objects present — measuring those $(awk -v b="$HITB" 'BEGIN{printf "%.1f",b/1073741824}') GiB)"
-    t0=$(now); echo "$HITMAP" | cut -f1 | xargs -P"$PAR" -I{} dd if="$MPS3/{}" of=/dev/null bs=1M 2>/dev/null
-    t1=$(now); WARM_MPS3=$(mbps "$HITB" "$(el "$t0" "$t1")")
-    fusermount -u "$MPS3" 2>/dev/null || true
-    echo "  cache-mp-s3: $WARM_MPS3 MB/s (mountpoint-s3 over cache bucket, $HITN objs)"
-  fi
-fi
+# NOTE: the mountpoint-s3 leg that used to sit here has been REMOVED. It mounted
+# the gateway's S3 endpoint (:9000) directly, so the router was NOT in the path at
+# all — it measured the gateway S3 face, not the read-through cache, and reported
+# 545 MB/s next to the router's 394 as if the two were comparable paths. Keeping a
+# non-router number inside the router benchmark invites exactly that comparison.
+# The gateway S3 face is already covered by the warp leg of --storage.
 
 # ============================ 4) CACHE-NFS (warm) ================================
 # OFF BY DEFAULT (CACHE_NFS=1 to include). The cache is measured over the two S3
@@ -229,7 +328,7 @@ fi
 # ===================== is the cache even TURNED ON? ==============================
 # The router only caches buckets listed in its -cache-buckets flag. `blimp --setup`
 # wires the gateway's SOURCE over the admin API but leaves the cache retarget
-# optional (hookup_cluster_source.sh), so on a default cluster the router runs with
+# done by `blimp --setup` (wire_router_cache); if that step was skipped the
 # -cache-buckets EMPTY and is a pass-through proxy:
 #     [evict] disabled (buckets=0 ... cacheHighBytes=0)
 # Every cache leg then reports 0 MB/s / 0 objects, which reads as broken storage
@@ -256,12 +355,11 @@ if [ "$CACHE_ON" = "off" ]; then
   echo "    The router reports 0 hits AND 0 misses, i.e. these reads never entered the"
   echo "    cache path — it is started with an empty -cache-buckets and is proxying"
   echo "    straight to the origin. So 'cache-S3' below is NOT a cache hit, and"
-  echo "    cache-mp-s3 finds 0 objects because nothing was ever cached."
-  echo "    Enable it, then re-run:   ./hookup_cluster_source.sh"
+  echo "    nothing was ever cached, so no hit can be measured."
+  echo "    Enable it by re-running:  blimp --setup"
 fi
 printf '  %-26s %8s MB/s\n' "direct-S3 (origin)"        "$DIRECT"
 printf '  %-26s %8s MB/s\n' "cache-S3 (router, warm)"   "$WARM_S3"
-printf '  %-26s %8s MB/s\n' "cache-mp-s3 (warm)"        "$WARM_MPS3"
 [ "$WARM_NFS" != "n/a" ] && printf '  %-26s %8s MB/s\n' "cache-NFS (Ganesha, warm)" "$WARM_NFS"
 # A speedup ratio over a tiny set is NOISE, not a measurement. At SF1 the whole
 # origin bucket is ~330 MB and the default table prefix is ONE 17 MB object, so
@@ -277,19 +375,19 @@ if [ "${BYTES:-0}" -lt "$MIN_RATIO_BYTES" ] 2>/dev/null; then
     printf "    minimum for a meaningful ratio. Both legs are per-request-latency bound at this size.\n"
     printf "    Point CACHE_TABLE at a larger prefix, or set MIN_RATIO_BYTES to override.\n"}'
 else
-  awk -v d="$DIRECT" -v s="$WARM_S3" -v m="$WARM_MPS3" -v n="$WARM_NFS" 'BEGIN{
-    if(d>0){ printf "  speedup vs direct-S3: cache-S3 %.1fx  mp-s3 %s%s\n", s/d, (m=="n/a"?"n/a":sprintf("%.1fx",m/d)), (n=="n/a"?"":sprintf("  cache-NFS %.1fx", n/d)) }}'
+  awk -v d="$DIRECT" -v s="$WARM_S3" -v n="$WARM_NFS" 'BEGIN{
+    if(d>0){ printf "  speedup vs direct-S3: cache-S3 %.1fx%s\n", s/d, (n=="n/a"?"":sprintf("  cache-NFS %.1fx", n/d)) }}'
 fi
 # physics gate: c6in.4xlarge networking is 25 Gbps baseline, "up to 50 Gbps"
 # burst ≈ 6250 MB/s absolute ceiling — any single-path number above it means
 # bytes were not actually transferred (stale view / cache no-op; 2026-07-22 saw
 # 8501/9650 MB/s = 68/77 Gbps from exactly that).
-for v in "$WARM_S3" "$WARM_MPS3" "$WARM_NFS"; do
+for v in "$WARM_S3" "$WARM_NFS"; do
   case "$v" in n/a) continue;; esac
   [ "${v:-0}" -gt 6400 ] 2>/dev/null && echo "  ⚠ SUSPECT: $v MB/s exceeds the 50 Gbps NIC burst ceiling — treat as invalid"
 done
-printf '{"table":"%s","bytes":%s,"objects":%s,"mbps":{"direct_s3":%s,"cache_s3":%s,"cache_mp_s3":"%s","cache_nfs":"%s"}}\n' \
-  "$TABLE" "$BYTES" "$NOBJ" "$DIRECT" "$WARM_S3" "$WARM_MPS3" "$WARM_NFS"
+printf '{"table":"%s","bytes":%s,"objects":%s,"mbps":{"direct_s3":%s,"cache_s3":%s,"cache_nfs":"%s"}}\n' \
+  "$TABLE" "$BYTES" "$NOBJ" "$DIRECT" "$WARM_S3" "$WARM_NFS"
 
 # ============ WRITE → READ over a CONTROLLED set (NFS write, S3 reads) ==========
 # The legs above are bounded by the customer's dataset SHAPE, not by the cluster:

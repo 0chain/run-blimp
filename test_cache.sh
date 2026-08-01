@@ -36,6 +36,16 @@ NFS_MNT="${NFS_MNT:-/mnt/zusnfs}"
 EC="${EC:-2/1}"
 ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "External S3 origin bucket for the read-through cache (e.g. blimp-tpcds1000-aps1):")
 REGION="${REGION:-ap-south-1}"
+# The origin is not always AWS S3 — when the customer had no data, blimp --setup
+# stands MinIO up on THIS box and the origin bucket lives there. Every origin
+# listing below must therefore carry its endpoint + keys, or it silently probes
+# real s3.<REGION>.amazonaws.com for a bucket that does not exist there and the
+# prefix auto-selection falls back to a table with no objects.
+OEP=""
+if [ -n "${S3_ENDPOINT:-}" ]; then
+  OEP="--endpoint-url $S3_ENDPOINT"
+  [ -n "${S3_KEY:-}" ] && export AWS_ACCESS_KEY_ID="$S3_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET"
+fi
 # Prefix under the origin bucket to read. The default used to be a hardcoded
 # store_returns, which at SF1 is the SMALLEST fact (~17 MB in ONE object) — so the
 # read-through cache was benchmarked over a set far too small to measure, and the
@@ -48,13 +58,13 @@ REGION="${REGION:-ap-south-1}"
 # Take the largest few prefixes actually present instead, and pass them all.
 if [ -z "${CACHE_TABLE:-}" ]; then
   CACHE_TABLE=$(for t in store_sales catalog_sales web_sales inventory store_returns catalog_returns web_returns; do
-      sz=$(aws s3 ls "s3://$ORIGIN_BUCKET/$t/" --recursive --region "$REGION" 2>/dev/null | awk '{s+=$3} END{print s+0}')
+      sz=$(aws s3 ls "s3://$ORIGIN_BUCKET/$t/" --recursive --region "$REGION" $OEP 2>/dev/null | awk '{s+=$3} END{print s+0}')
       [ "${sz:-0}" -gt 0 ] && echo "$sz $t"
     done | sort -rn | head -3 | awk '{printf "%s%s", (NR>1?" ":""), $2}')
   CACHE_TABLE="${CACHE_TABLE:-store_returns}"   # nothing probed (no aws creds / empty bucket)
   echo "[cache] auto-selected origin prefixes: $CACHE_TABLE"
 fi
-export GW GW_AK GW_SK ROUTER NFS_MNT EC ORIGIN_BUCKET REGION
+export GW GW_AK GW_SK ROUTER NFS_MNT EC ORIGIN_BUCKET REGION S3_ENDPOINT S3_KEY S3_SECRET
 
 echo ""
 echo "gateway=$GW  EC=$EC  router=$ROUTER  origin=s3://$ORIGIN_BUCKET/$CACHE_TABLE ($REGION)"
@@ -76,29 +86,23 @@ LEGS="${STORAGE_LEGS:-all}"
 want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
 [ "$LEGS" != "all" ] && echo "[legs] running only: $LEGS"
 
-# GUARANTEED cleanup — runs on completion, Ctrl-C, or any abort. Bench leftovers
-# (warp --keep-data, the kept mlperf dataset, fio files) pile ~100GB onto the
-# eblobber allocation; past the 80% watermark the capacity evictor then drains
-# the read-through cache every 5m sweep (evictions spike, hit-rate collapses —
-# seen live 2026-07-17: alloc 94.7%, evictor freed every cache fill).
-# KEEP_BENCH_DATA=1 skips it (e.g. to rerun mlperf without the slow regen).
-CLEANED=0
-cleanup_bench(){
-  [ "$CLEANED" = "1" ] && return 0; CLEANED=1
-  [ "${KEEP_BENCH_DATA:-0}" = "1" ] && { echo "-- cleanup skipped (KEEP_BENCH_DATA=1) --"; return 0; }
-  echo ""
-  echo "-- cleanup: removing bench artifacts from the cluster --"
-  sudo umount /mnt/mps3 /mnt/mps3_cache 2>/dev/null
-  ( export AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" AWS_REGION=us-east-1
-    for b in ttfb1k warpprobe warpbench mlperf-bench; do
-      aws s3 rb "s3://$b" --force --endpoint-url "http://$GW:9000" >/dev/null 2>&1
-    done )
-  if mountpoint -q "$NFS_MNT" 2>/dev/null; then
-    sudo rm -rf "$NFS_MNT/bench-fio" "$NFS_MNT/mlperf-bench" 2>/dev/null
-  fi
-  echo "   removed: ttfb1k/warpprobe/warpbench/mlperf-bench buckets + bench-fio/mlperf NFS dirs"
-}
-trap cleanup_bench EXIT INT TERM
+# NO AUTOMATIC CLEANUP. A trap used to delete the bench artifacts on every exit —
+# including the mlperf dataset, which costs ~17 minutes to regenerate on a small
+# client. Any rerun of the train leg (a different accel/rt/pf, or a rerun after a
+# crash) therefore paid the full regenerate again, and a run that failed for an
+# unrelated reason destroyed the dataset on its way out. The suite now LEAVES what
+# it wrote; remove it deliberately when you are done:
+#
+#   AWS_ACCESS_KEY_ID=$GW_AK AWS_SECRET_ACCESS_KEY=$GW_SK AWS_REGION=us-east-1 \
+#     aws s3 rb s3://mlperf-bench --force --endpoint-url http://$GW:9000
+#   sudo rm -rf $NFS_MNT/bench-fio $NFS_MNT/mlperf-bench
+#   for b in ttfb1k warpprobe warpbench; do aws s3 rb s3://$b --force \
+#     --endpoint-url http://$GW:9000; done
+#
+# Watch the allocation while leftovers accumulate: past the 80% watermark the
+# router's capacity evictor drains the read-through cache on every 5m sweep
+# (seen live 2026-07-17 at alloc 94.7%). Check with:
+#   curl -s "http://$GW:9000/admin/alloc/usage?token=zus-<cluster-id>"
 
 # 1) warp (S3 :9000) — 1KiB TTFB then 96MiB PUT/GET at EC concurrency (16 for 2/1)
 want warp && run "1/5 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb
@@ -108,15 +112,23 @@ want warp && run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$
 want fio && run "2/5 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
-want mlperf && run "3/5 mlperf resnet50 (mp-s3, accel-4/rt-20/pf-40)" \
+# Params come from detect_ec (EC 2/1 -> accel 3 / rt 12 / pf 24), the SAME table
+# the cluster's own benchmark uses. They used to be overridden to 4/20/40 — more
+# ranks and threads than the cluster runs for the same EC — and on a 4 GB client
+# the extra torch rank starved the mount-s3 daemon, which sits OUTSIDE the dlio
+# memory cgroup: the FUSE mount died 14 files into a 476-file read and every rank
+# then failed with "Transport endpoint is not connected". Override with
+# MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
+want mlperf && run "3/5 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
-  MLPERF_ACCELS=4 MLPERF_READ_THREADS=20 MLPERF_PREFETCH=40 MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
+  MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
   "$HERE/run_cluster.sh" mlperf
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
 want cache && run "4/5 read-through cache ($CACHE_TABLE via router)" \
   env GW="$GW" ORIGIN_BUCKET="$ORIGIN_BUCKET" REGION="$REGION" TABLE="$CACHE_TABLE" \
   ROUTER="$ROUTER" NFS_MNT="$NFS_MNT" GW_AK="$GW_AK" GW_SK="$GW_SK" \
+  S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
   "$HERE/run_router.sh"
 
 # 5) eviction — informational: the router must be running with pct high/low (or
@@ -125,7 +137,7 @@ want cache && run "4/5 read-through cache ($CACHE_TABLE via router)" \
 #    router's evictor log so you can see it fire + reclaim. Configure via the README.
 run "5/5 eviction (drive the cache past the high watermark; watch the evictor)" \
   bash -c '
-    KEYS=$(aws s3 ls "s3://'"$ORIGIN_BUCKET"'/'"$CACHE_TABLE"'/" --recursive --region "'"$REGION"'" 2>/dev/null | awk "\$3+0>0{print \$4}")
+    KEYS=$(aws s3 ls "s3://'"$ORIGIN_BUCKET"'/'"$CACHE_TABLE"'/" --recursive --region "'"$REGION"'" '"$OEP"' 2>/dev/null | awk "\$3+0>0{print \$4}")
     echo "$KEYS" | xargs -P32 -I{} curl -s -m600 -o /dev/null "'"$ROUTER"'/'"$ORIGIN_BUCKET"'/{}"
     echo "cache filled through the router — check the router logs for [evict] lines:"
     echo "   (on the gateway)  docker logs zus-router --since 60s | grep evict"
@@ -147,13 +159,13 @@ awk '
   /^  write: IOPS.*BW=/       { sub(/.*BW=/,""); sub(/ .*/,""); fw=$0 }
   /^  read: IOPS.*BW=/        { sub(/.*BW=/,""); sub(/ .*/,""); fr=$0 }
   /mlperf write-NFS:/         { mw=$3 }
-  /\[METRIC\] Training Accelerator/      { au=$NF; sub(/\(.*/,"",au); au=$(NF-1) }
-  /\[METRIC\] Training Throughput/       { sm=$(NF-1) }
-  /\[METRIC\] Training I\/O Throughput/  { io=$(NF-1) }
+  /Accelerator Utilization/          { au=$0; sub(/.*: */,"",au); sub(/ *\(.*/,"",au) }
+  /Training Throughput.*samples/     { sm=$0; sub(/.*: */,"",sm); sub(/ *\(.*/,"",sm) }
+  /Training I\/O Throughput/         { io=$0; sub(/.*: */,"",io); sub(/ *\(.*/,"",io) }
   /cache-bench\] set:/        { setsz=$0; sub(/^.*set: /,"",setsz) }
   /cache-MISS→write:/         { cw=$2 }
   /direct-S3 \(origin\)/      { d=$3 }  /cache-S3 \(router/   { c=$4 }
-  /cache-mp-s3 \(warm\)/      { m=$3 }  /cache-NFS \(Ganesha/ { n=$4 }
+  /cache-NFS \(Ganesha/ { n=$4 }
   /speedup vs direct-S3/      { sp=$0; sub(/^ */,"",sp) }
   /^  write-NFS   :/          { rww=$3 }
   /^  read-S3     :/          { rwr=$3 }
@@ -163,13 +175,13 @@ awk '
     if (put || get) { printf "  warp    S3 PUT %s MiB/s · GET %s MiB/s\n", put, get; any=1
                       if (ttfb) { sub(/^ *\* */,"",ttfb); printf "  %s\n", ttfb } }
     if (fw || fr)   { printf "  fio     NFS write %s · read %s\n", fw, fr; any=1 }
-    if (mw || io)   { printf "  mlperf  write-NFS %s MB/s", (mw?mw:"n/a")
-                      if (io) printf " · read AU %s%% · %s samples/s · %s MB/s", au, sm, io
-                      else    printf " · read (train produced no metrics)"
+    if (mw || io || au) { printf "  mlperf  write-NFS %s MB/s", (mw?mw:"n/a")
+                      if (au || io) printf " · read AU %s%% · %s samples/s · %s MB/s", (au?au:"n/a"), (sm?sm:"n/a"), (io?io:"n/a")
+                      else          printf " · read (train produced no metrics)"
                       printf "\n"; any=1 }
-    if (d || c || m) {
-      printf "  cache   set %s · direct-S3 %s · MISS→write %s · hit-S3 %s · hit-mp-s3 %s MB/s\n",
-             (setsz?setsz:"?"), d, (cw?cw:"n/a"), c, m
+    if (d || c) {
+      printf "  cache   set %s · direct-S3 %s · MISS→write %s · hit-S3 %s MB/s\n",
+             (setsz?setsz:"?"), d, (cw?cw:"n/a"), c
       if (sp) printf "  %s\n", sp
       any=1 }
     if (rww || rwr) { printf "  wr→rd   write-NFS %s · read-S3 %s · read-mp-s3 %s\n", rww, rwr, rwm; any=1 }
