@@ -83,6 +83,11 @@ registered_sigs(){ curl -s -m 20 "$QAPI/admin/mv/registered_queries" -H "Authori
   | python3 -c "import json,sys;print(' '.join(q['sig'] for q in json.load(sys.stdin).get('queries',[])))" 2>/dev/null; }
 
 echo "== MV lifecycle benchmark v2: cluster $CLUSTER_ID (authors=$AUTHOR_ITERS, appends=$ITERS, upserts=$ITERS, rows/cycle=$CDC_ROWS) =="
+# Say which fact the appends hit. When it does not match the query's own fact
+# there is no delta for its MV, every "refresh" is a warm re-serve, and
+# delta_merge_ms comes back empty — which reads as "the delta path is broken"
+# rather than "this run never changed the table the query reads".
+echo "   appends hit fact: ${BENCH_FACT:-$(query_fact)} (query $QLABEL)"
 
 # ---- A) COLD author of q1, AUTHOR_ITERS times, EVICTING after each ----------------
 # Same query (q1) every iteration, but the MV is DELETED right after it's built, so
@@ -104,12 +109,31 @@ for i in $(seq 1 "$AUTHOR_ITERS"); do
   sleep 1
 done
 
+# query_fact — the fact table the benched query actually reads, so the append
+# lands where the MV's grain comes from. First fact mentioned in the SQL wins;
+# falls back to store_sales (the fact behind most of the suite) rather than to a
+# table the query may not read at all.
+query_fact(){
+  local sql="" f
+  [ -n "${QF:-}" ] && [ -f "${QF:-}" ] && sql=$(tr 'A-Z' 'a-z' < "$QF")
+  for f in store_sales catalog_sales web_sales store_returns catalog_returns web_returns inventory; do
+    case "$sql" in *"$f"*) printf '%s' "$f"; return;; esac
+  done
+  printf 'store_sales'
+}
+
 cycle(){ # cycle <label> <seed-extra-args...> — commit, webhook, inline re-serve
   local label="$1"; shift
-  # BENCH_FACT: which fact the append hits (default store_returns; use
-  # catalog_sales for q64-class join-CTE MVs — the seeder appends referential
-  # catalog_returns rows alongside so the join actually gains delta rows).
-  local ft="${BENCH_FACT:-store_returns}"
+  # BENCH_FACT: which fact the append hits. DERIVED FROM THE QUERY by default,
+  # not hardcoded — a fixed default silently measures nothing for any query
+  # whose fact it does not touch. That is what happened with q9/q88/q14: all
+  # three are store_sales MVs, the append went to store_returns, so their source
+  # never moved, there was no delta to merge, and the run reported
+  # "delta_merge_ms: n=0" and a warm re-serve as though the delta path had been
+  # exercised. Explicit BENCH_FACT still wins (use catalog_sales for q64-class
+  # join-CTE MVs — the seeder appends referential catalog_returns rows alongside
+  # so the join actually gains delta rows).
+  local ft="${BENCH_FACT:-$(query_fact)}"
   # Source-bucket creds must win over any stale ~/.aws/credentials profile.
   AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
   "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \

@@ -78,7 +78,7 @@ run(){ echo; echo ">>> $1"; shift; "$@"; }
 # others: every mlperf attempt first re-ran ~12 min of warp and ~7 min of fio for
 # numbers already in hand. run_cluster.sh has always accepted the legs
 # individually; this just exposes that.
-#   STORAGE_LEGS=cache          only the read-through cache + write->read legs
+#   STORAGE_LEGS=cache          only the read-through cache leg
 #   STORAGE_LEGS=mlperf         only mlperf
 #   STORAGE_LEGS=warp,fio       several
 #   (unset / all)               everything, as before
@@ -105,11 +105,11 @@ want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) ret
 #   curl -s "http://$GW:9000/admin/alloc/usage?token=zus-<cluster-id>"
 
 # 1) warp (S3 :9000) — 1KiB TTFB then 96MiB PUT/GET at EC concurrency (16 for 2/1)
-want warp && run "1/5 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb
+want warp && run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb
 want warp && run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp
 
 # 2) fio (NFS) — write + cold sequential read
-want fio && run "2/5 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
+want fio && run "2/4 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
 # Params come from detect_ec (EC 2/1 -> accel 3 / rt 12 / pf 24), the SAME table
@@ -119,29 +119,25 @@ want fio && run "2/5 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC=
 # memory cgroup: the FUSE mount died 14 files into a 476-file read and every rank
 # then failed with "Transport endpoint is not connected". Override with
 # MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
-want mlperf && run "3/5 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
+want mlperf && run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
   MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
   "$HERE/run_cluster.sh" mlperf
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
-want cache && run "4/5 read-through cache ($CACHE_TABLE via router)" \
+want cache && run "4/4 read-through cache ($CACHE_TABLE via router)" \
   env GW="$GW" ORIGIN_BUCKET="$ORIGIN_BUCKET" REGION="$REGION" TABLE="$CACHE_TABLE" \
   ROUTER="$ROUTER" NFS_MNT="$NFS_MNT" GW_AK="$GW_AK" GW_SK="$GW_SK" \
   S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
   "$HERE/run_router.sh"
 
-# 5) eviction — informational: the router must be running with pct high/low (or
-#    -cache-max-bytes) wired to the gateway /admin/alloc/usage. This step just reads
-#    enough data through the router to cross the high watermark and prints the
-#    router's evictor log so you can see it fire + reclaim. Configure via the README.
-run "5/5 eviction (drive the cache past the high watermark; watch the evictor)" \
-  bash -c '
-    KEYS=$(aws s3 ls "s3://'"$ORIGIN_BUCKET"'/'"$CACHE_TABLE"'/" --recursive --region "'"$REGION"'" '"$OEP"' 2>/dev/null | awk "\$3+0>0{print \$4}")
-    echo "$KEYS" | xargs -P32 -I{} curl -s -m600 -o /dev/null "'"$ROUTER"'/'"$ORIGIN_BUCKET"'/{}"
-    echo "cache filled through the router — check the router logs for [evict] lines:"
-    echo "   (on the gateway)  docker logs zus-router --since 60s | grep evict"
-  '
+# NO EVICTION LEG. It reported no number: it re-read the whole set through the
+# router purely to generate load, then told the operator to run
+# `docker logs zus-router` ON THE GATEWAY — which the client box cannot do, it
+# has no shell there. And its stated goal, "drive the cache past the high
+# watermark", steers at the one condition that makes the evictor delete from a
+# bucket that also holds source data and MV output. Eviction is verified by unit
+# tests in the router repo, not by pushing a live cluster at its watermark.
 
 echo ""
 echo "============================ STORAGE/CACHE SUMMARY ============================"
@@ -167,9 +163,6 @@ awk '
   /direct-S3 \(origin\)/      { d=$3 }  /cache-S3 \(router/   { c=$4 }
   /cache-NFS \(Ganesha/ { n=$4 }
   /speedup vs direct-S3/      { sp=$0; sub(/^ */,"",sp) }
-  /^  write-NFS   :/          { rww=$3 }
-  /^  read-S3     :/          { rwr=$3 }
-  /^  read-mp-s3  :/          { rwm=$3 }
   END{
     any=0
     if (put || get) { printf "  warp    S3 PUT %s MiB/s · GET %s MiB/s\n", put, get; any=1
@@ -184,7 +177,6 @@ awk '
              (setsz?setsz:"?"), d, (cw?cw:"n/a"), c
       if (sp) printf "  %s\n", sp
       any=1 }
-    if (rww || rwr) { printf "  wr→rd   write-NFS %s · read-S3 %s · read-mp-s3 %s\n", rww, rwr, rwm; any=1 }
     if (!any) print "  (no leg produced numbers — see the log above for the failure)"
   }' "$CAP"
 echo "==============================================================================="

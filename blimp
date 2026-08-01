@@ -994,6 +994,7 @@ cmd_bench(){
     REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-3}" AUTHOR_ITERS="${AUTHOR_ITERS:-3}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     BENCH_QNR="${BENCH_QNR:-1}" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
+    BENCH_FACT="${BENCH_FACT:-}" \
     CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh"
 }
 

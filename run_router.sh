@@ -75,6 +75,7 @@ fi
 drop_client_cache(){ sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true; }
 remount_nfs(){ sudo umount -l "$MNT" 2>/dev/null || true; mount_nfs; }
 
+gib_(){ awk -v b="$1" 'BEGIN{printf "%.2f", b/1073741824}'; }
 mbps(){ awk -v b="$1" -v s="$2" 'BEGIN{ if(s<=0)s=0.0001; printf "%.0f", b/1e6/s }'; }
 now(){ date +%s.%N; }
 el(){ awk -v a="$1" -v z="$2" 'BEGIN{d=z-a; if(d<0)d=0; printf "%.2f", d}'; }
@@ -194,11 +195,42 @@ router_get(){
 # ============================ 1) DIRECT S3 (origin) ===============================
 # Straight GET from the origin bucket to /dev/null, parallel. VPC S3 endpoint keeps
 # it private + in-region; the box IAM role authenticates.
-t0=$(now)
-echo "$KEYS" | xargs -P"$PAR" -I{} aws s3api get-object --bucket "$BKT" --key "{}" \
-  --region "$REGION" $OEP /dev/stdout >/dev/null 2>&1
-t1=$(now); DIRECT=$(mbps "$BYTES" "$(el "$t0" "$t1")"); DIRECT_S=$(el "$t0" "$t1")
-echo "  direct-S3 : $DIRECT MB/s (${DIRECT_S}s)"
+# SAME CLIENT AS THE ROUTER LEGS, AND THE SIGNING IS NOT TIMED.
+#
+# This used to run `aws s3api get-object` once PER OBJECT — a full Python
+# interpreter start each time, measured at 0.76s per object — INSIDE the timed
+# window, while the router legs below use curl. So the two legs measured two
+# different clients, the origin baseline came out ~25% low, and the cache MISS
+# appeared FASTER than reading the origin directly (599 vs 388 MB/s). That is
+# impossible: the miss path is this same origin read PLUS a hop through the
+# router plus the proxying. Any "the cache beats the origin" reading came from
+# the measurement, not the cluster.
+#
+# Presign every key up front (outside the timer), then fetch with the identical
+# curl + concurrency the router legs use. Now the only difference between the
+# legs is the path, which is the thing being compared.
+PRESIGNED=$(mktemp)
+for k in $KEYS; do
+  if [ -n "$S3_ENDPOINT" ]; then
+    aws s3 presign "s3://$BKT/$k" --endpoint-url "$S3_ENDPOINT" --region "$REGION" --expires-in 7200 2>/dev/null
+  else
+    aws s3 presign "s3://$BKT/$k" --region "$REGION" --expires-in 7200 2>/dev/null
+  fi
+done > "$PRESIGNED"
+npre=$(awk 'NF' "$PRESIGNED" | wc -l | tr -d ' ')
+if [ "${npre:-0}" -lt "$NOBJ" ]; then
+  echo "  !! presigned only $npre/$NOBJ origin URLs — direct-S3 baseline would be partial; skipping it"
+  DIRECT=0; DIRECT_S=0
+else
+  t0=$(now)
+  xargs -P"$PAR" -I{} curl -s -m3600 -o /dev/null -w '%{size_download} %{http_code}\n' "{}" < "$PRESIGNED" \
+    | awk '{b+=$1; if($2!=200)e++} END{printf "%d %d", b+0, e+0}' > "$PRESIGNED.out"
+  t1=$(now)
+  DIRECT_B=$(cut -d' ' -f1 "$PRESIGNED.out"); DIRECT_ERR=$(cut -d' ' -f2 "$PRESIGNED.out")
+  DIRECT_S=$(el "$t0" "$t1"); DIRECT=$(mbps "${DIRECT_B:-0}" "$DIRECT_S")
+  echo "  direct-S3 : $DIRECT MB/s (${DIRECT_S}s, $(gib_ "${DIRECT_B:-0}") GiB recv${DIRECT_ERR:+, $DIRECT_ERR non-200})"
+fi
+rm -f "$PRESIGNED" "$PRESIGNED.out"
 
 # ==================== 2) CACHE MISS → WRITE onto the blimp node ==================
 # FULL-object GET through the Router so the whole object is fetched from origin and
@@ -389,66 +421,10 @@ done
 printf '{"table":"%s","bytes":%s,"objects":%s,"mbps":{"direct_s3":%s,"cache_s3":%s,"cache_nfs":"%s"}}\n' \
   "$TABLE" "$BYTES" "$NOBJ" "$DIRECT" "$WARM_S3" "$WARM_NFS"
 
-# ============ WRITE → READ over a CONTROLLED set (NFS write, S3 reads) ==========
-# The legs above are bounded by the customer's dataset SHAPE, not by the cluster:
-# at SF1 the origin is one parquet file per table (3 objects, 0.26 GiB), so no S3
-# read path can parallelise and every number is per-request-latency bound — which
-# is why "cache" read 26 MB/s while warp drove the same gateway at 574 MiB/s.
-#
-# So do what the mlperf leg does: WRITE a purpose-built set through NFS (POSIX,
-# and the gateway exports one namespace over both faces so the objects are then
-# visible over S3 with no second copy), then READ it back over the two S3 faces.
-# Object count and size are ours to choose, so the read is genuinely concurrent
-# and the number reflects the cluster instead of the dataset. Both directions are
-# measured — write once, read twice.
-#
-# NOTE this is a READ-PATH measurement, not a read-through-cache one: the objects
-# are written straight into the gateway namespace, so there is no origin miss to
-# fill. The cache legs above remain the read-through test.
-RW_OBJS="${RW_OBJS:-64}"; RW_MIB="${RW_MIB:-16}"; RW_BKT="${RW_BKT:-blimp-rw-bench}"
-if [ "${RW_BENCH:-1}" = "1" ] && mountpoint -q "$MNT" 2>/dev/null; then
-  echo ""
-  echo "==================== write→read ($RW_OBJS × ${RW_MIB} MiB = $(( RW_OBJS * RW_MIB )) MiB) ===================="
-  RW_DIR="$MNT/$RW_BKT"; sudo mkdir -p "$RW_DIR" 2>/dev/null; sudo chown "$(id -u)" "$RW_DIR" 2>/dev/null
-  RW_BYTES=$(( RW_OBJS * RW_MIB * 1048576 ))
-  # 1) WRITE via NFS — oflag=direct to match the fio leg's --direct=1. Buffered
-  #    writes land in the client page cache and reported 172 MB/s against fio's
-  #    78.9 MB/s on the same mount: that was the cache, not the cluster.
-  t0=$(now)
-  seq 1 "$RW_OBJS" | xargs -P"$PAR" -I{} \
-    dd if=/dev/zero of="$RW_DIR/obj-{}.bin" bs=1M count="$RW_MIB" oflag=direct 2>/dev/null
-  sync 2>/dev/null || true
-  t1=$(now); RW_W=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
-  echo "  write-NFS   : $RW_W MB/s ($(el "$t0" "$t1")s, $RW_OBJS objects, direct I/O — compare to fio NFS write)"
-  # 2) READ back over S3 with WARP, the same client and flags as the warp GET leg,
-  #    so the two numbers are directly comparable. The previous version spawned one
-  #    `aws` CLI per object — 64 Python interpreter starts — and reported 40 MB/s
-  #    while mountpoint-s3 read the same GiB at 326 MB/s. That measured process
-  #    spawn, not S3.
-  RW_R_S3="n/a"
-  if command -v warp >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then
-    RW_R_S3=$(warp get --host="$GW:9000" --access-key="$GW_AK" --secret-key="$GW_SK" \
-        --tls=false --no-color --bucket="$RW_BKT" --list-existing --noclear \
-        --concurrent="$PAR" --duration=20s 2>&1 \
-      | sed -n 's/.*Average: \([0-9.]*\) MiB\/s.*/\1/p' | head -1)
-    RW_R_S3="${RW_R_S3:-n/a}"
-  fi
-  echo "  read-S3     : $RW_R_S3 MiB/s (warp, conc=$PAR — compare to the warp GET leg)"
-  # 3) READ back over mountpoint-s3
-  RW_R_MPS3="n/a"
-  if command -v mount-s3 >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then
-    RWMP=/mnt/mps3_rw; sudo mkdir -p "$RWMP"; sudo chown "$(id -u)" "$RWMP"; fusermount -u "$RWMP" 2>/dev/null || true
-    if AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" \
-       mount-s3 --endpoint-url "http://$GW:9000" --region us-east-1 "$RW_BKT" "$RWMP" 2>/dev/null; then
-      drop_client_cache
-      t0=$(now)
-      seq 1 "$RW_OBJS" | xargs -P"$PAR" -I{} dd if="$RWMP/obj-{}.bin" of=/dev/null bs=1M 2>/dev/null
-      t1=$(now); RW_R_MPS3=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
-      fusermount -u "$RWMP" 2>/dev/null || true
-    fi
-  fi
-  echo "  read-mp-s3  : $RW_R_MPS3 MB/s (mountpoint-s3 over gateway :9000)"
-  rm -f "$RW_DIR"/obj-*.bin 2>/dev/null || true
-  printf '{"rw_bench":{"objects":%s,"bytes":%s,"mbps":{"write_nfs":%s,"read_s3":%s,"read_mp_s3":"%s"}}}\n' \
-    "$RW_OBJS" "$RW_BYTES" "$RW_W" "$RW_R_S3" "$RW_R_MPS3"
-fi
+# NO write->read LEG HERE. It wrote 64 objects over NFS and read them back with
+# warp and mountpoint-s3 against the gateway's S3 endpoint (:9000) — the ROUTER
+# is not in either path, so it measured the gateway's read face, not the
+# read-through cache, while sitting inside the router benchmark and inviting
+# exactly that comparison. Its own note already said so: "this is a READ-PATH
+# measurement, not a read-through-cache one". The gateway's write and read faces
+# are covered by the fio and warp legs of --storage.
