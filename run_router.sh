@@ -66,48 +66,49 @@ mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
 
 echo "[cache-bench] origin=s3://$BKT/{$TABLES}/  region=$REGION  router=$ROUTER  par=$PAR"
 
-# --- the set MUST exceed 2x the gateway's RAM ------------------------------------
-# Otherwise the "warm" read is served from the gateway's page cache and the number
-# says nothing about the cache: at SF1 the whole origin is 328 MB against ~3.7 GiB
-# of gateway RAM, so every byte fits in memory several times over.
+# --- the read set: OUR OWN data, sized above 2x the gateway's RAM ----------------
+# The router test needs a set the gateway cannot simply hold in memory, or the
+# "warm" read is served from its page cache and the number says nothing about the
+# cache. The customer's data does not qualify and cannot be made to: at SF1 the
+# whole origin is 328 MB against ~3.7 GiB of gateway RAM, in 3 objects.
 #
-# The origin is the customer's data and we cannot make it bigger, so replicate it
-# SERVER-SIDE (S3 copy — no bytes cross the client) into a bench prefix until the
-# set clears the bar. Same objects, more of them: it also lifts object count, which
-# is what gives the read any concurrency (one parquet file per table cannot
-# parallelise).
+# So MAKE the data here on the client, upload it to the origin, and read it back
+# through the router. 10 GB by default = 2.7x a 4 GiB gateway. It is written in
+# parts because a single object is a single stream — one 10 GB GET measures one
+# TCP connection, not the cluster. Set BENCH_PARTS=1 for a literal single file.
 #
-# MIN_SET_BYTES defaults to 8 GiB = 2x a 4 GiB gateway. Set it explicitly to
-# 2x YOUR gateway's RAM on a bigger node, or 0 to skip the check entirely.
-MIN_SET_BYTES="${MIN_SET_BYTES:-8589934592}"
+# BENCH_GB=0 skips generation and uses whatever is already in the bucket.
 BENCH_PREFIX="${BENCH_PREFIX:-_blimp_cachebench}"
-if [ "$MIN_SET_BYTES" -gt 0 ]; then
-  cur=$(for T in $TABLES $BENCH_PREFIX; do
-          aws s3 ls "s3://$BKT/$T/" --recursive --region "$REGION" 2>/dev/null
-        done | awk '{s+=$3} END{print s+0}')
-  if [ "${cur:-0}" -lt "$MIN_SET_BYTES" ]; then
-    # biggest single object as the replication unit — fewest copies, and it keeps
-    # the objects large enough that per-request overhead stays negligible.
-    src=$(for T in $TABLES; do
-            aws s3 ls "s3://$BKT/$T/" --recursive --region "$REGION" 2>/dev/null
-          done | sort -k3 -rn | head -1)
-    src_key=$(printf '%s' "$src" | awk '{print $4}')
-    src_sz=$(printf '%s' "$src" | awk '{print $3+0}')
-    if [ -n "$src_key" ] && [ "${src_sz:-0}" -gt 0 ]; then
-      need=$(( (MIN_SET_BYTES - cur + src_sz - 1) / src_sz ))
-      echo "[cache-bench] set is $(awk -v b="$cur" 'BEGIN{printf "%.2f",b/1073741824}') GiB, under the $(awk -v b="$MIN_SET_BYTES" 'BEGIN{printf "%.1f",b/1073741824}') GiB floor (2x gateway RAM)"
-      echo "[cache-bench] replicating $need x $(awk -v b="$src_sz" 'BEGIN{printf "%.0f",b/1048576}') MiB server-side into $BENCH_PREFIX/ (no client transfer)…"
-      i=0
-      while [ "$i" -lt "$need" ]; do
-        i=$((i+1))
-        aws s3 cp "s3://$BKT/$src_key" "s3://$BKT/$BENCH_PREFIX/copy-$i.bin" \
-          --region "$REGION" --only-show-errors 2>/dev/null &
-        [ $((i % 8)) -eq 0 ] && wait
-      done
-      wait
-    fi
+BENCH_GB="${BENCH_GB:-10}"
+BENCH_PARTS="${BENCH_PARTS:-10}"
+if [ "${BENCH_GB:-0}" -gt 0 ]; then
+  want_bytes=$(( BENCH_GB * 1073741824 ))
+  have=$(aws s3 ls "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" 2>/dev/null \
+         | awk '{s+=$3} END{print s+0}')
+  if [ "${have:-0}" -ge "$want_bytes" ]; then
+    echo "[cache-bench] reusing existing $(awk -v b="$have" 'BEGIN{printf "%.1f",b/1073741824}') GiB bench set in $BENCH_PREFIX/"
+  else
+    part_mb=$(( BENCH_GB * 1024 / BENCH_PARTS ))
+    echo "[cache-bench] creating ${BENCH_GB} GB on this client ($BENCH_PARTS x ${part_mb} MiB) and uploading to s3://$BKT/$BENCH_PREFIX/ …"
+    gen=$(mktemp -d /var/tmp/blimp-bench.XXXXXX)
+    i=0
+    while [ "$i" -lt "$BENCH_PARTS" ]; do
+      i=$((i+1))
+      # /dev/urandom, not /dev/zero: zeros are trivially compressible and any
+      # layer that compresses would flatter every number downstream.
+      dd if=/dev/urandom of="$gen/part-$i.bin" bs=1M count="$part_mb" 2>/dev/null &
+      [ $((i % 4)) -eq 0 ] && wait
+    done
+    wait
+    up0=$(now)
+    aws s3 cp "$gen/" "s3://$BKT/$BENCH_PREFIX/" --recursive --region "$REGION" --only-show-errors 2>/dev/null
+    up1=$(now)
+    echo "[cache-bench] uploaded $BENCH_GB GB to the origin in $(el "$up0" "$up1")s ($(mbps "$want_bytes" "$(el "$up0" "$up1")") MB/s client→origin)"
+    rm -rf "$gen"
   fi
-  case " $TABLES " in *" $BENCH_PREFIX "*) ;; *) TABLES="$TABLES $BENCH_PREFIX";; esac
+  # Read ONLY the bench set: mixing in the customer's 3 small parquet files would
+  # dilute the result with per-request-latency-bound reads.
+  TABLES="$BENCH_PREFIX"
 fi
 
 # --- enumerate the object set (key<TAB>size), optionally capped to MAX_BYTES -------
