@@ -110,6 +110,11 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   # whole leg with "HERE: unbound variable" before mlperf ran a single step.
   local kitdir; kitdir="$(cd "$(dirname "$0")" && pwd)"
   PATH="$kitdir:$PATH"; export PATH
+  # Hydra hides the real exception behind "Set the environment variable
+  # HYDRA_FULL_ERROR=1 for a complete stack trace", so a failed generate/train
+  # reported only that sentence plus mpirun's "exit code 1" — useless. Always on:
+  # this is a benchmark, a full traceback costs nothing and saves a whole run.
+  export HYDRA_FULL_ERROR=1
   local mpidir
   for mpidir in /usr/lib64/openmpi /usr/lib/x86_64-linux-gnu/openmpi /usr/lib64/mpich; do
     if [ -x "$mpidir/bin/mpirun" ]; then
@@ -168,7 +173,25 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
     DF="$NG"   # read directly from the NFS mount where generate wrote the data
   else
     sudo mkdir -p "$MPS3"; sudo chown "$(id -u)" "$MPS3"
-    mountpoint -q "$MPS3" || mount-s3 --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"
+    # ALWAYS unmount first. `mountpoint -q` reports a STALE FUSE endpoint as
+    # mounted, so "mount only if not mounted" skipped the remount and training
+    # then read through a dead mount:
+    #   FailedPreconditionError: /mnt/mps3/resnet50/train/img_001_of_476.tfrecord;
+    #   Transport endpoint is not connected
+    # A previous run's cleanup (or a killed mount-s3) leaves exactly that behind,
+    # so every subsequent mlperf run failed until the box was rebooted.
+    fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
+    if ! mount-s3 --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
+      echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"
+      return 0
+    fi
+    # Prove the mount is actually readable before handing it to dlio — a mount
+    # that reports success but cannot list is the same failure one step later.
+    if ! ls "$MPS3" >/dev/null 2>&1; then
+      echo "!! mlperf SKIPPED: $MPS3 mounted but is not readable (stale endpoint?)"
+      fusermount -u "$MPS3" 2>/dev/null || true
+      return 0
+    fi
     DF="$MPS3/resnet50"
   fi
   local L="$DLIO"; [ "$ACC" -gt 1 ] && L="mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus --oversubscribe -np $ACC $DLIO"
