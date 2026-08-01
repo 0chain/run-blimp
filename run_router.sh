@@ -145,9 +145,39 @@ echo "$NHITMAP" | cut -f1 | xargs -P"$PAR" -I{} sh -c 'dd if="$1/$2" of=/dev/nul
 t1=$(now); WARM_NFS=$(mbps "$NHITB" "$(el "$t0" "$t1")"); WARM_NFS_S=$(el "$t0" "$t1")
 echo "  cache-NFS : $WARM_NFS MB/s (${WARM_NFS_S}s, eblobber cache via Ganesha, $NHITN objs)"
 
+# ===================== is the cache even TURNED ON? ==============================
+# The router only caches buckets listed in its -cache-buckets flag. `blimp --setup`
+# wires the gateway's SOURCE over the admin API but leaves the cache retarget
+# optional (hookup_cluster_source.sh), so on a default cluster the router runs with
+# -cache-buckets EMPTY and is a pass-through proxy:
+#     [evict] disabled (buckets=0 ... cacheHighBytes=0)
+# Every cache leg then reports 0 MB/s / 0 objects, which reads as broken storage
+# rather than "the cache was never enabled" — and the cache-S3 number is really
+# just the router proxying to origin, not a cache hit. /iostats settles it: with
+# the bucket untracked there are ZERO hits AND zero misses, because the requests
+# never enter the cache path.
+CACHE_ON="unknown"
+IOSTATS=$(curl -s -m 10 "$ROUTER/iostats" 2>/dev/null || true)
+if [ -n "$IOSTATS" ]; then
+  CACHE_ON=$(printf '%s' "$IOSTATS" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("unknown"); raise SystemExit
+act = (d.get("cache_hits",0) or 0) + (d.get("cache_misses",0) or 0) + (d.get("bytes_written_to_cache",0) or 0)
+print("off" if act == 0 else "on")' 2>/dev/null || echo unknown)
+fi
+
 # ================================ summary ========================================
 echo ""
 echo "==================== read-through cache: $TABLES ($(awk -v b="$BYTES" 'BEGIN{printf "%.1f",b/1073741824}') GiB) ===================="
+if [ "$CACHE_ON" = "off" ]; then
+  echo "  ⚠ THE READ-THROUGH CACHE IS NOT ENABLED FOR THIS BUCKET."
+  echo "    The router reports 0 hits AND 0 misses, i.e. these reads never entered the"
+  echo "    cache path — it is started with an empty -cache-buckets and is proxying"
+  echo "    straight to the origin. So 'cache-S3' below is NOT a cache hit, and"
+  echo "    cache-mp-s3 / cache-NFS find 0 objects because nothing was ever cached."
+  echo "    Enable it, then re-run:   ./hookup_cluster_source.sh"
+fi
 printf '  %-26s %8s MB/s\n' "direct-S3 (origin)"        "$DIRECT"
 printf '  %-26s %8s MB/s\n' "cache-S3 (router, warm)"   "$WARM_S3"
 printf '  %-26s %8s MB/s\n' "cache-mp-s3 (warm)"        "$WARM_MPS3"
