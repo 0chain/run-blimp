@@ -130,6 +130,24 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
     return 0
   fi
   local BKT="${MLPERF_BUCKET:-mlperf-bench}" MPS3="${MPS3_MNT:-/mnt/mps3}" DLIO=/opt/dlio/venv_mlperf/bin/dlio_benchmark
+  # MEMORY GUARD, copied from the cluster (zs3-init.go run_bench). dlio's datagen
+  # writes through /dev/shm and `mpirun -np ACCEL` spawns ACCEL torch ranks; none
+  # of it is memory-bounded, so a run can exhaust RAM and wedge the whole box —
+  # which is exactly what happened here (the client stopped answering SSH mid
+  # training). Run every dlio invocation in a transient systemd scope capped at a
+  # fraction of RAM, with swap off so it cannot thrash. An overrun then OOM-kills
+  # only the dlio tree and the leg fails cleanly. Datagen gets the higher cap: it
+  # is sequential, but streaming large files accrues page cache in the cgroup.
+  local MEMKB; MEMKB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  local MLPERF_MEM_CAP="${MLPERF_MEM_CAP:-$(( MEMKB * 45 / 100 ))K}"
+  local MLPERF_GEN_MEM_CAP="${MLPERF_GEN_MEM_CAP:-$(( MEMKB * 85 / 100 ))K}"
+  MEMRUN(){ local cap="$1"; shift
+    if command -v systemd-run >/dev/null 2>&1 && [ "${MEMKB:-0}" -gt 0 ]; then
+      sudo systemd-run --scope --quiet -p MemoryMax="$cap" -p MemorySwapMax=0 -- "$@"
+    else "$@"; fi; }
+  # Stale OpenMPI session dirs make mpirun fail on a rerun; the cluster clears
+  # them before every generate.
+  rm -rf /tmp/ompi.* /tmp/openmpi-sessions-* /tmp/pmix.* 2>/dev/null || true
   # EXACT run_bench resnet50 profile (zs3-init line 10936 / train line 11173):
   #   2/1 -> accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain 34*7=238 / neval 64
   #   8/1 -> accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain 136*7=952 / neval 64
@@ -155,7 +173,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
     # directions: write here, read in the TRAIN step below.
     local g0 g1 gsec gbytes
     g0=$(date +%s)
-    "$DLIO" workload=resnet50_h100 ++workload.dataset.data_folder="$NG" \
+    MEMRUN "$MLPERF_GEN_MEM_CAP" "$DLIO" workload=resnet50_h100 ++workload.dataset.data_folder="$NG" \
       ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
       ++workload.workflow.generate_data=True ++workload.workflow.train=False 2>&1 | grep -iE 'Generation done|error' | tail -1
     g1=$(date +%s); gsec=$(( g1 - g0 )); [ "$gsec" -lt 1 ] && gsec=1
@@ -202,7 +220,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   # its banner, so the suite looked like it had simply produced no numbers. Show
   # the metrics on success; show the tail of the real failure otherwise.
   local tout trc
-  tout=$($L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \
+  tout=$(MEMRUN "$MLPERF_MEM_CAP" $L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \
     ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
     ++workload.workflow.train=True ++workload.workflow.evaluation=False ++workload.workflow.generate_data=False \
     ++workload.reader.read_threads="$RT" ++workload.reader.batch_size="$BATCH" ++workload.reader.prefetch_size="$PF" \
