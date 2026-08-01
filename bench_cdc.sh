@@ -134,10 +134,24 @@ for ft in $(facts_of); do
   echo ">> phase 2: append +$CDC_ROWS to [$APPEND_TABLES] + snapshot_changed"
   for at in $APPEND_TABLES; do
   # Source-bucket creds must win over any stale ~/.aws/credentials profile.
-  AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
-  "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
+  #
+  # Capture instead of `| tail -1`: the pipe threw away both the traceback AND
+  # the seeder's exit status, so an append that failed for EVERY fact printed one
+  # cryptic line and the run carried on to phase 3 reporting merge_ms=- /
+  # no-delta — indistinguishable from "this shape has no delta". Two real bugs
+  # (parquet field IDs, then all-null decimal stats) hid behind that for hours.
+  # On success keep the one-line summary; on failure print the whole traceback.
+  seed_out=$(AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+    "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
     --namespace "$NAMESPACE" --table "$at" --rows "$CDC_ROWS" --s3-region "$REGION" \
-    ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1 | tail -1
+    ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1); seed_rc=$?
+  if [ "$seed_rc" -ne 0 ]; then
+    echo "   !! APPEND FAILED for $at (exit $seed_rc) — no rows added, so any"
+    echo "   !! merge measured below is against UNCHANGED data. Full output:"
+    printf '%s\n' "$seed_out" | sed 's/^/   | /'
+  else
+    printf '%s\n' "$seed_out" | tail -1
+  fi
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"namespace\":\"$NAMESPACE\",\"table\":\"$at\",\"trigger\":\"cdc-bench\"}" >/dev/null
