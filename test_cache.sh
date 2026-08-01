@@ -64,6 +64,18 @@ CAP="${CAP:-/tmp/test_cache_out.log}"; : > "$CAP"
 exec > >(tee -a "$CAP") 2>&1
 run(){ echo; echo ">>> $1"; shift; "$@"; }
 
+# Leg selector. --storage was all-or-nothing, so re-measuring ONE leg re-paid the
+# others: every mlperf attempt first re-ran ~12 min of warp and ~7 min of fio for
+# numbers already in hand. run_cluster.sh has always accepted the legs
+# individually; this just exposes that.
+#   STORAGE_LEGS=cache          only the read-through cache + write->read legs
+#   STORAGE_LEGS=mlperf         only mlperf
+#   STORAGE_LEGS=warp,fio       several
+#   (unset / all)               everything, as before
+LEGS="${STORAGE_LEGS:-all}"
+want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
+[ "$LEGS" != "all" ] && echo "[legs] running only: $LEGS"
+
 # GUARANTEED cleanup — runs on completion, Ctrl-C, or any abort. Bench leftovers
 # (warp --keep-data, the kept mlperf dataset, fio files) pile ~100GB onto the
 # eblobber allocation; past the 80% watermark the capacity evictor then drains
@@ -89,20 +101,20 @@ cleanup_bench(){
 trap cleanup_bench EXIT INT TERM
 
 # 1) warp (S3 :9000) — 1KiB TTFB then 96MiB PUT/GET at EC concurrency (16 for 2/1)
-run "1/5 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb
-run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp
+want warp && run "1/5 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb
+want warp && run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp
 
 # 2) fio (NFS) — write + cold sequential read
-run "2/5 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
+want fio && run "2/5 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
-run "3/5 mlperf resnet50 (mp-s3, accel-4/rt-20/pf-40)" \
+want mlperf && run "3/5 mlperf resnet50 (mp-s3, accel-4/rt-20/pf-40)" \
   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
   MLPERF_ACCELS=4 MLPERF_READ_THREADS=20 MLPERF_PREFETCH=40 MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
   "$HERE/run_cluster.sh" mlperf
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
-run "4/5 read-through cache ($CACHE_TABLE via router)" \
+want cache && run "4/5 read-through cache ($CACHE_TABLE via router)" \
   env GW="$GW" ORIGIN_BUCKET="$ORIGIN_BUCKET" REGION="$REGION" TABLE="$CACHE_TABLE" \
   ROUTER="$ROUTER" NFS_MNT="$NFS_MNT" GW_AK="$GW_AK" GW_SK="$GW_SK" \
   "$HERE/run_router.sh"

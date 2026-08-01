@@ -242,20 +242,29 @@ if [ "${RW_BENCH:-1}" = "1" ] && mountpoint -q "$MNT" 2>/dev/null; then
   echo "==================== write→read ($RW_OBJS × ${RW_MIB} MiB = $(( RW_OBJS * RW_MIB )) MiB) ===================="
   RW_DIR="$MNT/$RW_BKT"; sudo mkdir -p "$RW_DIR" 2>/dev/null; sudo chown "$(id -u)" "$RW_DIR" 2>/dev/null
   RW_BYTES=$(( RW_OBJS * RW_MIB * 1048576 ))
-  # 1) WRITE via NFS, PAR-parallel
+  # 1) WRITE via NFS — oflag=direct to match the fio leg's --direct=1. Buffered
+  #    writes land in the client page cache and reported 172 MB/s against fio's
+  #    78.9 MB/s on the same mount: that was the cache, not the cluster.
   t0=$(now)
-  seq 1 "$RW_OBJS" | xargs -P"$PAR" -I{} dd if=/dev/zero of="$RW_DIR/obj-{}.bin" bs=1M count="$RW_MIB" 2>/dev/null
+  seq 1 "$RW_OBJS" | xargs -P"$PAR" -I{} \
+    dd if=/dev/zero of="$RW_DIR/obj-{}.bin" bs=1M count="$RW_MIB" oflag=direct 2>/dev/null
   sync 2>/dev/null || true
   t1=$(now); RW_W=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
-  echo "  write-NFS   : $RW_W MB/s ($(el "$t0" "$t1")s, $RW_OBJS objects)"
-  # 2) READ back over S3 (gateway :9000 direct)
-  drop_client_cache
-  t0=$(now)
-  seq 1 "$RW_OBJS" | AWS_ACCESS_KEY_ID="${GW_AK:-}" AWS_SECRET_ACCESS_KEY="${GW_SK:-}" \
-    xargs -P"$PAR" -I{} aws --endpoint-url "http://$GW:9000" s3api get-object \
-      --bucket "$RW_BKT" --key "obj-{}.bin" /dev/stdout >/dev/null 2>&1
-  t1=$(now); RW_R_S3=$(mbps "$RW_BYTES" "$(el "$t0" "$t1")")
-  echo "  read-S3     : $RW_R_S3 MB/s ($(el "$t0" "$t1")s, gateway :9000)"
+  echo "  write-NFS   : $RW_W MB/s ($(el "$t0" "$t1")s, $RW_OBJS objects, direct I/O — compare to fio NFS write)"
+  # 2) READ back over S3 with WARP, the same client and flags as the warp GET leg,
+  #    so the two numbers are directly comparable. The previous version spawned one
+  #    `aws` CLI per object — 64 Python interpreter starts — and reported 40 MB/s
+  #    while mountpoint-s3 read the same GiB at 326 MB/s. That measured process
+  #    spawn, not S3.
+  RW_R_S3="n/a"
+  if command -v warp >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then
+    RW_R_S3=$(warp get --host="$GW:9000" --access-key="$GW_AK" --secret-key="$GW_SK" \
+        --tls=false --no-color --bucket="$RW_BKT" --list-existing --noclear \
+        --concurrent="$PAR" --duration=20s 2>&1 \
+      | sed -n 's/.*Average: \([0-9.]*\) MiB\/s.*/\1/p' | head -1)
+    RW_R_S3="${RW_R_S3:-n/a}"
+  fi
+  echo "  read-S3     : $RW_R_S3 MiB/s (warp, conc=$PAR — compare to the warp GET leg)"
   # 3) READ back over mountpoint-s3
   RW_R_MPS3="n/a"
   if command -v mount-s3 >/dev/null 2>&1 && [ -n "${GW_AK:-}" ]; then

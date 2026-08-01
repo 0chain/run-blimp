@@ -101,6 +101,11 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   # /usr/lib64/openmpi), so dlio died with "RuntimeError: cannot load MPI library"
   # during dataset generation and mlperf produced NO numbers at all — the suite
   # printed its two banner lines and moved on. Prepend whichever prefix exists.
+  # dlio's TFRecord generator shells out to `tfrecord2idx`, which ships with
+  # NVIDIA DALI (a CUDA package with no place on a CPU-only client). Without it
+  # generation died with FileNotFoundError before producing a single number. The
+  # kit carries its own implementation — put the kit dir on PATH so dlio finds it.
+  PATH="$HERE:$PATH"; export PATH
   local mpidir
   for mpidir in /usr/lib64/openmpi /usr/lib/x86_64-linux-gnu/openmpi /usr/lib64/mpich; do
     if [ -x "$mpidir/bin/mpirun" ]; then

@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""tfrecord2idx — write a DALI-style index for a TFRecord file.
+
+dlio-benchmark's TFRecord generator shells out to `tfrecord2idx` (dlio_benchmark/
+data_generator/tf_generator.py) and dies with
+
+    FileNotFoundError: [Errno 2] No such file or directory: 'tfrecord2idx'
+
+when it is absent, which killed the mlperf leg during dataset GENERATION — before
+any number was produced. The tool normally ships with NVIDIA DALI, a CUDA package
+with no place on a CPU-only benchmark client, so implement it here instead.
+
+The index is what DALI expects: one "<offset> <size>" line per record, where
+offset is the start of the record's length header and size is the whole framed
+record. TFRecord framing (tensorflow/core/lib/io/record_writer.h):
+
+    uint64 length              8 bytes  (little-endian)
+    uint32 masked_crc(length)  4 bytes
+    byte   data[length]
+    uint32 masked_crc(data)    4 bytes
+
+so each record occupies 8 + 4 + length + 4 bytes. CRCs are not verified: this
+only needs record boundaries, and the reader validates payloads itself.
+
+Usage:  tfrecord2idx <input.tfrecord> <output.idx>
+"""
+import struct
+import sys
+
+HEADER = 12  # 8-byte length + 4-byte CRC of the length
+FOOTER = 4   # 4-byte CRC of the data
+
+
+def build_index(src, dst):
+    written = 0
+    with open(src, "rb") as f, open(dst, "w") as out:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(0)
+        offset = 0
+        while offset < size:
+            header = f.read(8)
+            if len(header) < 8:
+                raise SystemExit(
+                    "tfrecord2idx: %s: truncated length header at offset %d"
+                    % (src, offset)
+                )
+            (length,) = struct.unpack("<Q", header)
+            record = HEADER + length + FOOTER
+            # Compare against the FILE SIZE, not the seek result: seeking past EOF
+            # succeeds and tell() reports the requested position, so a truncated
+            # final record would otherwise be indexed as if it were complete and
+            # the reader would fail later with a far less obvious error.
+            if offset + record > size:
+                raise SystemExit(
+                    "tfrecord2idx: %s: truncated record at offset %d "
+                    "(needs %d bytes, file has %d)" % (src, offset, record, size)
+                )
+            # Skip the length CRC, the payload and the data CRC in one seek.
+            f.seek(offset + record)
+            out.write("%d %d\n" % (offset, record))
+            offset += record
+            written += 1
+    return written
+
+
+def main():
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: tfrecord2idx <input.tfrecord> <output.idx>")
+    build_index(sys.argv[1], sys.argv[2])
+
+
+if __name__ == "__main__":
+    main()
