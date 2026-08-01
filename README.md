@@ -191,15 +191,26 @@ not part of production operation (production is your pipeline + the
 
 ### A — `./blimp --query` (prove authoring + CDC)
 
-Defaults to **q1** on `store_returns`: ① cold author (`force_author`) →
-② append rows + fire the webhook → ③ verify the gateway **delta-merged**.
-CDC is **lazy**: the webhook only marks the MV stale — the *next query* pays
-the merge and reports `merge_ms` inline (the gate reads the phase-3 query
-response, with `/admin/mv/wave/report` as fallback):
+Defaults to **q9 q88 q14 q64 q4** on `store_sales`: ① serve/author each →
+② append rows to all five facts + fire the webhook → ③ re-run and report how
+each MV refreshed. CDC is **lazy**: the webhook only marks the MV stale — the
+*next query* pays the merge and reports `merge_ms` inline (read from the
+phase-3 query response, with `/admin/mv/wave/report` as fallback):
 
 ```
-q1  store_returns  merge_ms=3523  mode=incremental   RESULT: PASS
+q64  store_sales  merge_ms=8856  mode=incremental
+q4   store_sales  author_ms=45048  no MV — served from base
 ```
+
+There is **no PASS/FAIL verdict**. The suite reports what each query did and
+you judge it: `mode=incremental` is the delta-merge fast path, `no-delta` is a
+full re-author, and "no MV" means the query fell back to scanning base. Nothing
+here asserts a threshold, because the interesting outcomes (a query that authors
+no MV, a merge that silently measured unchanged data) are not binary.
+
+Add `--verify` to check the merged rows are *correct* rather than merely fast —
+off by default because the gateway runs no verification while serving, so an
+unflagged run measures the production path.
 
 Wider: `SUITES="store_sales:3 19 43 52 55;store_returns:1" ./blimp --query`
 
@@ -220,9 +231,14 @@ nodes:
 ### C — `./blimp --bench` (timing profile)
 
 Bench = min/median/avg/max author / materialize / delta-merge profile
-(`ITERS AUTHOR_ITERS CDC_ROWS`; `BENCH_QNR=64` benches a different TPC-DS
-query from `$Q_DIR/q<N>.sql` instead of the built-in q1; `BENCH_FACT=catalog_sales`
-appends referentially for join-CTE queries).
+(`ITERS AUTHOR_ITERS CDC_ROWS`, all defaulting to 3/3/50000; `BENCH_QNR=64`
+benches a different TPC-DS query from `$Q_DIR/q<N>.sql` instead of the built-in
+q1; `BENCH_FACT=catalog_sales` appends referentially for join-CTE queries).
+
+Check the `n=` on each summary line before quoting it — an append that
+re-materializes instead of merging contributes no `delta_merge_ms`, so `n` can
+be lower than `ITERS`. See the worked example in the walkthrough below for what
+the numbers do and don't mean.
 
 ## Notes
 
@@ -312,19 +328,50 @@ The remaining items are the TESTING commands — validation of the wired node,
 not production operation.
 
 **A. `blimp --query` — author + incremental CDC:**
+
+Five queries against a single fact, appending to all five facts each cycle so a
+multi-fact query exercises a multi-fact merge. Live run, AWS SF1 cluster
+`1785550395356`, 2026-08-01:
 ```
-== CDC bench: cluster=1784970467881 gw=10.10.12.249 rows/append=20000 suites=[store_returns:1] ==
->> phase 1: author all (force_author)
-   q1: author=8489 materialize=3953 cold_serve=2507ms mv_rows=251737 mv=mv_10490a66ba4e398b
->> phase 2: append +20000 to store_returns + snapshot_changed
-   tpcds_sf1x.store_returns: +20000 rows -> snapshot 4844583755386112254
+== CDC bench: cluster=1785550395356 gw=10.10.114.87 rows/append=5000 suites=[store_sales:9 88 14 64 4] ==
+==== fact: store_sales (q9 q88 q14 q64 q4) ====
+>> phase 1: serve/author all (force_author=0)
+   q9: author=? materialize=? cold_serve=2826ms mv=?x? (mv_h_0e90d0b63216)
+   q88: author=? materialize=? cold_serve=2668ms mv=?x? (mv_h_ae8ceee390cc)
+   q14: author=12252 materialize=? cold_serve=3134ms mv=?x? (none)
+   q64: author=? materialize=? cold_serve=2657ms mv=?x? (mv_h_ad47f860697f)
+   q4: author=45048 materialize=? cold_serve=2971ms mv=?x? (none)
+>> phase 2: append +5000 to [store_sales store_returns catalog_sales catalog_returns web_sales] + snapshot_changed
+tpcds.store_sales: +5000 rows -> snapshot 3827416906052195600
+tpcds.store_returns: +5000 rows -> snapshot 686337096249913447
+tpcds.catalog_returns: +1666 referential rows -> snapshot 6382376194974615624
+tpcds.catalog_returns: +5000 rows -> snapshot 7838483972766842389
+tpcds.web_sales: +5000 rows -> snapshot 4945461575749320971
 >> phase 3: re-run all (incremental)
 
 ============================== CDC CONTRIBUTIONS ==============================
-query      fact              mv_rows   author_ms   merge_ms     mode   incr_ms
-q1         store_returns      271490           ?       3523 incremental      2557
-RESULT: PASS (1/1 authored + delta-merged)
+query      fact             mv_rows x cols   author_ms   merge_ms     mode   incr_ms
+q9         store_sales                 ?x?           ?       5879 incremental      2781
+q88        store_sales                 ?x?           ?       6507 incremental      2693
+q14        store_sales                 ?x?       12252          -        -      3031
+q64        store_sales                 ?x?           ?       8856 incremental      3875
+q4         store_sales                 ?x?       45048          -        -      2959
+  q9: MV mv_h_0e90d0b63216 — delta-merged
+  q88: MV mv_h_ae8ceee390cc — delta-merged
+  q14: no MV — served from base
+  q64: MV mv_h_ad47f860697f — delta-merged
+  q4: no MV — served from base
 ```
+How to read it: `mode=incremental` with a `merge_ms` means the MV was refreshed
+by an append-only delta-merge (the O(|MV|+|delta|) fast path). A query with no
+MV serves from base and reports `author_ms` instead — q14 and q4 do that here,
+which is a real gap, not a pass/fail. There is no PASS/FAIL line: the suite
+reports what happened and you judge it.
+
+An append that fails leaves nothing to merge, and phase 3 then measures
+UNCHANGED data while still printing plausible-looking `no-delta` rows. The suite
+now prints the seeder's full traceback and says so explicitly when that happens
+— if you see `APPEND FAILED`, every number below it is meaningless.
 
 **B. Router corner cases** (operator, via SSM):
 ```
@@ -358,6 +405,53 @@ live query over zus-1784970467881-0.zus.network:9000
 warp   S3 PUT 749 MiB/s · GET 1673 MiB/s   (0 errors)
 fio    NFS write 1137 MiB/s · read 937 MiB/s
 ```
+
+Those are from a 2/1 cluster on larger instances. On a small node (c6in.large,
+2 vCPU) the same suite gave `fio NFS write 75.0MiB/s · read 352MiB/s` — the
+cache leg is only meaningful when the origin set is large enough to exercise it
+(a single 17 MB object measures nothing, and reports the router as *slower* than
+direct S3 purely from per-request overhead). Size the set to the cluster.
+
+**F. `blimp --bench` — MV lifecycle timing profile:**
+
+Phase A cold-authors the same query `AUTHOR_ITERS` times (evicting the MV
+between iterations); phase B appends and refreshes `ITERS` times. Live run, AWS
+SF1 cluster `1785550395356`, 2026-08-01:
+```
+== MV lifecycle benchmark v2: cluster 1785550395356 (authors=3, appends=3, upserts=3, rows/cycle=50000) ==
+  author[1] q1 COLD status=ok author_ms=24087 materialize_ms=4024 wall_ms=27393.2 mv=mv_h_aff2e89bc41f
+  author[2] q1 COLD status=ok author_ms=15188 materialize_ms=3773 wall_ms=18415.7 mv=mv_h_aff2e89bc41f
+  author[3] q1 COLD status=ok author_ms=15239 materialize_ms=3705 wall_ms=18522.2 mv=mv_h_aff2e89bc41f
+  append[1] refresh delta_merge_ms=? materialize_ms=3763 query_ms=2955 engine=duckdb wall_ms=21891.6
+  append[2] refresh delta_merge_ms=8321 materialize_ms=? query_ms=3151 engine=duckdb wall_ms=11930.5
+  append[3] refresh delta_merge_ms=6627 materialize_ms=? query_ms=3059 engine=duckdb wall_ms=10051.4
+
+== SUMMARY (q1-scale MV over 50000-row commits) ==
+  one-time author_ms (fresh queries):   n=3 min=15188 median=15239 avg=18171 max=24087 (ms)
+  one-time materialize_ms:              n=3 min=3705 median=3773 avg=3834 max=4024 (ms)
+  one-time wall_ms:                     n=3 min=18416 median=18522 avg=21444 max=27393 (ms)
+  append  delta_merge_ms:               n=2 min=6627 median=7474 avg=7474 max=8321 (ms)
+  append  refresh materialize_ms:       n=1 min=3763 median=3763 avg=3763 max=3763 (ms)
+  append  commit→answer wall_ms:        n=3 min=10051 median=11930 avg=14624 max=21892 (ms)
+```
+Reading it honestly:
+
+- **`n=2`, not 3.** `append[1]` shows `delta_merge_ms=?` with a `materialize_ms`
+  — it re-materialized instead of merging, so only two appends contributed a
+  merge time. The first append after a cold author has no usable banked MV.
+  Always check `n` before quoting the median.
+- **`author_ms` is dominated by verification, not by building the MV.**
+  Materialize is ~3.7–4.0 s of a 15–24 s author; the rest is the row-hash
+  verifier re-executing the ORIGINAL query to compare against the MV. That cost
+  is paid per author against a cold hash cache, and it is why the same query is
+  far cheaper on a warm cluster than a fresh one.
+- **`CDC_ROWS` sets how much the delta means.** The default 50,000 is ~90% of
+  q1's relevant base (55,440 rows in the `d_year=2000` window at SF1), so the
+  merge is measured with a delta about the size of the MV — that measures the
+  merge machinery, not the fast path. Lower `CDC_ROWS` for a realistic ratio;
+  q1's MV grows nearly 1 row per appended fact row because its inner aggregate
+  is ~90% distinct on `(customer, store)` even in the REAL data, so the MV
+  legitimately roughly doubles over three default-size cycles.
 
 Net: bare node → **two commands** (`install.sh`, `blimp --setup`) → a wired,
 validated Blimp source, with authoring, incremental CDC, cache correctness,
