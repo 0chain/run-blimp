@@ -596,21 +596,63 @@ ensure_storage_tools(){
     if command -v apt-get >/dev/null; then sudo apt-get install -y -qq fio 2>&1 | tail -1 || true
     elif command -v yum >/dev/null; then sudo yum install -y -q fio 2>&1 | tail -1 || true; fi
   }
+  # mount-s3 — needed for BOTH the mlperf read path and the cache-mp-s3 leg.
+  # This was apt-ONLY, so on an rpm host (AL2023, the default Amazon Linux client)
+  # the whole block was skipped silently: `mount-s3: missing`, cache-mp-s3 reported
+  # `n/a` on every run, and mlperf never ran at all. Mountpoint ships an .rpm too.
   command -v mount-s3 >/dev/null || {
-    bold "  installing mount-s3 (mlperf read path)…"
-    local arch; arch=$(uname -m)
-    if command -v apt-get >/dev/null; then
-      curl -fsSL "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch}/mount-s3.deb" \
-        -o /tmp/mount-s3.deb && sudo apt-get install -y -qq /tmp/mount-s3.deb 2>&1 | tail -1 && rm -f /tmp/mount-s3.deb \
-        || echo "  ! mount-s3 install failed — mlperf section will be skipped"
+    bold "  installing mount-s3 (mlperf + cache-mp-s3 read path)…"
+    local arch pkg url out; arch=$(uname -m)
+    if command -v apt-get >/dev/null; then pkg=deb
+    elif command -v dnf >/dev/null || command -v yum >/dev/null; then pkg=rpm
+    fi
+    if [ -n "${pkg:-}" ]; then
+      url="https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch}/mount-s3.${pkg}"
+      if out=$(curl -fsSL "$url" -o "/tmp/mount-s3.$pkg" 2>&1); then
+        case "$pkg" in
+          deb) out=$(sudo apt-get install -y -qq "/tmp/mount-s3.deb" 2>&1) ;;
+          rpm) out=$(sudo dnf install -y -q "/tmp/mount-s3.rpm" 2>&1 \
+                  || sudo yum install -y -q "/tmp/mount-s3.rpm" 2>&1) ;;
+        esac
+      fi
+      rm -f "/tmp/mount-s3.$pkg"
+      # Print the REASON. Swallowing it is why this sat broken: the summary said
+      # "missing" and the operator had nothing to act on.
+      command -v mount-s3 >/dev/null || {
+        echo "  ! mount-s3 install failed ($url) — mlperf + cache-mp-s3 will be skipped"
+        printf '%s\n' "$out" | tail -3 | sed 's/^/    | /'
+      }
+    else
+      echo "  ! no apt/dnf/yum — cannot install mount-s3; mlperf + cache-mp-s3 will be skipped"
     fi
   }
-  # dlio (mlperf resnet50 driver) — venv install, one-time, best-effort.
+  # dlio (mlperf resnet50 driver) — venv install, one-time.
   if [ ! -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ]; then
     bold "  installing dlio-benchmark (one-time, mlperf)…"
-    sudo mkdir -p /opt/dlio && sudo python3 -m venv /opt/dlio/venv_mlperf 2>/dev/null \
-      && sudo /opt/dlio/venv_mlperf/bin/pip install -q dlio-benchmark 2>&1 | tail -1 \
-      || echo "  ! dlio install failed — mlperf section will be skipped"
+    local dout
+    # `python3 -m venv` needs ensurepip, which is a SEPARATE package on rpm hosts
+    # (python3-pip) and on Debian (python3-venv); without it venv fails and the
+    # 2>/dev/null here hid that too.
+    command -v dnf >/dev/null && ! python3 -c 'import ensurepip' 2>/dev/null \
+      && sudo dnf install -y -q python3-pip >/dev/null 2>&1
+    command -v apt-get >/dev/null && ! python3 -c 'import ensurepip' 2>/dev/null \
+      && sudo apt-get install -y -qq python3-venv >/dev/null 2>&1
+    # TMPDIR must NOT be /tmp: on Amazon Linux /tmp is a RAM-backed tmpfs (1.9 GB
+    # on a c6in.large, and the suite's own artifacts had it at 76% full), while
+    # dlio-benchmark pulls tensorflow + torchvision — multiple GB of wheels that
+    # pip unpacks under TMPDIR. It ran out of space every time while the root disk
+    # had 195 GB free, and the failure surfaced only as `dlio: missing`.
+    # --no-cache-dir keeps the footprint down; a pip cache is useless here anyway.
+    local dtmp="${DLIO_TMPDIR:-/var/tmp/dlio-build}"
+    sudo mkdir -p /opt/dlio "$dtmp"
+    dout=$(sudo python3 -m venv /opt/dlio/venv_mlperf 2>&1 \
+      && sudo env TMPDIR="$dtmp" /opt/dlio/venv_mlperf/bin/pip install \
+           --no-cache-dir dlio-benchmark 2>&1)
+    sudo rm -rf "$dtmp" 2>/dev/null || true
+    [ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] || {
+      echo "  ! dlio install failed — mlperf section will be skipped"
+      printf '%s\n' "$dout" | tail -3 | sed 's/^/    | /'
+    }
   fi
   echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing)"
 }
