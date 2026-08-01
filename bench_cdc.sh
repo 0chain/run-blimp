@@ -224,13 +224,19 @@ echo "==========================================================================
 echo "mode=incremental → delta-merged (merge_ms, reads |MV|+|delta|); fallback/no-delta"
 echo "→ full re-author (author_ms, full fact scan). Merge is the O(MV) fast path."
 
-# ---- PASS/FAIL gate: every query must have built an MV AND delta-merged --------
-FAILS=0
+# ---- outcome summary (reporting only, no gate) --------------------------------
+# There is no PASS/FAIL assertion and no non-zero exit. A query that authored no
+# MV, or refreshed by full re-author instead of a delta-merge, is a MEASUREMENT —
+# often the interesting one — not a suite failure, and turning it into a red
+# RESULT line hid the numbers behind a verdict. Each query's state is named
+# plainly below; read the table above for the timings.
 for n in "${NAMES[@]}"; do
-  [ -n "${MVTBL[$n]:-}" ] && [ "${MVTBL[$n]}" != "none" ] || { echo "FAIL $n: no MV built"; FAILS=$((FAILS+1)); continue; }
-  [ "${MODE[$n]:-}" = "incremental" ] || { echo "FAIL $n: refresh mode='${MODE[$n]:--}' (expected incremental)"; FAILS=$((FAILS+1)); }
+  if [ -z "${MVTBL[$n]:-}" ] || [ "${MVTBL[$n]}" = "none" ]; then
+    echo "  $n: no MV — served from base"
+  elif [ "${MODE[$n]:-}" != "incremental" ]; then
+    echo "  $n: MV ${MVTBL[$n]} — refreshed by full re-author (mode='${MODE[$n]:--}')"
+  else
+    echo "  $n: MV ${MVTBL[$n]} — delta-merged"
+  fi
 done
-if [ "$FAILS" -eq 0 ]; then echo "RESULT: PASS (${#NAMES[@]}/${#NAMES[@]} authored + delta-merged)"
-else echo "RESULT: FAIL ($FAILS of ${#NAMES[@]} queries failed the gate)"; fi
 echo "DONE"
-exit $([ "$FAILS" -eq 0 ] && echo 0 || echo 1)

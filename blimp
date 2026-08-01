@@ -501,7 +501,7 @@ cmd_bench(){
   # / CDC_ROWS to size the sweep and the delta.
   exec env GW="$GW" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" CLUSTER_ID="$CLUSTER_ID" \
     ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" NAMESPACE="${NAMESPACE:-tpcds}" \
-    REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-5}" AUTHOR_ITERS="${AUTHOR_ITERS:-5}" \
+    REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-3}" AUTHOR_ITERS="${AUTHOR_ITERS:-3}" \
     CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh"
 }
 

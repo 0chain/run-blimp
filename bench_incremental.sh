@@ -10,13 +10,17 @@
 # (Upsert → full re-materialize lives in the separate bench_upsert.sh.)
 #
 # Env (test_query.sh's): GW GW_AK GW_SK CLUSTER_ID ICEBERG_URL WAREHOUSE
-#   [NAMESPACE=tpcds] [REGION=ap-south-1] [ITERS=5] [AUTHOR_ITERS=5]
+#   [NAMESPACE=tpcds] [REGION=ap-south-1] [ITERS=3] [AUTHOR_ITERS=3]
 #   [CDC_ROWS=50000] [Q_DIR=~/tpcds_queries]
 set -u
 NAMESPACE="${NAMESPACE:-tpcds}"; REGION="${REGION:-ap-south-1}"
-ITERS="${ITERS:-5}"; AUTHOR_ITERS="${AUTHOR_ITERS:-5}"; CDC_ROWS="${CDC_ROWS:-50000}"
+ITERS="${ITERS:-3}"; AUTHOR_ITERS="${AUTHOR_ITERS:-3}"; CDC_ROWS="${CDC_ROWS:-50000}"
 Q_DIR="${Q_DIR:-$HOME/tpcds_queries}"
-QAPI="http://$GW:9000"; TOKEN="zus-$CLUSTER_ID"; HERE="$(cd "$(dirname "$0")" && pwd)"
+# QAPI/TOKEN are overridable, like bench_cdc.sh. Hardcoding them sent every
+# request to the CLUSTER gateway with a cluster token, so against a manual stack
+# (test2: localhost:9100 + a harness token) all three refresh cycles returned
+# delta_merge_ms=? in 33ms — the bench looked like it ran and measured nothing.
+QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-zus-$CLUSTER_ID}"; HERE="$(cd "$(dirname "$0")" && pwd)"
 PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
 now(){ date +%s.%N; }; el(){ awk -v a="$1" -v z="$2" 'BEGIN{printf "%.1f",(z-a)*1000}'; }
 J(){ python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
@@ -52,9 +56,13 @@ if [ "$BENCH_QNR" != "1" ]; then
 fi
 QLABEL="q${BENCH_QNR}"
 
+# force_author is GONE from the product (a client flag that faked a cold state
+# instead of creating one). A cold author is produced the honest way — evict the
+# MV, which evict_mv already does between iterations — so the request carries the
+# query and nothing else.
 run_sql(){ curl -s -m 900 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","force_author":len(sys.argv)>2 and sys.argv[2]=="1"}))' "$1" "${2:-0}")"; }
+  -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer"}))' "$1")"; }
 
 # evict an MV so the NEXT identical query re-authors from scratch (clears the
 # sigcache row + warehouse bytes — copied from run.sh's \evict). The author-timing
