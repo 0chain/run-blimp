@@ -6,7 +6,7 @@
 #   phase 1  cold-author every query (force_author → graft-widen MV build)
 #   phase 2  one live append to store_sales + snapshot_changed
 #   phase 3  re-run every query → incremental delta-merge (mode=incremental)
-#   summary  the CDC CONTRIBUTIONS table + PASS/FAIL gate
+#   summary  the CDC CONTRIBUTIONS table + per-query state (no pass/fail gate)
 #
 # The TPC-DS query files are generated ON THIS BOX from duckdb's tpcds
 # extension into $Q_DIR (once; idempotent) — no shipping step, no drift.
