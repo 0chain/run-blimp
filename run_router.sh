@@ -147,8 +147,23 @@ printf '  %-26s %8s MB/s\n' "direct-S3 (origin)"        "$DIRECT"
 printf '  %-26s %8s MB/s\n' "cache-S3 (router, warm)"   "$WARM_S3"
 printf '  %-26s %8s MB/s\n' "cache-mp-s3 (warm)"        "$WARM_MPS3"
 printf '  %-26s %8s MB/s\n' "cache-NFS (Ganesha, warm)" "$WARM_NFS"
-awk -v d="$DIRECT" -v s="$WARM_S3" -v m="$WARM_MPS3" -v n="$WARM_NFS" 'BEGIN{
-  if(d>0){ printf "  speedup vs direct-S3: cache-S3 %.1fx  mp-s3 %s  cache-NFS %.1fx\n", s/d, (m=="n/a"?"n/a":sprintf("%.1fx",m/d)), n/d }}'
+# A speedup ratio over a tiny set is NOISE, not a measurement. At SF1 the whole
+# origin bucket is ~330 MB and the default table prefix is ONE 17 MB object, so
+# both legs are dominated by per-request latency and the ratio swings wildly —
+# observed 0.8x on one run and 0.2x on the next, from the same 1-object set, which
+# reads as "the read-through cache is 5x SLOWER than S3" when it measures nothing
+# of the sort. Print the throughputs (they are still real) but withhold the ratio
+# and say why, so nobody quotes it.
+MIN_RATIO_BYTES=${MIN_RATIO_BYTES:-1073741824}   # 1 GiB
+if [ "${BYTES:-0}" -lt "$MIN_RATIO_BYTES" ] 2>/dev/null; then
+  awk -v b="$BYTES" -v n="$NOBJ" -v min="$MIN_RATIO_BYTES" 'BEGIN{
+    printf "  speedup vs direct-S3: NOT REPORTED — the set is %.2f GiB in %d object(s), under the %.0f GiB\n", b/1073741824, n, min/1073741824
+    printf "    minimum for a meaningful ratio. Both legs are per-request-latency bound at this size.\n"
+    printf "    Point CACHE_TABLE at a larger prefix, or set MIN_RATIO_BYTES to override.\n"}'
+else
+  awk -v d="$DIRECT" -v s="$WARM_S3" -v m="$WARM_MPS3" -v n="$WARM_NFS" 'BEGIN{
+    if(d>0){ printf "  speedup vs direct-S3: cache-S3 %.1fx  mp-s3 %s  cache-NFS %.1fx\n", s/d, (m=="n/a"?"n/a":sprintf("%.1fx",m/d)), n/d }}'
+fi
 # physics gate: c6in.4xlarge networking is 25 Gbps baseline, "up to 50 Gbps"
 # burst ≈ 6250 MB/s absolute ceiling — any single-path number above it means
 # bytes were not actually transferred (stale view / cache no-op; 2026-07-22 saw

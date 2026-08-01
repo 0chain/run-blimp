@@ -36,7 +36,20 @@ NFS_MNT="${NFS_MNT:-/mnt/zusnfs}"
 EC="${EC:-2/1}"
 ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "External S3 origin bucket for the read-through cache (e.g. blimp-tpcds1000-aps1):")
 REGION="${REGION:-ap-south-1}"
-CACHE_TABLE="${CACHE_TABLE:-store_returns}"     # prefix under the origin bucket to read
+# Prefix under the origin bucket to read. The default used to be a hardcoded
+# store_returns, which at SF1 is the SMALLEST fact (~17 MB in ONE object) — so the
+# read-through cache was benchmarked over a set far too small to measure, and the
+# summary reported the router as slower than direct S3 purely from per-request
+# overhead. Pick the LARGEST prefix actually present instead; a bigger dataset
+# makes the cache leg meaningful, and an explicit CACHE_TABLE still wins.
+if [ -z "${CACHE_TABLE:-}" ]; then
+  CACHE_TABLE=$(for t in store_sales catalog_sales web_sales inventory store_returns catalog_returns web_returns; do
+      sz=$(aws s3 ls "s3://$ORIGIN_BUCKET/$t/" --recursive --region "$REGION" 2>/dev/null | awk '{s+=$3} END{print s+0}')
+      [ "${sz:-0}" -gt 0 ] && echo "$sz $t"
+    done | sort -rn | head -1 | cut -d' ' -f2)
+  CACHE_TABLE="${CACHE_TABLE:-store_returns}"   # nothing probed (no aws creds / empty bucket)
+  echo "[cache] auto-selected largest origin prefix: $CACHE_TABLE"
+fi
 export GW GW_AK GW_SK ROUTER NFS_MNT EC ORIGIN_BUCKET REGION
 
 echo ""

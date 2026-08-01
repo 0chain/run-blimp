@@ -35,7 +35,14 @@ ask(){ local var="$1" prompt="$2" def="${3:-}" cur="${!1:-}" v
   # No terminal (CI, `ssh host cmd`, nohup) → take the default instead of dying.
   # `read </dev/tty` on such a host printed "/dev/tty: No such device or address"
   # for EVERY prompt and the run ended with no wiring written.
-  if [ ! -r /dev/tty ]; then
+  #
+  # Test the OPEN, not `-r`: under nohup the /dev/tty device node still exists
+  # and is readable, so `[ -r /dev/tty ]` passes and the redirect below then
+  # fails with ENXIO ("No such device or address") because the process has no
+  # controlling terminal. That is exactly what happened to `blimp --storage`
+  # under nohup (2026-08-01): both gateway S3 key prompts errored, the run
+  # continued with BLANK credentials, and warp/mlperf then measured nothing.
+  if ! { : < /dev/tty; } 2>/dev/null; then
     printf '%s%s: <no tty, using default>\n' "$prompt" "${def:+ [$def]}" >&2
     printf '%s' "$def"; return
   fi
@@ -614,6 +621,25 @@ cmd_storage(){
   : "${GW:?gateway missing in wiring}" "${REGION:?}"
   [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
   [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
+  # REFUSE to run unauthenticated. These are the GATEWAY's own S3 credentials,
+  # which are NOT the source-bucket credentials: vpc mode deliberately leaves the
+  # source keys blank (the node reads the origin via its IAM instance role), but
+  # the gateway's S3 endpoint is MinIO-style and authenticates by key. With them
+  # blank, warp cannot PUT/GET at all and run_cluster.sh aborts with "AK: set AK"
+  # — taking warp AND mlperf with it — while the suite still printed a summary,
+  # just with the throughput fields empty:
+  #     warp   S3 PUT  MiB/s · GET  MiB/s          <- blank, looks like a format bug
+  #     cache  direct-S3 26 · router 20 · mp-s3 n/a
+  # An empty number reads as "the tool is broken", not "you gave me no key", so
+  # say which one is missing and where to get it.
+  if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
+    die "gateway S3 credentials are empty (GW_AK=$([ -n "${GW_AK:-}" ] && echo set || echo EMPTY), GW_SK=$([ -n "${GW_SK:-}" ] && echo set || echo EMPTY)).
+  warp and mlperf benchmark the GATEWAY's S3 endpoint, which authenticates by
+  key — an IAM instance role does not apply to it, so vpc mode does not fill
+  these in. Take the cluster's S3 access key/secret from the Blimp UI and either
+  add them to $ENVF as GW_AK= / GW_SK=, or pass them for one run:
+      GW_AK=... GW_SK=... blimp --storage"
+  fi
   ORIGIN_BUCKET="${ORIGIN_BUCKET:-$(ask ORIGIN_BUCKET "Origin S3 bucket (read-through cache)")}"
   exec env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
     REGION="$REGION" NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh"
