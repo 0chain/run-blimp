@@ -173,11 +173,23 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"; mount_nfs
   fi
   local L="$DLIO"; [ "$ACC" -gt 1 ] && L="mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus --oversubscribe -np $ACC $DLIO"
   echo "== mlperf resnet50 TRAIN via $IFACE (accel=$ACC rt=$RT pf=$PF batch=$BATCH epochs=$EP) =="
-  $L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \
+  # Capture, don't blind-grep. Piping straight into `grep [METRIC]` means a train
+  # step that CRASHES prints absolutely nothing — which is exactly what happened
+  # (2026-08-01): generation succeeded, training died, and the leg emitted only
+  # its banner, so the suite looked like it had simply produced no numbers. Show
+  # the metrics on success; show the tail of the real failure otherwise.
+  local tout trc
+  tout=$($L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \
     ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
     ++workload.workflow.train=True ++workload.workflow.evaluation=False ++workload.workflow.generate_data=False \
     ++workload.reader.read_threads="$RT" ++workload.reader.batch_size="$BATCH" ++workload.reader.prefetch_size="$PF" \
-    ++workload.train.epochs="$EP" 2>&1 | grep -iE '\[METRIC\]|samples/second|MB/second' | tail -5
+    ++workload.train.epochs="$EP" 2>&1); trc=$?
+  if printf '%s\n' "$tout" | grep -qiE '\[METRIC\]|samples/second|MB/second'; then
+    printf '%s\n' "$tout" | grep -iE '\[METRIC\]|samples/second|MB/second' | tail -5
+  else
+    echo "!! mlperf TRAIN produced no metrics (exit $trc) — last output:"
+    printf '%s\n' "$tout" | tail -12 | sed 's/^/   | /'
+  fi
   [ "$IFACE" = nfs ] || fusermount -u "$MPS3" 2>/dev/null || true
   # KEEP the generated dataset by default so sweeps reuse it (MLPERF_KEEP=1). Set
   # MLPERF_KEEP=0 to reclaim the ~34GiB after a one-off run.

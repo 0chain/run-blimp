@@ -91,15 +91,21 @@ echo "$KEYS" | xargs -P"$PAR" -I{} aws s3api get-object --bucket "$BKT" --key "{
 t1=$(now); DIRECT=$(mbps "$BYTES" "$(el "$t0" "$t1")"); DIRECT_S=$(el "$t0" "$t1")
 echo "  direct-S3 : $DIRECT MB/s (${DIRECT_S}s)"
 
-# ============================ 2) CACHE FILL (cold) ================================
+# ==================== 2) CACHE MISS → WRITE onto the blimp node ==================
 # FULL-object GET through the Router so the whole object is fetched from origin and
-# written into the gateway cache bucket (a range GET would only cache a slice, so the
-# NFS path below would miss). This is the COLD read (origin -> cache). Timed only if
-# COLD_FILL=1 (it includes the origin fetch, so it's ~direct + cache-write).
+# written into the gateway cache bucket (a range GET would only cache a slice, so
+# the file views below would read a hole).
+#
+# This IS the write half of the read-through test: a miss makes the router pull
+# from the source (SF1 origin) and WRITE it onto the blimp node, so the rate here
+# is the cache-fill/write speed. It was previously timed only under COLD_FILL=1,
+# so by default the suite reported the read half and silently dropped the write —
+# half the test. Report it always; COLD_FILL=0 suppresses it.
 t0=$(now)
 echo "$KEYS" | xargs -P"$PAR" -I{} curl -s -m3600 -o /dev/null "$ROUTER/$BKT/{}"
 t1=$(now); FILL_S=$(el "$t0" "$t1")
-[ "${COLD_FILL:-0}" = 1 ] && echo "  cache-fill: $(mbps "$BYTES" "$FILL_S") MB/s (${FILL_S}s, cold origin->cache)"
+[ "${COLD_FILL:-1}" = 1 ] && \
+  echo "  cache-MISS→write: $(mbps "$BYTES" "$FILL_S") MB/s (${FILL_S}s, origin→router→blimp node; includes the origin fetch)"
 
 # ============================ 3) CACHE-S3 (warm) =================================
 # Second GET of the same set through the Router — now served from the eblobber cache.
