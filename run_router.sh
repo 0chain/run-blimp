@@ -127,6 +127,20 @@ NOBJ=$(echo "$KEYS" | wc -l | tr -d ' ')
 BYTES=$(echo "$MAP" | awk '{s+=$2}END{print s+0}')
 echo "[cache-bench] set: $NOBJ objects, $(awk -v b="$BYTES" 'BEGIN{printf "%.1f", b/1073741824}') GiB"
 
+# router_get — GET every key through the router and return "<bytes> <errors>".
+#
+# HONEST BYTES. The router legs used to divide the SET size by wall time, so an
+# object the router failed to serve still counted its full size: `curl -s -o
+# /dev/null` exits 0 on a 404/403 having transferred nothing. That reported
+# cache-MISS→write at 611 MB/s while direct-S3 on the SAME set was 240 MB/s —
+# impossible, since the miss path must fetch those bytes FROM S3 and additionally
+# write them. Sum %{size_download} instead and surface any non-200.
+router_get(){
+  echo "$KEYS" | xargs -P"$PAR" -I{} \
+    curl -s -m3600 -o /dev/null -w '%{size_download} %{http_code}\n' "$ROUTER/$BKT/{}" \
+  | awk '{b+=$1; if ($2!=200) e++} END{printf "%d %d", b+0, e+0}'
+}
+
 # ============================ 1) DIRECT S3 (origin) ===============================
 # Straight GET from the origin bucket to /dev/null, parallel. VPC S3 endpoint keeps
 # it private + in-region; the box IAM role authenticates.
@@ -147,18 +161,24 @@ echo "  direct-S3 : $DIRECT MB/s (${DIRECT_S}s)"
 # so by default the suite reported the read half and silently dropped the write —
 # half the test. Report it always; COLD_FILL=0 suppresses it.
 t0=$(now)
-echo "$KEYS" | xargs -P"$PAR" -I{} curl -s -m3600 -o /dev/null "$ROUTER/$BKT/{}"
+FILL_OUT=$(router_get)
 t1=$(now); FILL_S=$(el "$t0" "$t1")
-[ "${COLD_FILL:-1}" = 1 ] && \
-  echo "  cache-MISS→write: $(mbps "$BYTES" "$FILL_S") MB/s (${FILL_S}s, origin→router→blimp node; includes the origin fetch)"
+FILL_B=${FILL_OUT%% *}; FILL_ERR=${FILL_OUT##* }
+[ "${COLD_FILL:-1}" = 1 ] && {
+  echo "  cache-MISS→write: $(mbps "$FILL_B" "$FILL_S") MB/s (${FILL_S}s, origin→router→blimp node; includes the origin fetch)"
+  [ "${FILL_B:-0}" -lt "$BYTES" ] && echo "    (transferred $(awk -v b="$FILL_B" 'BEGIN{printf "%.2f",b/1073741824}') of $(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}') GiB${FILL_ERR:+, $FILL_ERR non-200 response(s)}) — rate is over bytes ACTUALLY received"
+}
 
 # ============================ 3) CACHE-S3 (warm) =================================
 # Second GET of the same set through the Router — now served from the eblobber cache.
 drop_client_cache
 t0=$(now)
-echo "$KEYS" | xargs -P"$PAR" -I{} curl -s -m3600 -o /dev/null "$ROUTER/$BKT/{}"
-t1=$(now); WARM_S3=$(mbps "$BYTES" "$(el "$t0" "$t1")"); WARM_S3_S=$(el "$t0" "$t1")
+WARM_OUT=$(router_get)
+t1=$(now); WARM_S3_S=$(el "$t0" "$t1")
+WARM_B=${WARM_OUT%% *}; WARM_ERR=${WARM_OUT##* }
+WARM_S3=$(mbps "$WARM_B" "$WARM_S3_S")
 echo "  cache-S3  : $WARM_S3 MB/s (${WARM_S3_S}s, router->eblobber cache)"
+[ "${WARM_B:-0}" -lt "$BYTES" ] && echo "    (transferred $(awk -v b="$WARM_B" 'BEGIN{printf "%.2f",b/1073741824}') of $(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}') GiB${WARM_ERR:+, $WARM_ERR non-200 response(s)}) — rate is over bytes ACTUALLY received"
 
 # ============================ 3b) CACHE-mp-s3 (warm) =============================
 # Read the cached objects via mountpoint-s3 (FUSE-over-S3) of the gateway cache
