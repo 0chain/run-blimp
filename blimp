@@ -695,11 +695,28 @@ OUT
   # 1. Gateway S3 credentials. NOT the source-bucket keys — vpc mode leaves those
   #    blank on purpose (IAM instance role), but the gateway's own S3 endpoint
   #    authenticates by key and warp/mlperf/cache-mp-s3 are useless without it.
+  # Auto-fetched from the gateway itself (GET /admin/credentials, same Bearer
+  # zus-<CLUSTER_ID> every other admin call uses) — no UI copy-paste, no
+  # interactive prompt. Idempotent: safe to call every --setup run; an
+  # already-set GW_AK/GW_SK wins and skips the call, and a gateway image older
+  # than this endpoint (404/unreachable) just leaves them unset, same as
+  # before, with warp/mlperf/cache-mp-s3 skipped.
   if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
-    echo "  The storage suite benchmarks the GATEWAY's S3 endpoint, which needs the"
-    echo "  cluster's own S3 access key/secret (Blimp UI → cluster → S3 credentials)."
-    GW_AK=$(ask GW_AK "  Gateway S3 access key (blank = skip warp/mlperf/mp-s3)")
-    GW_SK=$(ask GW_SK "  Gateway S3 secret key")
+    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer zus-$CLUSTER_ID" 2>/dev/null)
+    fetched_ak=$(printf '%s' "$resp" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin)
+  print(d.get("s3_access_key","") if d.get("status")=="ok" else "")
+except Exception: print("")' 2>/dev/null)
+    fetched_sk=$(printf '%s' "$resp" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin)
+  print(d.get("s3_secret_key","") if d.get("status")=="ok" else "")
+except Exception: print("")' 2>/dev/null)
+    if [ -n "$fetched_ak" ] && [ -n "$fetched_sk" ]; then
+      GW_AK="$fetched_ak"; GW_SK="$fetched_sk"
+      echo "  ✓ gateway S3 credentials auto-fetched from GET /admin/credentials"
+    fi
   fi
   if [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ]; then
     sed -i.bak '/^GW_AK=/d;/^GW_SK=/d' "$ENVF" 2>/dev/null || true

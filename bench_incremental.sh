@@ -82,6 +82,19 @@ print('n=%d min=%.0f median=%.0f avg=%.0f max=%.0f (ms)'%(len(v),min(v),st.media
 registered_sigs(){ curl -s -m 20 "$QAPI/admin/mv/registered_queries" -H "Authorization: Bearer $TOKEN" \
   | python3 -c "import json,sys;print(' '.join(q['sig'] for q in json.load(sys.stdin).get('queries',[])))" 2>/dev/null; }
 
+# query_fact — the fact table the benched query actually reads, so the append
+# lands where the MV's grain comes from. First fact mentioned in the SQL wins;
+# falls back to store_sales (the fact behind most of the suite) rather than to a
+# table the query may not read at all.
+query_fact(){
+  local sql="" f
+  [ -n "${QF:-}" ] && [ -f "${QF:-}" ] && sql=$(tr 'A-Z' 'a-z' < "$QF")
+  for f in store_sales catalog_sales web_sales store_returns catalog_returns web_returns inventory; do
+    case "$sql" in *"$f"*) printf '%s' "$f"; return;; esac
+  done
+  printf 'store_sales'
+}
+
 echo "== MV lifecycle benchmark v2: cluster $CLUSTER_ID (authors=$AUTHOR_ITERS, appends=$ITERS, upserts=$ITERS, rows/cycle=$CDC_ROWS) =="
 # Say which fact the appends hit. When it does not match the query's own fact
 # there is no delta for its MV, every "refresh" is a warm re-serve, and
@@ -108,19 +121,6 @@ for i in $(seq 1 "$AUTHOR_ITERS"); do
   evict_mv "${MVNS:-tpcds_mv}" "$MVTB"                  # drop it → next iteration is cold
   sleep 1
 done
-
-# query_fact — the fact table the benched query actually reads, so the append
-# lands where the MV's grain comes from. First fact mentioned in the SQL wins;
-# falls back to store_sales (the fact behind most of the suite) rather than to a
-# table the query may not read at all.
-query_fact(){
-  local sql="" f
-  [ -n "${QF:-}" ] && [ -f "${QF:-}" ] && sql=$(tr 'A-Z' 'a-z' < "$QF")
-  for f in store_sales catalog_sales web_sales store_returns catalog_returns web_returns inventory; do
-    case "$sql" in *"$f"*) printf '%s' "$f"; return;; esac
-  done
-  printf 'store_sales'
-}
 
 cycle(){ # cycle <label> <seed-extra-args...> — commit, webhook, inline re-serve
   local label="$1"; shift
