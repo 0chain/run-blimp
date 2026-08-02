@@ -235,8 +235,17 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     # --allow-other needs user_allow_other in /etc/fuse.conf; add it if absent.
     grep -qs '^user_allow_other' /etc/fuse.conf || \
       echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
+    # --force-path-style: without it, mount-s3 defaults to virtual-hosted-style
+    # addressing (bucket prepended to the host, e.g. "$BKT.$GW"). That works by
+    # accident when $GW is a bare IP (SDKs special-case IPs to path-style), which
+    # is why this passed in vpc mode — but in external mode $GW is a real
+    # hostname (zus-<id>-0.zus.network) and "$BKT.zus-<id>-0.zus.network" was
+    # never provisioned in DNS, so every request failed with
+    # AWS_IO_DNS_INVALID_NAME (cluster 1785632294645, cross-region client,
+    # 2026-08-02). Path-style is correct for a MinIO-compatible endpoint either
+    # way, so force it unconditionally rather than branch on IP-vs-hostname.
     if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
-         mount-s3 --allow-other --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
+         mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
       echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"
       return 0
     fi
