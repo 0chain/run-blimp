@@ -149,7 +149,14 @@ standup_iceberg(){
     cur_ep=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
              | sed -n 's/^CATALOG_S3_ENDPOINT=//p' | head -1)
     case "${S3_ENDPOINT:-}" in ""|*amazonaws.com*) want_ep="";; *) want_ep="$S3_ENDPOINT";; esac
-    if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ]; then
+    # Reuse must also match the WAL catalog URI: a pre-WAL container keeps the
+    # ephemeral in-container SQLite that wedges with SQLITE_BUSY under
+    # concurrent commits+reads (4x on 2026-08-03) and loses the catalog on
+    # docker rm. A container without the durable WAL URI is replaced.
+    local cur_uri
+    cur_uri=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
+              | sed -n 's/^CATALOG_URI=//p' | head -1)
+    if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ] && [ "${cur_uri#*journal_mode=WAL}" != "$cur_uri" ]; then
       ICEBERG_URL="http://$(this_host):8181"
       bold "  Iceberg catalog already up over $WAREHOUSE — reusing it ($ICEBERG_URL)"
       return 0
@@ -170,10 +177,22 @@ standup_iceberg(){
     *) EP_ENV="-e CATALOG_S3_ENDPOINT=$S3_ENDPOINT -e CATALOG_S3_PATH__STYLE__ACCESS=true" ;;
   esac
   $DKR rm -f iceberg-rest >/dev/null 2>&1 || true
+  # Durable WAL-mode catalog db on the HOST. The image default is an ephemeral
+  # in-container SQLite in rollback-journal mode: concurrent seeder commits +
+  # gateway added_files reads wedge it with SQLITE_BUSY/CommitStateUnknown
+  # (4 wedges on 2026-08-03), and `docker rm` destroys the catalog outright.
+  # WAL allows readers during a writer; busy_timeout absorbs bursts; the bind
+  # mount survives container recreation.
+  sudo mkdir -p /opt/blimp/catalog 2>/dev/null || mkdir -p /opt/blimp/catalog
+  sudo chown -R 1000:1000 /opt/blimp/catalog 2>/dev/null || true
   # shellcheck disable=SC2086  # EP_ENV is an intentional word-split flag pair
   $DKR run -d --name iceberg-rest --restart unless-stopped -p 8181:8181 \
     -e CATALOG_WAREHOUSE="$WAREHOUSE" \
     -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+    -e CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog \
+    -e CATALOG_URI='jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL' \
+    -e CATALOG_JDBC_USER=user -e CATALOG_JDBC_PASSWORD=password \
+    -v /opt/blimp/catalog:/catalog \
     $EP_ENV \
     -e AWS_REGION="$REGION" \
     -e AWS_ACCESS_KEY_ID="${S3_KEY:-${CAT_AK:-${AWS_ACCESS_KEY_ID:-}}}" \
