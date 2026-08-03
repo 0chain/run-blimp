@@ -192,6 +192,7 @@ standup_iceberg(){
     -e CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog \
     -e CATALOG_URI='jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL&transaction_mode=IMMEDIATE' \
     -e CATALOG_JDBC_USER=user -e CATALOG_JDBC_PASSWORD=password \
+    -e CATALOG_CLIENTS=1 \
     -v /opt/blimp/catalog:/catalog \
     $EP_ENV \
     -e AWS_REGION="$REGION" \
