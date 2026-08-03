@@ -27,7 +27,7 @@ services:
       # gateway drift-poller's catalog reads on SQLite's single global lock and
       # fail with CommitStateUnknownException (SQLITE_BUSY). WAL lets readers run
       # while a writer commits; busy_timeout makes a blocked writer wait, not fail.
-      CATALOG_URI: jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL
+      CATALOG_URI: jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL&transaction_mode=IMMEDIATE
       CATALOG_JDBC_USER: user
       CATALOG_JDBC_PASSWORD: password
       CATALOG_WAREHOUSE: ${WAREHOUSE}                 # e.g. s3://my-bucket/iceberg_wh
