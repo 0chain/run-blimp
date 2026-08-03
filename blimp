@@ -156,7 +156,7 @@ standup_iceberg(){
     local cur_uri
     cur_uri=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
               | sed -n 's/^CATALOG_URI=//p' | head -1)
-    if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ] && [ "${cur_uri#*journal_mode=WAL}" != "$cur_uri" ]; then
+    if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ] && [ "${cur_uri#*transaction_mode=IMMEDIATE}" != "$cur_uri" ]; then
       ICEBERG_URL="http://$(this_host):8181"
       bold "  Iceberg catalog already up over $WAREHOUSE — reusing it ($ICEBERG_URL)"
       return 0
