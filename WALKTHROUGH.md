@@ -179,19 +179,6 @@ registered 24/24 tables into http://localhost:8181 ns=tpcds_sf1x
 **UI path:** paste the six values from Part D into the cluster's Query
 Optimizer → Production tab, then Run.
 
-**Scripted path** (run against the gateway via SSH/SSM as root):
-```bash
-ICEBERG_URL=http://10.10.12.62:8181 WAREHOUSE=s3://blimp-tpcds-sf1-aps1/wh3 \
-NAMESPACE=tpcds_sf1x ORIGIN_BUCKET=blimp-tpcds-sf1-aps1 S3_REGION=ap-south-1 \
-bash hookup_cluster_source.sh
-```
-```
-[hookup] router :8088 up
-[hookup] gateway :9000 up
-[hookup] DONE — source=http://10.10.12.62:8181|s3://blimp-tpcds-sf1-aps1/wh3 ns=tpcds_sf1x,
-         cache fronts s3://blimp-tpcds-sf1-aps1 (ap-south-1)
-```
-
 ---
 
 ## PART G — `blimp --query` (author + incremental CDC)
@@ -228,11 +215,6 @@ reads only |MV|+|delta| — not the fact again.
 WARP_BUDGET_MIB=5120 FIO_JOBS=4 FIO_SIZE=1280M blimp --storage
 #   warp   S3 PUT 749 MiB/s · GET 1673 MiB/s
 #   fio    NFS write 1137 MiB/s · read 937 MiB/s
-
-# router on/off correctness (operator; toggles gateway flags via SSM)
-bash test_router_freshness.sh
-#   PASS router ON  : append visible through warm cache (md5 moved)
-#   PASS router OFF : zero bytes cached on blobbers
 ```
 
 **Cluster stop/start** (raw EC2, no app involvement): private IPs survive so the
@@ -252,9 +234,8 @@ On an in-VPC node with the cluster's IAM profile, the entire flow is:
 ```bash
 curl -fsSL .../install.sh | sh                 # or git clone
 export CLUSTER_ID=… WAREHOUSE=s3://…/wh ORIGIN_BUCKET=… NAMESPACE=…
-blimp --setup                                  # deps, catalog, wiring — no keys
+blimp --setup                                  # deps, catalog, wiring, source hookup — no keys
 ~/.blimp_venv/bin/python3 /opt/blimp/register_tpcds_tables.py …   # register data
-bash hookup_cluster_source.sh                  # (or paste into the UI)
 blimp --query                                  # PASS
 ```
 

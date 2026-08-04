@@ -2,14 +2,9 @@
 
 ## Blimp
 
-Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per Blimp node) that keeps your AI/ML context fresh with CDC delta-merges in seconds. One small, simple, scalable Blimp node runs in your own VPC; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost. → [blimp.software](https://blimp.software)
+Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per Blimp node) that keeps your AI/ML context fresh with CDC delta-merges served queries in 1-2s. One small, simple, scalable Blimp node runs in your own VPC; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost. → [blimp.software](https://blimp.software)
 
-`blimp` connects a **Blimp node** to **your** data and keeps it fresh. Run it on
-your own **Iceberg node** — same VPC as the Blimp node, a peered / different-region
-VPC, or a different cloud entirely. It wires the Blimp node's query optimizer +
-read-through cache to your Iceberg + S3 data (or **stands the source up for you** if
-you have none), authors materialized views, and delta-merges each change via a
-webhook your pipeline fires on commit. Your data stays in your environment; Blimp
+`blimp` connects a **Blimp node** to **your** data which stays in your environment; Blimp
 only reads it.
 
 ```
@@ -25,6 +20,17 @@ only reads it.
 Vpc-mode reaches the Blimp node's gateway on its private IP with the Iceberg node's
 IAM role (no keys); cross-region / cross-account / non-AWS reach it over public DNS.
 `blimp --setup` detects which and wires it accordingly.
+
+**All three (same VPC, cross-region/peered, different cloud) are supported and
+proven by this kit for demo/test setup — pick whichever matches where your
+Iceberg node already lives.** For **production**, run the Iceberg node in the
+**same VPC as the Blimp node** (same account, same region — ideally the same
+AZ): that path uses private IPs and the IAM instance role with no S3 keys, and
+every S3 call to the origin stays on the VPC S3 gateway endpoint with no
+internet egress. Cross-region, cross-account, or cross-cloud setups work, but
+add network hops and (outside same-account/region) real data-transfer egress
+cost on every read — fine for a demo or a one-off test, but not the
+recommended production topology.
 
 
 ## Install
@@ -59,7 +65,7 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 ```
 blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
-blimp --query         query optimizer + incremental CDC (q1 delta-merge)
+blimp --query         query optimizer + incremental CDC delta-merge
 blimp --storage       storage & read-through cache suite
 blimp --bench         author / materialize / delta-merge timing profile
 ```
@@ -163,20 +169,14 @@ its live env (effective on the next query, **no restart**) and persists it
 across reboots. Requires a gateway image ≥ 2026-07-27; on older images the
 call fails gracefully and `--setup` prints the manual steps.
 
-Manual fallback: paste `--setup`'s printed values into the Blimp node UI
-(Production tab) — or, scripted (SSH/SSM as root on the gateway; also
-retargets the read-through cache router at the new bucket, which the API
-path leaves to the operator):
+Manual fallback (older gateway image, or the admin-API call failed): paste
+`--setup`'s printed values into the Blimp node UI (Production tab). `--setup`
+also retargets the read-through cache router at the new bucket itself
+(`POST /admin/cache/config`) — that isn't a separate manual step.
 
-```
-ICEBERG_URL=http://<node>:8181 WAREHOUSE=s3://my-bucket/wh NAMESPACE=myns \
-ORIGIN_BUCKET=my-bucket S3_REGION=ap-south-1 \
-S3_KEY=<key> S3_SECRET=<secret> bash hookup_cluster_source.sh   # keys: external mode only
-```
-
-External / cross-account mode **requires** `S3_KEY`/`S3_SECRET` (the script
-wires the gateway's full `ZS3_SRC_CUSTOMER_*` source spec from them); in vpc
-mode leave them unset — the gateway reads via its IAM role.
+External / cross-account mode **requires** `S3_KEY`/`S3_SECRET`; `--setup`
+sends them in the `/admin/source/configure` body. In vpc mode leave them
+unset — the gateway reads via its IAM role.
 
 > Firewall: the gateway must reach this node on the catalog port. If the
 > Blimp node security group doesn't open 8181, serve the catalog on an open port
@@ -242,10 +242,9 @@ the numbers do and don't mean.
 
 ## Notes
 
-**Router corner cases (operator).** `test_router_freshness.sh` toggles the
-gateway's router flags via SSM and proves both invariants: **router ON** → an
-append still changes the served result (immutable Iceberg files = new keys = no
-stale hit); **router OFF** → a source read writes **zero** bytes to the cache.
+**Router cache-freshness guarantee.** Router ON: an append still changes the
+served result (immutable Iceberg files = new keys = no stale hit). Router OFF:
+a source read writes zero bytes to the cache.
 
 **Blimp node stop/start (self-heal, no touch).** Raw EC2 stop/start: private IPs
 survive (in-VPC wiring reconnects untouched); public IPs change and the control
@@ -267,6 +266,8 @@ serves without re-author, CDC keeps merging.
 
 - **[WALKTHROUGH.md](WALKTHROUGH.md)** — the same flow as a full transcript: every
   command and its real output, start to finish, on a fresh node.
+- **[TESTING.md](TESTING.md)** — testing the kit itself (`./test_kit.sh`), not
+  the Blimp node.
 - Product docs: [docs.zus.network/zus-docs/webapps/blimp](https://docs.zus.network/zus-docs/webapps/blimp)
   — the optimizer, incremental MVs (CDC), and the Prod-Query & MV API.
 
@@ -373,16 +374,7 @@ UNCHANGED data while still printing plausible-looking `no-delta` rows. The suite
 now prints the seeder's full traceback and says so explicitly when that happens
 — if you see `APPEND FAILED`, every number below it is meaningless.
 
-**B. Router corner cases** (operator, via SSM):
-```
-TEST A+B — router ON: append visible through warm cache
-  PASS router ON: result changed after append (93707b6c… -> 1e21abc5…)
-TEST C — router OFF: source not cached on blobbers
-  PASS router OFF: cache bytes unchanged (52146)
-RESULT: 2 passed, 0 failed
-```
-
-**C. Raw stop/start (all 4 instances) → self-heal + re-validate:**
+**B. Raw stop/start (all 4 instances) → self-heal + re-validate:**
 ```
 private IPs unchanged; all 4 public IPs changed
 DNS reconciled by the 60s cron (no touch):
@@ -393,14 +385,14 @@ DNS reconciled by the 60s cron (no touch):
 post-restart q1: merge_ms=5138 mode=incremental   RESULT: PASS
 ```
 
-**D. External-cloud host** (non-AWS box, over public DNS):
+**C. External-cloud host** (non-AWS box, over public DNS):
 ```
 network assessment → MODE=external (gateway private unknown reachable: no)
 live query over zus-1784970467881-0.zus.network:9000
   {status: ok, rows: 1, author_ms: 575, query_ms: 2447, md5: 7a26dcec…}
 ```
 
-**E. `blimp --storage` numbers** (2/1 cluster, 5 GB warp set):
+**D. `blimp --storage` numbers** (2/1 cluster, 5 GB warp set):
 ```
 warp   S3 PUT 749 MiB/s · GET 1673 MiB/s   (0 errors)
 fio    NFS write 1137 MiB/s · read 937 MiB/s
@@ -412,7 +404,7 @@ cache leg is only meaningful when the origin set is large enough to exercise it
 (a single 17 MB object measures nothing, and reports the router as *slower* than
 direct S3 purely from per-request overhead). Size the set to the cluster.
 
-**F. `blimp --bench` — MV lifecycle timing profile:**
+**E. `blimp --bench` — MV lifecycle timing profile:**
 
 Phase A cold-authors the same query `AUTHOR_ITERS` times (evicting the MV
 between iterations); phase B appends and refreshes `ITERS` times. Live run, AWS
@@ -434,46 +426,4 @@ SF1 cluster `1785550395356`, 2026-08-01:
   append  refresh materialize_ms:       n=1 min=3763 median=3763 avg=3763 max=3763 (ms)
   append  commit→answer wall_ms:        n=3 min=10051 median=11930 avg=14624 max=21892 (ms)
 ```
-Reading it honestly:
 
-- **`n=2`, not 3.** `append[1]` shows `delta_merge_ms=?` with a `materialize_ms`
-  — it re-materialized instead of merging, so only two appends contributed a
-  merge time. The first append after a cold author has no usable banked MV.
-  Always check `n` before quoting the median.
-- **`author_ms` is dominated by verification, not by building the MV.**
-  Materialize is ~3.7–4.0 s of a 15–24 s author; the rest is the row-hash
-  verifier re-executing the ORIGINAL query to compare against the MV. That cost
-  is paid per author against a cold hash cache, and it is why the same query is
-  far cheaper on a warm cluster than a fresh one.
-- **`CDC_ROWS` sets how much the delta means.** The default 50,000 is ~90% of
-  q1's relevant base (55,440 rows in the `d_year=2000` window at SF1), so the
-  merge is measured with a delta about the size of the MV — that measures the
-  merge machinery, not the fast path. Lower `CDC_ROWS` for a realistic ratio;
-  q1's MV grows nearly 1 row per appended fact row because its inner aggregate
-  is ~90% distinct on `(customer, store)` even in the REAL data, so the MV
-  legitimately roughly doubles over three default-size cycles.
-
-Net: bare node → **two commands** (`install.sh`, `blimp --setup`) → a wired,
-validated Blimp source, with authoring, incremental CDC, cache correctness,
-stop/start self-heal, and cross-cloud all proven — zero credentials typed in
-vpc mode.
-
-
-## Testing the kit itself
-
-`./test_kit.sh` unit-tests the kit's pure decision logic — no cluster, no
-network. Every case in it corresponds to a bug that shipped a *wrong number*
-rather than an error, which is the class a run log cannot show you:
-
-- the fact table `--bench` appends to is derived from the query, so a run can't
-  silently measure a query whose source never changed
-- a non-blank `S3_ENDPOINT` always produces `--endpoint-url`; without it origin
-  calls quietly go to AWS and the cache leg reports "no objects"
-- the cache set is sized so the per-blobber shard share exceeds per-blobber RAM
-  (below that the "hit" is served from blobber page cache and nothing
-  client-side reveals it)
-- mlperf runs accel=1 below a `*.4xlarge`, because extra ranks starve the
-  mount-s3 daemon (it sits outside the dlio memory cgroup and gets OOM-killed)
-- dlio's `<value> (<stddev>)` is parsed to the value
-- **the kit never shells into the Blimp node** — it is HTTP-only, and the suite
-  fails if any `ssh`/`aws ssm`/`docker exec` against the cluster reappears
