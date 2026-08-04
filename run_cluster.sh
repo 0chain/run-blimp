@@ -105,10 +105,16 @@ bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
   # mount but mount-s3 only uploaded 9/16, wedging the rest in fio's end_fsync
   # with zero network I/O on either side. Cap concurrent writers (RAM was not
   # the limit — it was mount-s3's upload concurrency). Tune via MPS3_FIO_MAX_JOBS.
-  local MPCAP="${MPS3_FIO_MAX_JOBS:-6}"
+  local MPCAP="${MPS3_FIO_MAX_JOBS:-4}"
   [ "$NJ" -gt "$MPCAP" ] && { echo "  [fio] mount-s3 concurrency cap: $NJ -> $MPCAP writers (MPS3_FIO_MAX_JOBS)"; NJ=$MPCAP; }
   command -v mount-s3 >/dev/null 2>&1 || { echo "!! fio SKIPPED: mount-s3 not installed"; return 0; }
   AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://$GW:9000" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
+  # Start each fio run against a CLEAN bucket. mount-s3 stalls its upload
+  # pipeline writing into a bucket carrying accumulated data from prior runs
+  # (a killed run leaves GiBs behind, and the next fio then hangs even at low
+  # concurrency). Purge the bench bucket's contents first — objects here are
+  # scratch, regenerated every run.
+  AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://$GW:9000" s3 rm "s3://$BKT/" --recursive --only-show-errors >/dev/null 2>&1 || true
   sudo mkdir -p "$MP"
   grep -qs '^user_allow_other' /etc/fuse.conf || \
     echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
