@@ -73,6 +73,10 @@ blimp --bench         author / materialize / delta-merge timing profile
 Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 **Running a command with no wiring offers to run `--setup` for you first.**
 
+Rough timing: `--setup` takes about 10-15 minutes end to end, `--query` about
+5 minutes, and `--storage` about 30 minutes (it drives the fullest benchmark
+suite — warp, fio, mlperf, cache).
+
 **Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
 export these (or source a file with `set -a`) and `--setup` runs unattended:
 
