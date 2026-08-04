@@ -122,6 +122,8 @@ want fio && run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW
 want mlperf && run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
   MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
+  MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
+  MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
   "$HERE/run_cluster.sh" mlperf
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
