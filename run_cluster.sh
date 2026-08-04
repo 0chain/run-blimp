@@ -99,6 +99,14 @@ bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
   local RAMG NJ; RAMG=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo)
   NJ=$FJ; [ "$RAMG" -lt "$NJ" ] && { NJ=$RAMG; [ "$NJ" -lt 2 ] && NJ=2
     echo "  [fio] client has ${RAMG}G RAM -> $NJ jobs instead of $FJ (mount-s3 buffer guard)"; }
+  # mount-s3 CONCURRENCY cap (separate from the RAM guard): one mount-s3 daemon
+  # stalls its multipart-upload COMPLETION path under many big concurrent files.
+  # Observed on a 16-vCPU/32 GiB box: 16 x 2.3 GiB writes finished to the FUSE
+  # mount but mount-s3 only uploaded 9/16, wedging the rest in fio's end_fsync
+  # with zero network I/O on either side. Cap concurrent writers (RAM was not
+  # the limit — it was mount-s3's upload concurrency). Tune via MPS3_FIO_MAX_JOBS.
+  local MPCAP="${MPS3_FIO_MAX_JOBS:-6}"
+  [ "$NJ" -gt "$MPCAP" ] && { echo "  [fio] mount-s3 concurrency cap: $NJ -> $MPCAP writers (MPS3_FIO_MAX_JOBS)"; NJ=$MPCAP; }
   command -v mount-s3 >/dev/null 2>&1 || { echo "!! fio SKIPPED: mount-s3 not installed"; return 0; }
   AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://$GW:9000" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
   sudo mkdir -p "$MP"
