@@ -243,6 +243,13 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   sudo mkdir -p "$MPS3"; sudo chown "$(id -u)" "$MPS3"
   grep -qs '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
   fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
+  # mount-s3 refuses a non-empty mountpoint (it fails with a confusing "No such
+  # file or directory (os error 2)" here). A prior run's `mkdir -p $MPS3/resnet50`
+  # can leave a LOCAL resnet50/ dir when $MPS3 was unmounted, so recreate the
+  # mountpoint clean when it is not a live mount.
+  if ! mountpoint -q "$MPS3" && [ -n "$(sudo ls -A "$MPS3" 2>/dev/null)" ]; then
+    sudo rm -rf "$MPS3" && sudo mkdir -p "$MPS3"
+  fi
   if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
        mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
        --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MPS3"; then
@@ -291,6 +298,10 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     # A previous run's cleanup (or a killed mount-s3) leaves exactly that behind,
     # so every subsequent mlperf run failed until the box was rebooted.
     fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
+    # Non-empty mountpoint guard (mount-s3 refuses it — see the datagen mount).
+    if ! mountpoint -q "$MPS3" && [ -n "$(sudo ls -A "$MPS3" 2>/dev/null)" ]; then
+      sudo rm -rf "$MPS3" && sudo mkdir -p "$MPS3"
+    fi
     # Mount as ROOT with --allow-other. dlio runs inside the memory scope via
     # `sudo systemd-run`, i.e. as root, and a FUSE mount is private to the user
     # that created it — so an ec2-user mount gave every rank
