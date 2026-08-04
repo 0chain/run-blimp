@@ -67,6 +67,7 @@ blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
 blimp --query         query optimizer + incremental CDC delta-merge
 blimp --storage       storage & read-through cache suite
+blimp --acid          ACID / linearizability check of all three data paths
 blimp --bench         author / materialize / delta-merge timing profile
 ```
 
@@ -74,8 +75,51 @@ Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 **Running a command with no wiring offers to run `--setup` for you first.**
 
 Rough timing: `--setup` takes about 10-15 minutes end to end, `--query` about
-5 minutes, and `--storage` about 30 minutes (it drives the fullest benchmark
-suite — warp, fio, mlperf, cache).
+5 minutes, `--storage` about 30 minutes (it drives the fullest benchmark
+suite — warp, fio, mlperf, cache), and `--acid` about 5 minutes.
+
+### `blimp --acid` — does the node keep your data consistent under load?
+
+A Blimp node is not a single disk — a write is erasure-coded across many
+independent blobbers, and reads are served through several front-ends (the
+gateway S3 API, a read-through cache, a mounted filesystem). `--acid` proves
+that this distributed stack still behaves like one correct store: a value you
+just wrote is the value everyone reads, and a read that races an overwrite
+never returns a stale copy or a torn mix of the old and new bytes.
+
+It uses [porcupine](https://github.com/anishathalye/porcupine), the same
+linearizability model-checker used in Jepsen distributed-systems testing.
+Many clients hammer the same keys with concurrent writes and reads; porcupine
+then searches for *any* ordering of those operations consistent with a single
+correct register. If none exists, the history is **NOT LINEARIZABLE** and the
+offending operation is reported.
+
+It runs against **all three data paths** of the node, each under two profiles:
+
+| Path | What it is |
+|------|------------|
+| **gateway S3 :9000** | the raw S3 API → gosdk → blobbers |
+| **router :8088** | the read-through cache S3 endpoint in front of the gateway |
+| **mountpoint-s3** | the gateway S3 bucket mounted as a POSIX filesystem (the fio / mlperf / customer mount path) |
+
+- **single-writer** — one client writes a key while N clients read it. This is
+  the read-after-write guarantee an object store actually promises; a stale or
+  torn read here is a genuine consistency bug.
+- **multi-writer** — every client both writes and reads the shared keys, a
+  stricter total-order probe. (High "errors" counts on the FUSE/router legs are
+  just the client refusing two concurrent writers to one key — the verdict is
+  over the operations that *completed*.)
+
+```bash
+blimp --acid
+# tune with ACID_CLIENTS (8), ACID_KEYS (4), ACID_DURATION (45s)
+```
+
+A clean run prints `LINEARIZABLE` for every leg — read-after-write is preserved
+and no torn erasure-decode is ever exposed, whether you reach the node over S3,
+through the cache, or as a mounted filesystem. `--setup` builds the checker (a
+small Go program under `acid/`) automatically; it needs no configuration beyond
+the gateway S3 keys already in your wiring.
 
 **Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
 export these (or source a file with `set -a`) and `--setup` runs unattended:

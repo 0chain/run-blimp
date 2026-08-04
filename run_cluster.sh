@@ -77,20 +77,56 @@ bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
   W get --bucket=warpbench --list-existing --noclear --concurrent="$EC_CONC" --duration="${DUR}s" 2>&1 | grep -iE 'Average:|Errors:' | head -2
   clean_bkt warpbench warpprobe; }
 
-# --- fio write + read on the NFS mount (exact run_bench flags) --------------------
-# WRITE: direct/libaio at EC iodepth. READ: run_bench restarts minioserver+zus-nfs
-# and drop_caches to force cold-from-blobber, then reads SEQUENTIAL + buffered
-# (--rw=read --ioengine=psync) — random+O_DIRECT is a cache-defeating FLOOR, not the
-# achievable rate. A CLIENT box can't restart the gateway container or drop its page
-# cache, so cold is instead guaranteed by a working set > gateway RAM: NJ*FSZ (2/1 =
-# 16*2304M = 36 GiB > an 8-vCPU gw's ~31 GB), read sequentially and buffered.
-bench_fio(){ mount_nfs || return 0; disk_guard; local D="$MNT/bench-fio"; sudo mkdir -p "$D"
-  echo "== fio WRITE ($FJ jobs x $FSZ, bs=1M, iodepth=$FID, direct/libaio, full pass) =="
-  sudo fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$FJ" --iodepth="$FID" --direct=1 --fallocate=none --ioengine=libaio --group_reporting 2>&1 | grep -iE 'WRITE:'
-  disk_guard; sync
-  echo "== fio SEQ READ (buffered psync, blobber-served: set ${FJ}x${FSZ} > gw RAM) =="
-  sudo fio --name=w --directory="$D" --rw=read --bs=1M --size="$FSZ" --numjobs="$FJ" --ioengine=psync --group_reporting 2>&1 | grep -iE 'READ:'
-  sudo rm -rf "$D"; disk_guard; }
+# --- fio write + read over MOUNTPOINT-S3 (was: NFS mount) --------------------------
+# Switched off NFS (2026-08-04): NFS :2049 is VPC-only by security group, so the
+# external kit could never run this leg against a real deployment, and the product
+# read path being certified is mount-s3 (same as mlperf). mount-s3 constraints
+# baked in (each cost a wedge to learn on a live box):
+#   * NO --direct/libaio: FUSE has no O_DIRECT; fio's open O_WRONLY without
+#     O_TRUNC on an existing key is EPERM under mount-s3, and the default
+#     layout-then-reopen pattern deadlocked buffered writes with ZERO bytes on
+#     the wire. --create_on_open=1 makes the measured write BE the file create.
+#   * psync engine both legs; end_fsync=1 so upload-on-close completion is
+#     inside the timed window (otherwise the last part is untimed).
+#   * RAM guard: mount-s3 buffers in-flight parts in memory; 6 concurrent 1 GiB
+#     streams wedged a 3 GB client (I/O errors, mount needed a remount). Cap
+#     jobs at (RAM_GB) with a floor of 2.
+#   * unique run dir: mp-s3 keys can't be re-laid-out in place.
+# READ: sequential buffered psync — same cold-by-working-set rationale as before
+# (set > gateway RAM), served via ranged GETs + mount-s3 readahead.
+bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
+  local BKT="${FIO_BUCKET:-bench-fio}" MP="${MPS3_FIO_MNT:-/mnt/mps3-fio}"
+  local RAMG NJ; RAMG=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo)
+  NJ=$FJ; [ "$RAMG" -lt "$NJ" ] && { NJ=$RAMG; [ "$NJ" -lt 2 ] && NJ=2
+    echo "  [fio] client has ${RAMG}G RAM -> $NJ jobs instead of $FJ (mount-s3 buffer guard)"; }
+  command -v mount-s3 >/dev/null 2>&1 || { echo "!! fio SKIPPED: mount-s3 not installed"; return 0; }
+  AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://$GW:9000" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
+  sudo mkdir -p "$MP"
+  grep -qs '^user_allow_other' /etc/fuse.conf || \
+    echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
+  # Always remount: `mountpoint -q` reports a stale FUSE endpoint as mounted.
+  fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true
+  # mount-s3 REFUSES a non-empty mountpoint ("fuse: mountpoint is not empty").
+  # If a prior run (or a manual use of this path as a plain dir) left files
+  # behind, recreate the mountpoint clean. Guarded: only when it is NOT a live
+  # mount, so we never rm through an active FUSE endpoint.
+  if ! mountpoint -q "$MP" && [ -n "$(ls -A "$MP" 2>/dev/null)" ]; then
+    sudo rm -rf "$MP" && sudo mkdir -p "$MP"
+  fi
+  if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
+       mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
+       --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MP"; then
+    echo "!! fio SKIPPED: could not mount s3://$BKT at $MP via mountpoint-s3"; return 0
+  fi
+  local D="$MP/bench-fio-$$"; sudo mkdir -p "$D"
+  echo "== fio WRITE ($NJ jobs x $FSZ, bs=1M, psync/create_on_open, mount-s3) =="
+  sudo fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$NJ" \
+    --ioengine=psync --create_on_open=1 --fallocate=none --end_fsync=1 --group_reporting 2>&1 | grep -iE 'WRITE:'
+  echo "== fio SEQ READ (buffered psync, blobber-served: set ${NJ}x${FSZ} > gw RAM) =="
+  sudo fio --name=w --directory="$D" --rw=read --bs=1M --size="$FSZ" --numjobs="$NJ" \
+    --ioengine=psync --fallocate=none --group_reporting 2>&1 | grep -iE 'READ:'
+  sudo rm -rf "$D"
+  fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true; }
 
 # --- mlperf resnet50 (dlio 2.0) over MOUNTPOINT-S3 (the mlperf-mp-s3 read path) --
 # NOT the NFS mount: mlperf reads via mount-s3 (FUSE over the gateway S3), same as
@@ -102,7 +138,10 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # the whole dataset onto the client's own disk — 30 GiB of it, reported as
   # "mlperf write-NFS: N MB/s" as though it had been written to the Blimp node.
   # A cluster write measurement that never touched the cluster. Skip instead.
-  mount_nfs || return 0
+  # 2026-08-04: mlperf now writes AND reads over mountpoint-s3 (no NFS) — the
+  # datagen is mounted-s3 too, not just the train read. NFS :2049 is VPC-only
+  # and being retired; mp-s3 is the certified product path. mount-s3 must exist.
+  command -v mount-s3 >/dev/null 2>&1 || { echo "!! mlperf SKIPPED: mount-s3 not installed (run 'blimp --setup')"; return 0; }
   # dlio imports mpi4py, which dlopen()s libmpi at startup. Distro OpenMPI is NOT
   # on the default PATH/LD_LIBRARY_PATH (Amazon Linux keeps it under
   # /usr/lib64/openmpi), so dlio died with "RuntimeError: cannot load MPI library"
@@ -184,8 +223,19 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   local NF="${MLPERF_NUM_FILES:-$(( EC_DATASET_GB * 7 ))}" NE="${MLPERF_NUM_EVAL:-64}"
   export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=us-east-1
   aws s3 mb "s3://$BKT" --endpoint-url "http://$GW:9000" >/dev/null 2>&1 || true
-  local NG="$MNT/$BKT/resnet50"; sudo mkdir -p "$NG"; sudo chown "$(id -u)" "$NG"
-  # GENERATE via NFS write-through (train + eval splits) — data lands on the blobbers.
+  # Mount the mlperf bucket over mountpoint-s3 UP FRONT — datagen writes into it
+  # and train reads from it, so the whole workload is mp-s3 (no NFS). Always
+  # remount: `mountpoint -q` reports a stale FUSE endpoint as mounted.
+  sudo mkdir -p "$MPS3"; sudo chown "$(id -u)" "$MPS3"
+  grep -qs '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
+  fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
+  if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
+       mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
+       --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MPS3"; then
+    echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"; return 0
+  fi
+  local NG="$MPS3/resnet50"; sudo mkdir -p "$NG"
+  # GENERATE over mountpoint-s3 (train + eval splits) — data lands on the blobbers.
   # REUSE: the 238-file generate is slow AND intermittently hits a dlio/Hydra error,
   # so generate ONCE and KEEP it (MLPERF_KEEP=1, the default); every later accel/rt/pf
   # sweep reuses the SAME dataset instead of regenerating. Skip generate when the
@@ -194,8 +244,8 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   if [ "${HAVE:-0}" -ge "$NF" ] && [ "${MLPERF_REGEN:-0}" != 1 ]; then
     echo "== mlperf resnet50: REUSING existing dataset ($HAVE train files in $NG) =="
   else
-    echo "== mlperf resnet50: generate $NF train + $NE eval via NFS (~$(( NF*143/1024 ))GiB) =="
-    # TIME THE WRITE. Generation is the mlperf WRITE path (dlio -> NFS -> blobbers)
+    echo "== mlperf resnet50: generate $NF train + $NE eval via mountpoint-s3 (~$(( NF*143/1024 ))GiB) =="
+    # TIME THE WRITE. Generation is the mlperf WRITE path (dlio -> mp-s3 -> blobbers)
     # and the read (training over mountpoint-s3) was the only side ever reported,
     # so a dataset that took many minutes to land showed up nowhere. Measure both
     # directions: write here, read in the TRAIN step below.
@@ -207,7 +257,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     g1=$(date +%s); gsec=$(( g1 - g0 )); [ "$gsec" -lt 1 ] && gsec=1
     gbytes=$(du -sb "$NG" 2>/dev/null | awk '{print $1+0}')
     [ "${gbytes:-0}" -gt 0 ] && \
-      echo "  mlperf write-NFS: $(( gbytes / gsec / 1000000 )) MB/s (${gsec}s, $(( gbytes / 1048576 )) MiB generated)"
+      echo "  mlperf write-mp-s3: $(( gbytes / gsec / 1000000 )) MB/s (${gsec}s, $(( gbytes / 1048576 )) MiB generated)"
   fi
   disk_guard
   # TRAIN interface: MLPERF_IFACE=mps3 (default, reads via mountpoint-s3 FUSE) or

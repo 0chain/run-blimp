@@ -109,7 +109,7 @@ want warp && run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC
 want warp && run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp
 
 # 2) fio (NFS) — write + cold sequential read
-want fio && run "2/4 fio (NFS write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
+want fio && run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
 # Params come from detect_ec (EC 2/1 -> accel 3 / rt 12 / pf 24), the SAME table

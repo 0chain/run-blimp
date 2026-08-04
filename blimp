@@ -57,6 +57,11 @@ usage(){
                      Uses your Iceberg REST + S3 endpoints if you have them, or
                      stands up an Iceberg catalog / S3 bucket here if you don't.
   blimp --storage    Test: storage & read-through cache suite.
+  blimp --acid       Test: ACID / linearizability — a Jepsen-style porcupine
+                     check that concurrent writers + readers never observe a
+                     stale or torn value, run against all three data paths of
+                     the node (gateway S3 :9000, router :8088, mountpoint-s3).
+                     Reports LINEARIZABLE / NOT-LINEARIZABLE per endpoint.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
                      Add --verify to turn verification ON. OFF by default because
                      that is the PRODUCTION path: the gateway runs NO verification
@@ -752,6 +757,7 @@ except Exception: print("")' 2>/dev/null)
   #    installed at the START of --storage, so a failure cost a whole run.
   if [ "${BLIMP_SKIP_DEPS:-0}" != "1" ]; then
     ensure_storage_tools
+    ensure_acid_tools || true   # porcupine ACID checker (Go build); non-fatal
   fi
 
   # 3. Read-through cache. The router only caches buckets named in its
@@ -955,7 +961,38 @@ ensure_storage_tools(){
       printf '%s\n' "$dout" | tail -3 | sed 's/^/    | /'
     }
   fi
-  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing) · nfs: $({ [ -x /sbin/mount.nfs4 ] || [ -x /usr/sbin/mount.nfs4 ]; } && echo ok || echo missing)"
+  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing)"
+}
+
+# ACID_BIN — the compiled porcupine linearizability checker (built from acid/).
+ACID_BIN="$HERE/acid/ptest"
+
+# ensure_acid_tools builds the porcupine checker (acid/ptest). It is a single Go
+# program; building it needs a Go toolchain, which we fetch to /usr/local/go if
+# the host has none (same one-time pattern as warp/mount-s3/dlio). Idempotent:
+# a present, runnable binary is reused.
+ensure_acid_tools(){
+  [ "${BLIMP_SKIP_DEPS:-0}" = 1 ] && return 0
+  [ -x "$ACID_BIN" ] && { echo "  porcupine (acid): ok"; return 0; }
+  bold "== building the porcupine ACID checker (acid/ptest) =="
+  local GO; GO=$(command -v go || echo /usr/local/go/bin/go)
+  if ! "$GO" version >/dev/null 2>&1; then
+    bold "  installing Go toolchain (one-time, to build the ACID checker)…"
+    local arch gover; arch=$(uname -m); [ "$arch" = aarch64 ] && arch=arm64 || arch=amd64
+    gover=1.22.5
+    if curl -fsSL "https://go.dev/dl/go${gover}.linux-${arch}.tar.gz" -o /tmp/go.tgz; then
+      sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
+      GO=/usr/local/go/bin/go
+    fi
+  fi
+  if ! "$GO" version >/dev/null 2>&1; then
+    echo "  ! Go toolchain unavailable — 'blimp --acid' will be unavailable"; return 1
+  fi
+  # Build offline-tolerant: module deps (porcupine, minio-go) are fetched on the
+  # first build and cached under GOPATH thereafter.
+  ( cd "$HERE/acid" && GOFLAGS=-mod=mod "$GO" build -o ptest . ) 2>&1 | tail -3
+  [ -x "$ACID_BIN" ] && echo "  porcupine (acid): built ok" \
+    || { echo "  ! porcupine build failed — 'blimp --acid' will be unavailable"; return 1; }
 }
 
 cmd_storage(){
@@ -1047,9 +1084,76 @@ for f in "$@"; do
   esac
 done
 
+# cmd_acid — linearizability (ACID) check of the node's three data paths.
+# For each endpoint it runs the porcupine model checker under two profiles:
+#   single-writer : one client writes a key, N clients read it concurrently —
+#                   the read-after-write property an object store actually
+#                   promises. A stale/torn read here is a REAL consistency bug.
+#   multi-writer  : all clients write AND read the same keys — a stricter
+#                   total-order probe. (Some completed-op errors here are just
+#                   the FUSE client refusing concurrent writers to one key; the
+#                   verdict is over the ops that COMPLETED.)
+# LINEARIZABLE on every endpoint == the gateway+router+mp-s3 stack preserves
+# read-after-write and never exposes a torn erasure-decode under load.
+cmd_acid(){
+  need_env
+  : "${GW:?gateway missing in wiring}"
+  preflight 1 0
+  [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
+  [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
+  [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || die "gateway S3 credentials required (GW_AK/GW_SK)"
+  ensure_acid_tools || die "porcupine checker unavailable — run 'blimp --setup'"
+  local CL="${ACID_CLIENTS:-8}" KEYS="${ACID_KEYS:-4}" DUR="${ACID_DURATION:-45s}"
+  local ROUTER_PORT="${ROUTER_PORT:-8088}" S3_PORT="${S3_PORT:-9000}"
+  local MP="${ACID_MPS3_MNT:-/mnt/mps3-acid}" BKT="${ACID_BUCKET:-blimp-acid}"
+  export AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" AWS_REGION=us-east-1
+  aws s3 mb "s3://$BKT" --endpoint-url "http://$GW:$S3_PORT" >/dev/null 2>&1 || true
+
+  run_leg(){ # <label> <extra ptest args...>
+    local label="$1"; shift
+    echo; bold "== $label =="
+    echo "-- single-writer (${CL}c/${KEYS}k/${DUR}) --"
+    "$ACID_BIN" -bucket "$BKT" -access-key "$GW_AK" -secret-key "$GW_SK" \
+      -clients "$CL" -keys "$KEYS" -duration "$DUR" -single-writer "$@" 2>&1 | grep -E 'RESULT|Illegal' | head -3
+    echo "-- multi-writer (${CL}c/${KEYS}k/${DUR}) --"
+    "$ACID_BIN" -bucket "$BKT" -access-key "$GW_AK" -secret-key "$GW_SK" \
+      -clients "$CL" -keys "$KEYS" -duration "$DUR" "$@" 2>&1 | grep -E 'RESULT|Illegal' | head -3
+  }
+
+  bold "ACID / linearizability — node $GW  (bucket s3://$BKT)"
+  run_leg "gateway S3 :$S3_PORT"  -mode s3     -endpoint "$GW:$S3_PORT"
+  run_leg "router :$ROUTER_PORT"  -mode router -endpoint "$GW:$ROUTER_PORT"
+
+  # mountpoint-s3 leg — mount the bucket as a filesystem over the gateway S3 and
+  # run the file backend against it. Always remount (a stale FUSE endpoint reads
+  # as "mounted"). mount-s3 default trailing checksums exercise the gateway's
+  # aws-chunked-trailer decode path on write.
+  if command -v mount-s3 >/dev/null 2>&1; then
+    sudo mkdir -p "$MP"
+    grep -qs '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
+    fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true
+    if sudo -E env AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" \
+         mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:$S3_PORT" \
+         --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MP"; then
+      echo; bold "== mountpoint-s3 (over :$S3_PORT) =="
+      echo "-- single-writer (${CL}c/${KEYS}k/${DUR}) --"
+      sudo "$ACID_BIN" -mode mounts3 -dir "$MP" -clients "$CL" -keys "$KEYS" -duration "$DUR" -single-writer 2>&1 | grep -E 'RESULT|Illegal' | head -3
+      echo "-- multi-writer (${CL}c/${KEYS}k/${DUR}) --"
+      sudo "$ACID_BIN" -mode mounts3 -dir "$MP" -clients "$CL" -keys "$KEYS" -duration "$DUR" 2>&1 | grep -E 'RESULT|Illegal' | head -3
+      fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true
+    else
+      echo "!! mountpoint-s3 leg SKIPPED: could not mount s3://$BKT at $MP"
+    fi
+  else
+    echo "!! mountpoint-s3 leg SKIPPED: mount-s3 not installed (run 'blimp --setup')"
+  fi
+  echo; bold "ACID check complete — LINEARIZABLE on every leg == read-after-write preserved, no torn reads."
+}
+
 case "$CMD" in
   --setup)            cmd_setup ;;
   --storage|storage)  cmd_storage ;;
+  --acid|acid)        cmd_acid ;;
   --query|query)      cmd_query ;;
   --bench|bench)      cmd_bench ;;
   ""|-h|--help|help)  usage ;;
