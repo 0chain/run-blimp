@@ -6,6 +6,18 @@
 # appends), aws CLI v2 (bucket create/grant, SSM), duckdb CLI (query suite),
 # and the kit scripts. The Iceberg REST catalog runs as its own compose service
 # (see docker-compose.yml), so this container never needs docker-in-docker.
+
+# --- acid builder: compile the porcupine linearizability checker (blimp --acid).
+# The final image sets BLIMP_SKIP_DEPS=1 and ships no Go toolchain, so the CLI's
+# runtime build (ensure_acid_tools) is a no-op there — bake the binary here so
+# `blimp --acid` works out of the box.
+FROM golang:1.22-bookworm AS acidbuild
+WORKDIR /acid
+COPY acid/go.mod acid/go.sum ./
+RUN go mod download
+COPY acid/ ./
+RUN CGO_ENABLED=0 go build -o ptest .
+
 FROM python:3.12-slim
 
 # --- OS deps: aws CLI, duckdb CLI, and the small tools the scripts shell out to
@@ -30,7 +42,11 @@ WORKDIR /kit
 COPY blimp register_tpcds_tables.py seed_tpcds.py standup_data.sh \
      test_query.sh bench_cdc.sh bench_incremental.sh test_cache.sh \
      run_cluster.sh run_router.sh /kit/
-RUN chmod +x /kit/blimp /kit/*.sh || true; \
+# acid checker: source (for reference) + the prebuilt binary from the builder
+# stage, so `blimp --acid` runs without a Go toolchain in this image.
+COPY acid/ /kit/acid/
+COPY --from=acidbuild /acid/ptest /kit/acid/ptest
+RUN chmod +x /kit/blimp /kit/*.sh /kit/acid/ptest || true; \
     ln -s /kit/blimp /usr/local/bin/blimp
 
 # The image ALREADY has every prerequisite, so the CLI's own installer is a
