@@ -143,8 +143,15 @@ bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
   fi
   local D="$MP/bench-fio-$$"; sudo mkdir -p "$D"
   echo "== fio WRITE ($NJ jobs x $FSZ, bs=1M, psync/create_on_open, mount-s3) =="
-  sudo fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$NJ" \
-    --ioengine=psync --create_on_open=1 --fallocate=none --end_fsync=1 --group_reporting 2>&1 | grep -iE 'WRITE:'
+  # HARD TIMEOUT: mp-s3 FUSE write of large files can WEDGE — fio hangs in end_fsync
+  # while mount-s3 uploads 0 bytes (measured 2026-08-05: 4.2 MB/s on a 4xlarge
+  # gateway, full wedge on a c6in.large). Cap it so the suite can NEVER hang; on
+  # timeout, say so and point at native S3 (the warp PUT above) for real write BW.
+  local FIO_WR_TO="${FIO_WRITE_TIMEOUT:-180}"
+  if ! sudo timeout -s KILL "$FIO_WR_TO" fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$NJ" \
+       --ioengine=psync --create_on_open=1 --fallocate=none --end_fsync=1 --group_reporting 2>&1 | grep -iE 'WRITE:'; then
+    echo "  !! fio mp-s3 WRITE stalled/timed out (>${FIO_WR_TO}s) — mount-s3 FUSE write wedges on large files; use native S3 (warp PUT above) for write throughput"
+  fi
   echo "== fio SEQ READ (buffered psync, blobber-served: set ${NJ}x${FSZ} > gw RAM) =="
   sudo fio --name=w --directory="$D" --rw=read --bs=1M --size="$FSZ" --numjobs="$NJ" \
     --ioengine=psync --fallocate=none --group_reporting 2>&1 | grep -iE 'READ:'
@@ -283,20 +290,30 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   if [ "${HAVE:-0}" -ge "$NF" ] && [ "${MLPERF_REGEN:-0}" != 1 ]; then
     echo "== mlperf resnet50: REUSING existing dataset ($HAVE train files in $NG) =="
   else
-    echo "== mlperf resnet50: generate $NF train + $NE eval via mountpoint-s3 (~$(( NF*143/1024 ))GiB) =="
-    # TIME THE WRITE. Generation is the mlperf WRITE path (dlio -> mp-s3 -> blobbers)
-    # and the read (training over mountpoint-s3) was the only side ever reported,
-    # so a dataset that took many minutes to land showed up nowhere. Measure both
-    # directions: write here, read in the TRAIN step below.
-    local g0 g1 gsec gbytes
+    echo "== mlperf resnet50: generate $NF train + $NE eval (~$(( NF*143/1024 ))GiB), native-S3 upload =="
+    # 🚨 DO NOT generate straight into the mp-s3 mount. mountpoint-s3 FUSE WRITE of
+    # large files from a client WEDGES / is ~200x slower than native S3 (measured
+    # 2026-08-05: native warp 913 MB/s vs mp-s3 fio 4.2 MB/s on a c6in.4xlarge
+    # gateway, and mp-s3 fully WEDGED — 0 bytes uploaded, fio stuck in fsync — on a
+    # c6in.large gateway). dlio-over-mp-s3 datagen therefore stalled the whole
+    # suite. Instead: generate to a LOCAL scratch dir (fast local disk), then upload
+    # via `aws s3 cp` (native S3 MULTIPART, the same fast path warp uses). TRAIN
+    # below still READS via mp-s3 ($NG) — mp-s3 READ is fine, only WRITE wedges.
+    local g0 g1 gsec gbytes LG
+    LG="${MLPERF_LOCAL_GEN:-/var/tmp/mlperf-gen}/resnet50"
+    sudo rm -rf "$LG" 2>/dev/null; sudo mkdir -p "$LG"; sudo chown -R "$(id -u)" "$(dirname "$LG")"
     g0=$(date +%s)
-    MEMRUN "$MLPERF_GEN_MEM_CAP" "$DLIO" workload=resnet50_h100 ++workload.dataset.data_folder="$NG" \
+    MEMRUN "$MLPERF_GEN_MEM_CAP" "$DLIO" workload=resnet50_h100 ++workload.dataset.data_folder="$LG" \
       ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
       ++workload.workflow.generate_data=True ++workload.workflow.train=False 2>&1 | grep -iE 'Generation done|error' | tail -1
+    # native-S3 multipart upload of the whole generated tree into the bucket (fast);
+    # train then reads it back through the mp-s3 mount at $NG.
+    aws s3 cp "$LG/" "s3://$BKT/resnet50/" --recursive --endpoint-url "http://$GW:9000" --only-show-errors 2>&1 | tail -2
     g1=$(date +%s); gsec=$(( g1 - g0 )); [ "$gsec" -lt 1 ] && gsec=1
-    gbytes=$(du -sb "$NG" 2>/dev/null | awk '{print $1+0}')
+    gbytes=$(du -sb "$LG" 2>/dev/null | awk '{print $1+0}')
     [ "${gbytes:-0}" -gt 0 ] && \
-      echo "  mlperf write-mp-s3: $(( gbytes / gsec / 1000000 )) MB/s (${gsec}s, $(( gbytes / 1048576 )) MiB generated)"
+      echo "  mlperf gen+native-upload: $(( gbytes / gsec / 1000000 )) MB/s (${gsec}s, $(( gbytes / 1048576 )) MiB)"
+    sudo rm -rf "$LG" 2>/dev/null   # dataset now lives in the bucket; reclaim client scratch
   fi
   disk_guard
   # TRAIN interface: MLPERF_IFACE=mps3 (default, reads via mountpoint-s3 FUSE) or
