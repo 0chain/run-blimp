@@ -1033,12 +1033,15 @@ cmd_storage(){
   # answered InvalidAccessKeyId. The listing came back empty and the leg died
   # with "no objects under s3://<bucket>/{_blimp_cachebench}/".
   # Run the suite LOCALLY (on THIS node, to measure the real client->gateway
-  # path), capturing its output so we can register the run on the Blimp UI bench
-  # list. Unlike --query (which runs server-side and so already appears on the
-  # UI), --storage never touches the gateway's cdc_service — so without the
-  # /bench/import POST below the whole run is invisible on the UI. Was `exec`;
-  # now we stay in-process to import the result, then exit with the suite's code.
+  # path), capturing its output. Unlike --query — which runs SERVER-SIDE, so the
+  # gateway's cdc_service tracks it live and the UI shows a yellow "running" row
+  # with partial data — --storage runs HERE, so the gateway has no live view. To
+  # give the SAME live UI, a background heartbeat POSTs the partial results to
+  # cdc_service every <180s as status=running (the UI shows the live row), and we
+  # finalize as "done" when the suite exits. Was `exec`; now we stay in-process.
   local _slog; _slog=$(mktemp "${TMPDIR:-/tmp}/blimp_storage.XXXXXX.log")
+  local _rid="storage_$(date +%s)"; : > "$_slog"
+  storage_heartbeat "$_slog" "$_rid" & local _hbpid=$!
   env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
     REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
@@ -1047,54 +1050,105 @@ cmd_storage(){
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
     NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh" 2>&1 | tee "$_slog"
   local _rc=${PIPESTATUS[0]}
-  storage_import "$_slog" || true
+  kill "$_hbpid" 2>/dev/null || true; wait "$_hbpid" 2>/dev/null || true
+  storage_import "$_slog" "$_rid" "done" || true   # finalize the SAME UI row
   rm -f "$_slog" 2>/dev/null || true
   exit "$_rc"
 }
 
-# storage_import <logfile> — register a client-side --storage run on the Blimp
-# node's UI bench list via the gateway cdc_service `POST /bench/import`
-# (Authorization: Bearer zus-<CLUSTER_ID>). The suite prints human-readable
-# result lines; we scrape the throughput/TTFB/AU lines into a [label,value]
-# metrics array and ship them + the full log so the UI shows the run exactly
-# like a gateway-launched one (tagged client_* / source=client). Best-effort:
-# an older gateway image without /bench/import (or an unreachable :9401) just
-# skips, it never fails the run.
+# storage_heartbeat <logfile> <id> — while --storage runs, push its partial
+# output to the gateway every 75s as status=running so the UI shows a LIVE
+# "running" row (yellow, partial metrics) exactly like a --query run, instead of
+# the run only appearing when it finishes. Each POST rewrites the gateway-side
+# summary/log so bench_status() keeps reporting "running" (freshness < 180s).
+# Killed by cmd_storage; the "done" finalize is a separate storage_import call.
+storage_heartbeat(){
+  local log="$1" id="$2"
+  [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  sleep 15   # let the first leg emit a line before the first beat
+  while :; do storage_import "$log" "$id" "running" quiet; sleep 75; done
+}
+
+# storage_import <logfile> [id] [status] [quiet] — register/update a client-side
+# --storage run on the Blimp UI bench list via the gateway cdc_service
+# `POST /bench/import` (Authorization: Bearer zus-<CLUSTER_ID>). The suite prints
+# human-readable result lines; we scrape the throughput/TTFB/AU lines into a
+# [label,value] metrics array and ship them + the full log so the UI shows the
+# run like a gateway-launched one (tagged client_* / source=client). status is
+# "running" (heartbeat) or "done" (final). Best-effort: an older gateway image
+# without /bench/import (or an unreachable :9401) just skips, never fails the run.
 storage_import(){
-  local log="$1"
-  [ -n "${CLUSTER_ID:-}" ] || { echo "  (skipping UI registration — no CLUSTER_ID in wiring)"; return 0; }
+  local log="$1" id="${2:-storage_$(date +%s)}" status="${3:-done}" quiet="${4:-}"
+  [ -n "${CLUSTER_ID:-}" ] || { [ -z "$quiet" ] && echo "  (skipping UI registration — no CLUSTER_ID in wiring)"; return 0; }
   [ -n "${GW:-}" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  local tok="zus-$CLUSTER_ID" id="storage_$(date +%s)"
+  local tok="zus-$CLUSTER_ID"
   local payload
-  payload=$(CLOG="$log" python3 - "$id" "$(hostname 2>/dev/null || echo client)" <<'PY' 2>/dev/null
+  payload=$(CLOG="$log" python3 - "$id" "$(hostname 2>/dev/null || echo client)" "$status" <<'PY' 2>/dev/null
 import json,os,re,sys
-rid,host=sys.argv[1],sys.argv[2]
-raw=open(os.environ["CLOG"],errors="replace").read()
-clean=re.sub(r"\x1b\[[0-9;]*m","",raw)
-rows=[]
-pat=re.compile(r"TTFB:|S3 PUT|S3 GET|WRITE:|READ:|mlperf read|cache |MB/s|MiB/s| AU ")
-for ln in clean.splitlines():
+rid,host,status=sys.argv[1],sys.argv[2],sys.argv[3]
+try: raw=open(os.environ["CLOG"],errors="replace").read()
+except Exception: raw=""
+c=re.sub(r"\x1b\[[0-9;]*m","",raw)
+# throughput is normalised to DECIMAL MB/s (or GB/s >=1000) — warp/fio report
+# BINARY MiB/s, but the UI + gateway rows use MB/s, so convert (1 MiB = 1.048576 MB).
+def to_mb(v,u):
+    v=float(v); u=u.lower()
+    return v*(1073.741824 if u.startswith("gib") else 1.048576 if u.startswith("mib") else 0.001048576 if u.startswith("kib") else 1000.0 if u.startswith("gb") else 0.001 if u.startswith("kb") else 1.0)
+def fmt(mb): return "%.2f GB/s"%(mb/1000.0) if mb>=1000 else "%d MB/s"%round(mb)
+def thr(s,paren=False):
+    if paren:
+        m=re.search(r"\(([0-9.]+)\s*(GB/s|MB/s|KB/s)\)",s)
+        if m: return fmt(to_mb(m.group(1),m.group(2)))
+    m=re.search(r"([0-9.]+)\s*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s)",s)
+    return fmt(to_mb(m.group(1),m.group(2))) if m else None
+rows=[]; wctx=None
+def g(rx,s,grp=1):
+    m=re.search(rx,s); return m.group(grp) if m else None
+for ln in c.splitlines():
     s=ln.strip()
-    if not s or not pat.search(s): continue
-    if ":" in s:
-        k,v=s.split(":",1); rows.append([k.strip()[:90], v.strip()[:140]])
-    else:
-        rows.append([s[:90], ""])
-    if len(rows)>=40: break
-print(json.dumps({"id":rid,"type":"storage (client)",
-  "summary":{"type":"storage (client)","metrics":rows,"config":"run-blimp kit @ "+host},
-  "log":clean[-200000:]}))
+    if "== warp PUT" in s: wctx="PUT"; continue
+    if "== warp GET" in s: wctx="GET"; continue
+    if s.startswith("* Average:") and wctx:
+        v=thr(s); ob=g(r"([0-9.]+)\s*obj/s",s)
+        if v: rows.append(["warp S3 %s (96MiB, conc16)"%wctx, v+(" · "+ob+" obj/s" if ob else "")])
+        wctx=None; continue
+    if "TTFB:" in s:
+        med=g(r"Median:\s*([0-9a-z]+)",s); p99=g(r"99th:\s*([0-9a-z]+)",s); avg=g(r"Avg:\s*([0-9a-z]+)",s)
+        parts=[x for x in [("p50 "+med if med else ""),("p99 "+p99 if p99 else ""),("avg "+avg if avg else "")] if x]
+        rows.append(["TTFB 1KiB GET (conc1)", " · ".join(parts)]); continue
+    if s.startswith("WRITE:") or "write BW" in s:
+        v=thr(s,paren=True)
+        if v: rows.append(["fio write (mp-s3, 4 jobs)", v]); continue
+    if s.startswith("READ:") or "seq read" in s:
+        v=thr(s,paren=True)
+        if v: rows.append(["fio read (cold seq)", v]); continue
+    if "mlperf read" in s:
+        au=g(r"AU\s*([0-9.]+)",s); io=thr(s); acc=g(r"accel=([0-9]+)",s)
+        parts=[x for x in [("AU "+au+"%" if au else ""),(io if io else "")] if x]
+        rows.append(["mlperf resnet50"+(" accel-"+acc if acc else ""), " · ".join(parts)]); continue
+    if re.search(r"cache .*(direct|router|mp-s3)",s):
+        rows.append(["cache read-through", re.sub(r"\s+"," ",s)[:120]]); continue
+od=[]; seen={}
+for k,v in rows:
+    if k not in seen: od.append(k)
+    seen[k]=v
+final=[[k,seen[k]] for k in od]
+print(json.dumps({"id":rid,"type":"storage (client)","status":status,
+  "summary":{"type":"storage (client)","metrics":final,"config":"run-blimp kit (client %s)"%host,"status":status},
+  "log":c[-200000:]}))
 PY
 )
   [ -n "$payload" ] || return 0
   if curl -fsS -m 20 -X POST "http://$GW:9401/bench/import" \
        -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
        --data-binary "$payload" >/dev/null 2>&1; then
-    bold "  ✓ registered this run on the Blimp UI bench list (client_$id)"
+    [ -z "$quiet" ] && bold "  ✓ registered this run on the Blimp UI bench list (client_$id, $status)"
   else
-    echo "  (could not register on the UI bench list — gateway :9401 unreachable or image predates /bench/import)"
+    [ -z "$quiet" ] && echo "  (could not register on the UI bench list — gateway :9401 unreachable or image predates /bench/import)"
   fi
+  return 0
 }
 
 cmd_query(){
