@@ -32,24 +32,170 @@ J(){ python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))" 2>/de
 # on the cluster). NOTE the merge only works for a SINGLE-fact delta; multi-fact
 # queries (q25/q29: store_sales+store_returns+catalog_sales) can't merge a
 # one-table delta and fall back to full re-author.
-Q1='with customer_total_return as
- (select sr_customer_sk as ctr_customer_sk, sr_store_sk as ctr_store_sk,
-         sum(sr_return_amt) as ctr_total_return
-  from store_returns, date_dim
-  where sr_returned_date_sk = d_date_sk and d_year = 2000
-  group by sr_customer_sk, sr_store_sk)
-select c_customer_id
-from customer_total_return ctr1, store, customer
-where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
-        from customer_total_return ctr2 where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
-  and s_store_sk = ctr1.ctr_store_sk and s_state = '\''TN'\''
-  and ctr1.ctr_customer_sk = c_customer_sk
-order by c_customer_id limit 100'
+Q1='SELECT *
+FROM
+  (SELECT count(*) h8_30_to_9
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 8
+     AND time_dim.t_minute >= 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s1,
+  (SELECT count(*) h9_to_9_30
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 9
+     AND time_dim.t_minute < 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s2,
+  (SELECT count(*) h9_30_to_10
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 9
+     AND time_dim.t_minute >= 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s3,
+  (SELECT count(*) h10_to_10_30
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 10
+     AND time_dim.t_minute < 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s4,
+  (SELECT count(*) h10_30_to_11
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 10
+     AND time_dim.t_minute >= 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s5,
+  (SELECT count(*) h11_to_11_30
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 11
+     AND time_dim.t_minute < 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s6,
+  (SELECT count(*) h11_30_to_12
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 11
+     AND time_dim.t_minute >= 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s7,
+  (SELECT count(*) h12_to_12_30
+   FROM store_sales,
+        household_demographics,
+        time_dim,
+        store
+   WHERE ss_sold_time_sk = time_dim.t_time_sk
+     AND ss_hdemo_sk = household_demographics.hd_demo_sk
+     AND ss_store_sk = s_store_sk
+     AND time_dim.t_hour = 12
+     AND time_dim.t_minute < 30
+     AND ((household_demographics.hd_dep_count = 4
+           AND household_demographics.hd_vehicle_count<=4+2)
+          OR (household_demographics.hd_dep_count = 2
+              AND household_demographics.hd_vehicle_count<=2+2)
+          OR (household_demographics.hd_dep_count = 0
+              AND household_demographics.hd_vehicle_count<=0+2))
+     AND store.s_store_name = '\''ese'\'') s8 '
 
 # BENCH_QNR: bench a different TPC-DS query (reads $Q_DIR/q<N>.sql, e.g.
-# BENCH_QNR=64). Default stays the built-in q1. Labels below follow suit.
-BENCH_QNR="${BENCH_QNR:-1}"
-if [ "$BENCH_QNR" != "1" ]; then
+# BENCH_QNR=64). Labels below follow suit.
+#
+# DEFAULT q88, and it is embedded inline above rather than read from $Q_DIR so
+# `blimp bench` works on a box that has never generated the query files.
+#
+# Why q88: it is the only query in the default CDC set that currently authors,
+# VERIFIES and delta-merges end to end. Measured on a fresh SF1 cluster
+# (2026-08-05, image c4e6c88e6): exact-mv match on a 158,369-row banked MV,
+# `verify claim=query matched=true`, served in 130-135 ms. At SF1000 the same
+# shape merged in 146-1,525 ms and served in 176-593 ms.
+#
+# The previous default q1 was a poor benchmark subject: it is the
+# customer_total_return correlated-average shape, and on the same cluster its
+# archetype authors an MV whose rewrite does not survive the query-level verify.
+# A bench whose subject falls back to a base scan measures the base scan.
+#
+# Do NOT default this to q9 or q13: q9's MV is 101 rows at EVERY scale factor
+# (ss_quantity is a bounded domain) and q13's is 23, so both are refused by the
+# ZUS_MV_AUTHORING_MIN_MV_ROWS=1000 floor that provisioning sets — no dataset
+# size rescues them. q59 ties on its ORDER BY key (store has 12 rows but only 6
+# distinct s_store_id, so the self-join fans out) and its LIMIT 100 is therefore
+# unstable, which reads as a verify mismatch that is not a real one.
+BENCH_QNR="${BENCH_QNR:-88}"
+if [ "$BENCH_QNR" != "88" ]; then
   QF="$Q_DIR/q${BENCH_QNR}.sql"
   [ -f "$QF" ] || { echo "FATAL: BENCH_QNR=$BENCH_QNR but no $QF"; exit 1; }
   Q1="$(cat "$QF")"

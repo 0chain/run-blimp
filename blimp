@@ -1032,13 +1032,69 @@ cmd_storage(){
   # passed here — so every origin call fell back to the IAM role and MinIO
   # answered InvalidAccessKeyId. The listing came back empty and the leg died
   # with "no objects under s3://<bucket>/{_blimp_cachebench}/".
-  exec env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
+  # Run the suite LOCALLY (on THIS node, to measure the real client->gateway
+  # path), capturing its output so we can register the run on the Blimp UI bench
+  # list. Unlike --query (which runs server-side and so already appears on the
+  # UI), --storage never touches the gateway's cdc_service — so without the
+  # /bench/import POST below the whole run is invisible on the UI. Was `exec`;
+  # now we stay in-process to import the result, then exit with the suite's code.
+  local _slog; _slog=$(mktemp "${TMPDIR:-/tmp}/blimp_storage.XXXXXX.log")
+  env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
     REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     STORAGE_LEGS="${STORAGE_LEGS:-}" \
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
-    NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh"
+    NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh" 2>&1 | tee "$_slog"
+  local _rc=${PIPESTATUS[0]}
+  storage_import "$_slog" || true
+  rm -f "$_slog" 2>/dev/null || true
+  exit "$_rc"
+}
+
+# storage_import <logfile> — register a client-side --storage run on the Blimp
+# node's UI bench list via the gateway cdc_service `POST /bench/import`
+# (Authorization: Bearer zus-<CLUSTER_ID>). The suite prints human-readable
+# result lines; we scrape the throughput/TTFB/AU lines into a [label,value]
+# metrics array and ship them + the full log so the UI shows the run exactly
+# like a gateway-launched one (tagged client_* / source=client). Best-effort:
+# an older gateway image without /bench/import (or an unreachable :9401) just
+# skips, it never fails the run.
+storage_import(){
+  local log="$1"
+  [ -n "${CLUSTER_ID:-}" ] || { echo "  (skipping UI registration — no CLUSTER_ID in wiring)"; return 0; }
+  [ -n "${GW:-}" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local tok="zus-$CLUSTER_ID" id="storage_$(date +%s)"
+  local payload
+  payload=$(CLOG="$log" python3 - "$id" "$(hostname 2>/dev/null || echo client)" <<'PY' 2>/dev/null
+import json,os,re,sys
+rid,host=sys.argv[1],sys.argv[2]
+raw=open(os.environ["CLOG"],errors="replace").read()
+clean=re.sub(r"\x1b\[[0-9;]*m","",raw)
+rows=[]
+pat=re.compile(r"TTFB:|S3 PUT|S3 GET|WRITE:|READ:|mlperf read|cache |MB/s|MiB/s| AU ")
+for ln in clean.splitlines():
+    s=ln.strip()
+    if not s or not pat.search(s): continue
+    if ":" in s:
+        k,v=s.split(":",1); rows.append([k.strip()[:90], v.strip()[:140]])
+    else:
+        rows.append([s[:90], ""])
+    if len(rows)>=40: break
+print(json.dumps({"id":rid,"type":"storage (client)",
+  "summary":{"type":"storage (client)","metrics":rows,"config":"run-blimp kit @ "+host},
+  "log":clean[-200000:]}))
+PY
+)
+  [ -n "$payload" ] || return 0
+  if curl -fsS -m 20 -X POST "http://$GW:9401/bench/import" \
+       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+       --data-binary "$payload" >/dev/null 2>&1; then
+    bold "  ✓ registered this run on the Blimp UI bench list (client_$id)"
+  else
+    echo "  (could not register on the UI bench list — gateway :9401 unreachable or image predates /bench/import)"
+  fi
 }
 
 cmd_query(){
@@ -1070,7 +1126,7 @@ cmd_bench(){
     ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" NAMESPACE="${NAMESPACE:-tpcds}" \
     REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-3}" AUTHOR_ITERS="${AUTHOR_ITERS:-3}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
-    BENCH_QNR="${BENCH_QNR:-1}" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
+    BENCH_QNR="${BENCH_QNR:-88}" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
     BENCH_FACT="${BENCH_FACT:-}" \
     CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh"
 }
