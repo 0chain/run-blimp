@@ -118,7 +118,28 @@ else
   # Set QNRS/SUITES to trim this; it is deliberately broad because the point of
   # a fresh-cluster run is to find out which recipes survive contact with real
   # data, not to confirm the four we already know about.
-  SUITES="${SUITES:-store_sales:13 59 88 9 47 70 24 4 11 14 23 31 51 17 5 80 49;catalog_sales:72;web_sales:95}"
+  # THE FIVE. Every one MEASURED delta-merging end to end at SF1000 on
+  # 2026-08-05 (i-036afe917af144a84, after a +50,000-row store_sales append that
+  # marked 6 MVs stale). Ordered by merge cost:
+  #
+  #        mode      merge_ms   query_ms   wall
+  #   q47  APPEND         125        236   0.93 s
+  #   q59  APPEND         130        415   0.90 s
+  #   q88  APPEND         146        195   1.14 s
+  #   q13  APPEND         233        144   1.08 s
+  #   q9   APPEND         238        115   0.83 s
+  #
+  # mode=APPEND is the whole point: "delta-only aggregate, cost O(|delta|), MV
+  # parquet not rewritten". All five are single-fact-per-branch, which is the
+  # condition for that — with k facts in a branch the binder expands 2^k-1
+  # inclusion-exclusion terms and each unchanged fact binds at FULL size.
+  #
+  # Kept deliberately SMALL. The 19-query set this replaced ran every recipe in
+  # the shipped corpus, which is the right thing for a coverage sweep and the
+  # wrong thing for a default: it authored 19 queries through the LLM ladder on
+  # a fresh cluster, and most of those recipes have never been verified by a
+  # gateway. Use SUITES= for that sweep; the default stays the proven five.
+  SUITES="${SUITES:-store_sales:47 59 88 13 9}"
 fi
 declare -A SQL FACT; NAMES=()
 IFS=';' read -ra SUITE_ARR <<< "$SUITES"
