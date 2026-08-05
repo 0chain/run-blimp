@@ -148,13 +148,15 @@ bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
   # gateway, full wedge on a c6in.large). Cap it so the suite can NEVER hang; on
   # timeout, say so and point at native S3 (the warp PUT above) for real write BW.
   local FIO_WR_TO="${FIO_WRITE_TIMEOUT:-180}"
+  # --percentile_list=50:99 + grep the clat line so the summary can report clat p50/p99
+  # (previously only the WRITE:/READ: bandwidth line was kept, so clat showed n/a).
   if ! sudo timeout -s KILL "$FIO_WR_TO" fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$NJ" \
-       --ioengine=psync --create_on_open=1 --fallocate=none --end_fsync=1 --group_reporting 2>&1 | grep -iE 'WRITE:'; then
+       --ioengine=psync --create_on_open=1 --fallocate=none --end_fsync=1 --percentile_list=50:99 --group_reporting 2>&1 | grep -iE 'WRITE:|clat perc|th=\['; then
     echo "  !! fio mp-s3 WRITE stalled/timed out (>${FIO_WR_TO}s) — mount-s3 FUSE write wedges on large files; use native S3 (warp PUT above) for write throughput"
   fi
   echo "== fio SEQ READ (buffered psync, blobber-served: set ${NJ}x${FSZ} > gw RAM) =="
   sudo fio --name=w --directory="$D" --rw=read --bs=1M --size="$FSZ" --numjobs="$NJ" \
-    --ioengine=psync --fallocate=none --group_reporting 2>&1 | grep -iE 'READ:'
+    --ioengine=psync --fallocate=none --percentile_list=50:99 --group_reporting 2>&1 | grep -iE 'READ:|clat perc|th=\['
   sudo rm -rf "$D"
   fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true; }
 
@@ -257,6 +259,22 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   if [ -z "${MLPERF_ACCELS:-}" ] && [ "${NCPU:-1}" -lt 16 ]; then
     [ "$ACC" -gt 1 ] && echo "  [mlperf] client has $NCPU vCPU (< 16 = *.4xlarge) -> accel 1 instead of $ACC (mount-s3 OOM guard)"
     ACC=1
+  fi
+  # GATEWAY-SIZE guard: mlperf reads are SERVED by the gateway, so a small gateway
+  # (e.g. c6in.large, 2 vCPU) can't feed accel>1 — the train stalls waiting for data
+  # (AU ~45%). accel 1 on a gateway smaller than .4xlarge (<16 vCPU), EC accel (3/4/6)
+  # on a .4xlarge or bigger. Needs CLUSTER_ID + the box's IAM ec2:DescribeInstances.
+  if [ -z "${MLPERF_ACCELS:-}" ] && [ -n "${CLUSTER_ID:-}" ] && command -v aws >/dev/null 2>&1; then
+    local _reg GWTYPE
+    _reg=$(curl -s --max-time 3 http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+    GWTYPE=$(aws ec2 describe-instances --region "${_reg:-${REGION:-us-east-1}}" \
+      --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[].Instances[].InstanceType' --output text 2>/dev/null | head -1)
+    case "$GWTYPE" in
+      *.large|*.xlarge|*.2xlarge)
+        [ "$ACC" -gt 1 ] && echo "  [mlperf] gateway $GWTYPE (< .4xlarge) serves the reads -> accel 1 instead of $ACC (small-gateway read guard)"
+        ACC=1 ;;
+    esac
   fi
   local BATCH="${MLPERF_BATCH:-1200}" EP="${MLPERF_EPOCHS:-1}"
   local NF="${MLPERF_NUM_FILES:-$(( EC_DATASET_GB * 7 ))}" NE="${MLPERF_NUM_EVAL:-64}"

@@ -132,19 +132,31 @@ if t=="warp":
             if med or p99: ttfb="%s/%s"%(med or "n/a",p99 or "n/a")
     rows=[["spec","warp S3 PUT/GET 96MiB conc16 + 1KiB TTFB (client->gateway)"],["PUT",put or "n/a"],["GET",get or "n/a"],["GET TTFB p50/p99",ttfb or "n/a"]]
 elif t=="fio":
-    wr=rd=None
+    wr=rd=nj=sz=wc=rc=None; phase=None; unit="us"
     for ln in c.splitlines():
         s=ln.strip()
+        m=re.search(r"fio WRITE \((\d+) jobs x (\S+?),",s)
+        if m: nj,sz=m.group(1),m.group(2); phase="w"
+        if "fio SEQ READ" in s: phase="r"
         if s.startswith("WRITE:"): wr=thr(s,paren=True)
         elif s.startswith("READ:"): rd=thr(s,paren=True)
-    rows=[["spec","fio 1M seq write (create_on_open) + cold seq read, mount-s3->gateway (client)"],["1M write BW",wr or "n/a"],["1M seq read BW (blobber-served)",rd or "n/a"],
-          ["write clat p50/p99","n/a"],["read clat p50/p99","n/a"]]
+        if "clat percentiles" in s: unit="ms" if "msec" in s else ("s" if "(sec" in s else "us")
+        cm=re.search(r"50\.\d+th=\[\s*([0-9.]+)\].*?99\.\d+th=\[\s*([0-9.]+)\]",s)
+        if cm:
+            v="%s/%s %s"%(cm.group(1),cm.group(2),unit)
+            if phase=="w": wc=v
+            elif phase=="r": rc=v
+    spec="fio %s jobs x %s, 1M blocks, psync (create_on_open), mount-s3->gateway (client)"%(nj or "?",sz or "?")
+    rows=[["spec",spec],["1M write BW",wr or "n/a"],["1M seq read BW (blobber-served)",rd or "n/a"],
+          ["write clat p50/p99",wc or "n/a"],["read clat p50/p99",rc or "n/a"]]
 elif t=="mlperf resnet50":
-    au=io=acc=None
+    au=io=acc=rt=pf=None
     for ln in c.splitlines():
         if "mlperf read" in ln:
-            au=g(r"AU\s*([0-9.]+)",ln); io=g(r"([0-9.]+)\s*MB/s",ln); acc=g(r"accel=([0-9]+)",ln)
-    rows=[["spec","resnet50 dlio via mount-s3, EC-derived accel/rt/pf (client-side train)"],["resnet50 accel-%s"%(acc or "?"),"AU %s%%, %s MB/s"%(au or "n/a",(io or "n/a"))]]
+            au=g(r"AU\s*([0-9.]+)",ln); io=g(r"([0-9.]+)\s*MB/s",ln)
+            acc=g(r"accel=([0-9]+)",ln); rt=g(r"rt=([0-9]+)",ln); pf=g(r"pf=([0-9]+)",ln)
+    spec="resnet50 dlio via mount-s3 · accel %s · read_threads %s · prefetch %s (client-side train)"%(acc or "?",rt or "?",pf or "?")
+    rows=[["spec",spec],["resnet50 accel-%s"%(acc or "?"),"AU %s%%, %s MB/s"%(au or "n/a",io or "n/a")]]
 print(json.dumps(rows))
 PY
 }
@@ -206,7 +218,7 @@ if want mlperf; then
   MB="mlperf_$(date +%s)"; ML=$(mktemp); bl_post "$MB" running "mlperf resnet50" '[]'; sleep 6
   run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
     env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
-    MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
+    MLPERF_IFACE=mps3 MLPERF_KEEP=1 CLUSTER_ID="$CLUSTER_ID" REGION="$REGION" \
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
     "$HERE/run_cluster.sh" mlperf 2>&1 | tee -a "$ML"
