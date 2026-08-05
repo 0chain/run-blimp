@@ -181,7 +181,7 @@ want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) ret
 
 # 1) warp — registered as ONE internal "warp" run (PUT + GET + TTFB), tiers by cdc
 if want warp; then
-  WB="warp_$(date +%s)"; WL=$(mktemp); bl_post "$WB" running warp '[]'
+  WB="warp_$(date +%s)"; WL=$(mktemp); bl_post "$WB" running warp '[]'; sleep 6
   run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb 2>&1 | tee -a "$WL"
   run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp 2>&1 | tee -a "$WL"
   bl_post "$WB" done warp "$(bl_parse warp "$WL")" "$WL"; rm -f "$WL"
@@ -189,7 +189,7 @@ fi
 
 # 2) fio — registered as an internal "fio" run
 if want fio; then
-  FB="fio_$(date +%s)"; FL=$(mktemp); bl_post "$FB" running fio '[]'
+  FB="fio_$(date +%s)"; FL=$(mktemp); bl_post "$FB" running fio '[]'; sleep 6
   run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio 2>&1 | tee -a "$FL"
   bl_post "$FB" done fio "$(bl_parse fio "$FL")" "$FL"; rm -f "$FL"
 fi
@@ -203,7 +203,7 @@ fi
 # then failed with "Transport endpoint is not connected". Override with
 # MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
 if want mlperf; then
-  MB="mlperf_$(date +%s)"; ML=$(mktemp); bl_post "$MB" running "mlperf resnet50" '[]'
+  MB="mlperf_$(date +%s)"; ML=$(mktemp); bl_post "$MB" running "mlperf resnet50" '[]'; sleep 6
   run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
     env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
     MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
