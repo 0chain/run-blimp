@@ -194,6 +194,11 @@ FROM
 # size rescues them. q59 ties on its ORDER BY key (store has 12 rows but only 6
 # distinct s_store_id, so the self-join fans out) and its LIMIT 100 is therefore
 # unstable, which reads as a verify mismatch that is not a real one.
+# Which dataset the gateway answers from — internal (the built-in TPC-DS set,
+# the UI's "Run on TPC SF1") or customer (an external source wired via
+# `blimp --setup`). Default internal: hardcoding "customer" made every run on a
+# fresh cluster return an error the harness rendered as a 0ms non-answer.
+SOURCE="${SOURCE:-internal}"
 BENCH_QNR="${BENCH_QNR:-88}"
 if [ "$BENCH_QNR" != "88" ]; then
   QF="$Q_DIR/q${BENCH_QNR}.sql"
@@ -208,7 +213,7 @@ QLABEL="q${BENCH_QNR}"
 # query and nothing else.
 run_sql(){ curl -s -m 900 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer"}))' "$1")"; }
+  -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2]}))' "$1" "$SOURCE")"; }
 
 # evict an MV so the NEXT identical query re-authors from scratch (clears the
 # sigcache row + warehouse bytes — copied from run.sh's \evict). The author-timing

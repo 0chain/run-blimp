@@ -23,6 +23,23 @@
 set -u
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
 NAMESPACE="${NAMESPACE:-tpcds}"; REGION="${REGION:-ap-south-1}"; CDC_ROWS="${CDC_ROWS:-5000}"
+# SOURCE selects which dataset the gateway answers from. The accepted ids are
+# normalizeSourceID's: internal|demo|sf1|minio -> the BUILT-IN TPC-DS set (the
+# UI's "Run on TPC SF1"), customer|prod|production -> an external Iceberg/S3
+# source the operator wired via `blimp --setup`.
+#
+# Default INTERNAL. This used to be hardcoded "customer", which meant the whole
+# suite could never run on a cluster that had no external source wired — i.e. on
+# every fresh cluster. The gateway refuses loudly and correctly:
+#
+#   "no external Prod source is wired to this node — connect your Iceberg/S3
+#    source (blimp --setup), or use Run on TPC SF1 for the internal dataset"
+#
+# and bench_cdc reported it as `author=? materialize=? cold_serve=0ms mv=?x?
+# (none)` for EVERY query — 19 identical non-answers that look like 19 failures
+# and are actually one wiring error. Observed on cluster 1785947456705,
+# 2026-08-05. Set SOURCE=customer to drive a wired production source.
+SOURCE="${SOURCE:-internal}"
 # QAPI/TOKEN overridable for non-cluster gateways (e.g. the test2 manual stack:
 # QAPI=http://localhost:9100 TOKEN=<ZS3_ADMIN_TOKEN>); defaults keep the
 # run-blimp cluster convention.
@@ -145,7 +162,7 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":"customer","label":sys.argv[2],"skip_verify":not(sys.argv[3]=="1" and sys.argv[5]=="1"),"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":not(sys.argv[3]=="1" and sys.argv[5]=="1"),"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE")"
 }
 
 # ---- MV content signature + THE DELTA GATE -----------------------------------
