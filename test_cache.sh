@@ -79,12 +79,16 @@ run(){ echo; echo ">>> $1"; shift; "$@"; }
 # running run_bench's __tiers__ sampler between the running and done imports. Token
 # = zus-<CLUSTER_ID>; best-effort (skips silently if wiring/py absent).
 BL_TOK="zus-${CLUSTER_ID:-}"
-bl_post(){ # <bid> <status> <type> <metrics_json>
+bl_post(){ # <bid> <status> <type> <metrics_json> [logfile]
   [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] && command -v python3 >/dev/null 2>&1 || return 0
-  BL_ID="$1" BL_ST="$2" BL_TY="$3" BL_M="$4" BL_GW="$GW" BL_CID="$CLUSTER_ID" python3 - <<'PY' 2>/dev/null || true
-import os,json,urllib.request
+  BL_ID="$1" BL_ST="$2" BL_TY="$3" BL_M="$4" BL_LOG="${5:-}" BL_GW="$GW" BL_CID="$CLUSTER_ID" python3 - <<'PY' 2>/dev/null || true
+import os,json,re,urllib.request
 m=json.loads(os.environ["BL_M"] or "[]")
-d=json.dumps({"id":os.environ["BL_ID"],"type":os.environ["BL_TY"],"status":os.environ["BL_ST"],
+lg=""
+try:
+    if os.environ.get("BL_LOG"): lg=re.sub(r"\x1b\[[0-9;]*m","",open(os.environ["BL_LOG"],errors="replace").read())[-200000:]
+except Exception: pass
+d=json.dumps({"id":os.environ["BL_ID"],"type":os.environ["BL_TY"],"status":os.environ["BL_ST"],"log":lg,
   "summary":{"type":os.environ["BL_TY"],"metrics":m,"config":"run-blimp client-side run","status":os.environ["BL_ST"]}}).encode()
 r=urllib.request.Request("http://%s:9401/bench/import"%os.environ["BL_GW"],data=d,
   headers={"Authorization":"Bearer zus-"+os.environ["BL_CID"],"Content-Type":"application/json"},method="POST")
@@ -126,24 +130,21 @@ if t=="warp":
         elif "TTFB:" in s:
             med=g(r"Median:\s*([0-9a-z]+)",s); p99=g(r"99th:\s*([0-9a-z]+)",s)
             if med or p99: ttfb="%s/%s"%(med or "n/a",p99 or "n/a")
-    rows=[["spec","warp S3 PUT/GET 96MiB conc16 + 1KiB TTFB (client->gateway)"],["validation","n/a"],
-          ["PUT",put or "n/a"],["GET",get or "n/a"],["GET TTFB p50/p99",ttfb or "n/a"]]
+    rows=[["spec","warp S3 PUT/GET 96MiB conc16 + 1KiB TTFB (client->gateway)"],["PUT",put or "n/a"],["GET",get or "n/a"],["GET TTFB p50/p99",ttfb or "n/a"]]
 elif t=="fio":
     wr=rd=None
     for ln in c.splitlines():
         s=ln.strip()
         if s.startswith("WRITE:"): wr=thr(s,paren=True)
         elif s.startswith("READ:"): rd=thr(s,paren=True)
-    rows=[["spec","fio 1M seq write (create_on_open) + cold seq read, mount-s3->gateway (client)"],["validation","n/a"],
-          ["1M write BW",wr or "n/a"],["1M seq read BW (blobber-served)",rd or "n/a"],
+    rows=[["spec","fio 1M seq write (create_on_open) + cold seq read, mount-s3->gateway (client)"],["1M write BW",wr or "n/a"],["1M seq read BW (blobber-served)",rd or "n/a"],
           ["write clat p50/p99","n/a"],["read clat p50/p99","n/a"]]
 elif t=="mlperf resnet50":
     au=io=acc=None
     for ln in c.splitlines():
         if "mlperf read" in ln:
             au=g(r"AU\s*([0-9.]+)",ln); io=g(r"([0-9.]+)\s*MB/s",ln); acc=g(r"accel=([0-9]+)",ln)
-    rows=[["spec","resnet50 dlio via mount-s3, EC-derived accel/rt/pf (client-side train)"],["validation","n/a"],
-          ["resnet50 accel-%s"%(acc or "?"),"AU %s%%, %s MB/s"%(au or "n/a",(io or "n/a"))]]
+    rows=[["spec","resnet50 dlio via mount-s3, EC-derived accel/rt/pf (client-side train)"],["resnet50 accel-%s"%(acc or "?"),"AU %s%%, %s MB/s"%(au or "n/a",(io or "n/a"))]]
 print(json.dumps(rows))
 PY
 }
@@ -183,14 +184,14 @@ if want warp; then
   WB="warp_$(date +%s)"; WL=$(mktemp); bl_post "$WB" running warp '[]'
   run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb 2>&1 | tee -a "$WL"
   run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp 2>&1 | tee -a "$WL"
-  bl_post "$WB" done warp "$(bl_parse warp "$WL")"; rm -f "$WL"
+  bl_post "$WB" done warp "$(bl_parse warp "$WL")" "$WL"; rm -f "$WL"
 fi
 
 # 2) fio — registered as an internal "fio" run
 if want fio; then
   FB="fio_$(date +%s)"; FL=$(mktemp); bl_post "$FB" running fio '[]'
   run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio 2>&1 | tee -a "$FL"
-  bl_post "$FB" done fio "$(bl_parse fio "$FL")"; rm -f "$FL"
+  bl_post "$FB" done fio "$(bl_parse fio "$FL")" "$FL"; rm -f "$FL"
 fi
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
@@ -209,7 +210,7 @@ if want mlperf; then
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
     "$HERE/run_cluster.sh" mlperf 2>&1 | tee -a "$ML"
-  bl_post "$MB" done "mlperf resnet50" "$(bl_parse 'mlperf resnet50' "$ML")"; rm -f "$ML"
+  bl_post "$MB" done "mlperf resnet50" "$(bl_parse 'mlperf resnet50' "$ML")" "$ML"; rm -f "$ML"
 fi
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
