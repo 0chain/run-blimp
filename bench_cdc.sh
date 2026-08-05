@@ -78,7 +78,30 @@ else
   # expands 2^k-1 inclusion-exclusion terms and each unchanged fact binds at
   # FULL size — q64 (2 facts/branch, 6 terms) took 702 s at SF1000 before being
   # killed, against 133-471 ms for the single-fact recipes above.
-  SUITES="${SUITES:-store_sales:13 59 88 9}"
+  # PLUS the 15 linear-core recipes now embedded in the gateway binary
+  # (mv_linear_recipes.json, imported into rag_authors at boot). They are here
+  # so a run EXERCISES them — embedding a recipe nothing runs proves nothing.
+  # Grouped by the fact whose append should move each query's MV:
+  #
+  #   store_sales  q47 q70 q24 q13 q59 q88 q9   single-fact, store-driven
+  #                q4 q11 q14 q23 q31 q51 q17   multi-channel, store is the
+  #                q5 q80 q49                    largest contributor
+  #   catalog_sales q72                          cs x inventory
+  #   web_sales     q95                          web-only
+  #
+  # STATUS, so a red slot is read correctly rather than chased:
+  #   PROVEN at SF1000 (mode=APPEND measured): q13 q59 q88 q9 q14 q24 q4 q11 q23
+  #   PROVEN at SF1 by their authoring agents, NEVER verified by a gateway:
+  #     q5 q17 q31 q47 q49 q51 q70 q72 q80 q95 — these import with an EMPTY
+  #     row_hash on purpose, so THIS cluster's verifier decides. A first-run
+  #     failure on one of them is information, not a regression.
+  #   EXPECTED NOT to merge: q72 ships cover-only (no sound delta exists);
+  #     q17 and q49 have >1 fact per branch, so their merges are 2^k-1 terms.
+  #
+  # Set QNRS/SUITES to trim this; it is deliberately broad because the point of
+  # a fresh-cluster run is to find out which recipes survive contact with real
+  # data, not to confirm the four we already know about.
+  SUITES="${SUITES:-store_sales:13 59 88 9 47 70 24 4 11 14 23 31 51 17 5 80 49;catalog_sales:72;web_sales:95}"
 fi
 declare -A SQL FACT; NAMES=()
 IFS=';' read -ra SUITE_ARR <<< "$SUITES"
