@@ -267,9 +267,15 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   if [ -z "${MLPERF_ACCELS:-}" ] && [ -n "${CLUSTER_ID:-}" ] && command -v aws >/dev/null 2>&1; then
     local _reg GWTYPE
     _reg=$(curl -s --max-time 3 http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
-    GWTYPE=$(aws ec2 describe-instances --region "${_reg:-${REGION:-us-east-1}}" \
+    # test_cache.sh exports the GATEWAY S3 keys as AWS_ACCESS_KEY_ID/SECRET globally
+    # (for warp/aws-s3 against the gateway endpoint). This describe hits REAL AWS EC2,
+    # so unset those first (env -u) — otherwise it AuthFailures to empty and the guard
+    # silently skips, leaving accel at the EC default on a small gateway.
+    GWTYPE=$(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+      aws ec2 describe-instances --region "${_reg:-${REGION:-us-east-1}}" \
       --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
       --query 'Reservations[].Instances[].InstanceType' --output text 2>/dev/null | head -1)
+    [ -z "$GWTYPE" ] && echo "  [mlperf] gw-guard: could not resolve gateway type (CLUSTER_ID=${CLUSTER_ID:-} region=${_reg:-${REGION:-?}}) — accel stays $ACC"
     case "$GWTYPE" in
       *.large|*.xlarge|*.2xlarge)
         [ "$ACC" -gt 1 ] && echo "  [mlperf] gateway $GWTYPE (< .4xlarge) serves the reads -> accel 1 instead of $ACC (small-gateway read guard)"

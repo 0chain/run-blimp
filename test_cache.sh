@@ -141,7 +141,7 @@ elif t=="fio":
         if s.startswith("WRITE:"): wr=thr(s,paren=True)
         elif s.startswith("READ:"): rd=thr(s,paren=True)
         if "clat percentiles" in s: unit="ms" if "msec" in s else ("s" if "(sec" in s else "us")
-        cm=re.search(r"50\.\d+th=\[\s*([0-9.]+)\].*?99\.\d+th=\[\s*([0-9.]+)\]",s)
+        cm=re.search(r"50(?:\.\d+)?th=\[\s*([0-9.]+)\].*?99(?:\.\d+)?th=\[\s*([0-9.]+)\]",s)
         if cm:
             v="%s/%s %s"%(cm.group(1),cm.group(2),unit)
             if phase=="w": wc=v
@@ -222,7 +222,10 @@ if want mlperf; then
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
     "$HERE/run_cluster.sh" mlperf 2>&1 | tee -a "$ML"
-  bl_post "$MB" done "mlperf resnet50" "$(bl_parse 'mlperf resnet50' "$ML")" "$ML"; rm -f "$ML"
+  # A train that dies (corrupt tfrecord, mount-s3 drop, OOM) prints no "mlperf read"
+  # summary line — post it as FAILED, not a misleading "done" with accel-?/AU n/a.
+  if grep -q "mlperf read" "$ML"; then MST=done; else MST=failed; fi
+  bl_post "$MB" "$MST" "mlperf resnet50" "$(bl_parse 'mlperf resnet50' "$ML")" "$ML"; rm -f "$ML"
 fi
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
