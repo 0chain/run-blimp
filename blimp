@@ -1038,22 +1038,20 @@ cmd_storage(){
   # with partial data — --storage runs HERE, so the gateway has no live view. To
   # give the SAME live UI, a background heartbeat POSTs the partial results to
   # cdc_service every <180s as status=running (the UI shows the live row), and we
-  # finalize as "done" when the suite exits. Was `exec`; now we stay in-process.
-  local _slog; _slog=$(mktemp "${TMPDIR:-/tmp}/blimp_storage.XXXXXX.log")
-  local _rid="storage_$(date +%s)"; : > "$_slog"
-  storage_heartbeat "$_slog" "$_rid" & local _hbpid=$!
+  # exits. Each leg (warp/fio/mlperf) now registers its OWN internal-format run from
+  # inside test_cache.sh — identical type + labels to the gateway's run_bench rows,
+  # with cdc sampling the tier columns via __tiers__ — so there is no combined
+  # "storage (client)" heartbeat here anymore. CLUSTER_ID is forwarded so the
+  # per-leg POST /bench/import is authed (Bearer zus-<CLUSTER_ID>).
   env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
+    CLUSTER_ID="$CLUSTER_ID" \
     REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     STORAGE_LEGS="${STORAGE_LEGS:-}" \
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
-    NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh" 2>&1 | tee "$_slog"
-  local _rc=${PIPESTATUS[0]}
-  kill "$_hbpid" 2>/dev/null || true; wait "$_hbpid" 2>/dev/null || true
-  storage_import "$_slog" "$_rid" "done" || true   # finalize the SAME UI row
-  rm -f "$_slog" 2>/dev/null || true
-  exit "$_rc"
+    NAMESPACE="${NAMESPACE:-tpcds}" bash "$HERE/test_cache.sh"
+  exit $?
 }
 
 # storage_heartbeat <logfile> <id> — while --storage runs, push its partial

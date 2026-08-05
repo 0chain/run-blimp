@@ -74,6 +74,80 @@ CAP="${CAP:-/tmp/test_cache_out.log}"; : > "$CAP"
 exec > >(tee -a "$CAP") 2>&1
 run(){ echo; echo ">>> $1"; shift; "$@"; }
 
+# --- register each leg as an ORDINARY internal run (identical type + labels to the
+# gateway's own run_bench fio/warp/mlperf rows). cdc auto-fills the tier columns by
+# running run_bench's __tiers__ sampler between the running and done imports. Token
+# = zus-<CLUSTER_ID>; best-effort (skips silently if wiring/py absent).
+BL_TOK="zus-${CLUSTER_ID:-}"
+bl_post(){ # <bid> <status> <type> <metrics_json>
+  [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] && command -v python3 >/dev/null 2>&1 || return 0
+  BL_ID="$1" BL_ST="$2" BL_TY="$3" BL_M="$4" BL_GW="$GW" BL_CID="$CLUSTER_ID" python3 - <<'PY' 2>/dev/null || true
+import os,json,urllib.request
+m=json.loads(os.environ["BL_M"] or "[]")
+d=json.dumps({"id":os.environ["BL_ID"],"type":os.environ["BL_TY"],"status":os.environ["BL_ST"],
+  "summary":{"type":os.environ["BL_TY"],"metrics":m,"config":"run-blimp client-side run","status":os.environ["BL_ST"]}}).encode()
+r=urllib.request.Request("http://%s:9401/bench/import"%os.environ["BL_GW"],data=d,
+  headers={"Authorization":"Bearer zus-"+os.environ["BL_CID"],"Content-Type":"application/json"},method="POST")
+try: urllib.request.urlopen(r,timeout=15)
+except Exception: pass
+PY
+}
+# parse a captured leg log into internal-format [label,value] rows (identical labels
+# to run_bench). throughput normalised to decimal MB/s (GB/s >=1000).
+bl_parse(){ # <type> <logfile>  -> metrics json on stdout
+  BL_TYPE="$1" BL_LOG="$2" python3 - <<'PY' 2>/dev/null || echo '[]'
+import os,re,json
+t=os.environ["BL_TYPE"]
+try: c=re.sub(r"\x1b\[[0-9;]*m","",open(os.environ["BL_LOG"],errors="replace").read())
+except Exception: c=""
+def to_mb(v,u):
+    v=float(v); u=u.lower()
+    return v*(1073.741824 if u.startswith("gib") else 1.048576 if u.startswith("mib") else 1000.0 if u.startswith("gb") else 1.0 if u.startswith("mb") else 0.001048576 if u.startswith("kib") else 0.001)
+def fmt(mb): return "%.2f GB/s"%(mb/1000.0) if mb>=1000 else "%d MB/s"%round(mb)
+def thr(s,paren=False):
+    if paren:
+        m=re.search(r"\(([0-9.]+)\s*(GB/s|MB/s|KB/s)\)",s)
+        if m: return fmt(to_mb(m.group(1),m.group(2)))
+    m=re.search(r"([0-9.]+)\s*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s)",s)
+    return fmt(to_mb(m.group(1),m.group(2))) if m else None
+def g(rx,s,gr=1):
+    m=re.search(rx,s); return m.group(gr) if m else None
+rows=[]
+if t=="warp":
+    put=get=ttfb=None; ctx=None
+    for ln in c.splitlines():
+        s=ln.strip()
+        if "== warp PUT" in s: ctx="P"
+        elif "== warp GET" in s: ctx="G"
+        elif s.startswith("* Average:"):
+            v=thr(s)
+            if v and ctx=="P": put=v
+            elif v and ctx=="G": get=v
+        elif "TTFB:" in s:
+            med=g(r"Median:\s*([0-9a-z]+)",s); p99=g(r"99th:\s*([0-9a-z]+)",s)
+            if med or p99: ttfb="%s/%s"%(med or "n/a",p99 or "n/a")
+    rows=[["spec","warp S3 PUT/GET 96MiB conc16 + 1KiB TTFB (client->gateway)"],["validation","n/a"],
+          ["PUT",put or "n/a"],["GET",get or "n/a"],["GET TTFB p50/p99",ttfb or "n/a"]]
+elif t=="fio":
+    wr=rd=None
+    for ln in c.splitlines():
+        s=ln.strip()
+        if s.startswith("WRITE:"): wr=thr(s,paren=True)
+        elif s.startswith("READ:"): rd=thr(s,paren=True)
+    rows=[["spec","fio 1M seq write (create_on_open) + cold seq read, mount-s3->gateway (client)"],["validation","n/a"],
+          ["1M write BW",wr or "n/a"],["1M seq read BW (blobber-served)",rd or "n/a"],
+          ["write clat p50/p99","n/a"],["read clat p50/p99","n/a"]]
+elif t=="mlperf resnet50":
+    au=io=acc=None
+    for ln in c.splitlines():
+        if "mlperf read" in ln:
+            au=g(r"AU\s*([0-9.]+)",ln); io=g(r"([0-9.]+)\s*MB/s",ln); acc=g(r"accel=([0-9]+)",ln)
+    rows=[["spec","resnet50 dlio via mount-s3, EC-derived accel/rt/pf (client-side train)"],["validation","n/a"],
+          ["resnet50 accel-%s"%(acc or "?"),"AU %s%%, %s MB/s"%(au or "n/a",(io or "n/a"))]]
+print(json.dumps(rows))
+PY
+}
+
 # Leg selector. --storage was all-or-nothing, so re-measuring ONE leg re-paid the
 # others: every mlperf attempt first re-ran ~12 min of warp and ~7 min of fio for
 # numbers already in hand. run_cluster.sh has always accepted the legs
@@ -104,12 +178,20 @@ want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) ret
 # (seen live 2026-07-17 at alloc 94.7%). Check with:
 #   curl -s "http://$GW:9000/admin/alloc/usage?token=zus-<cluster-id>"
 
-# 1) warp (S3 :9000) — 1KiB TTFB then 96MiB PUT/GET at EC concurrency (16 for 2/1)
-want warp && run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb
-want warp && run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp
+# 1) warp — registered as ONE internal "warp" run (PUT + GET + TTFB), tiers by cdc
+if want warp; then
+  WB="warp_$(date +%s)"; WL=$(mktemp); bl_post "$WB" running warp '[]'
+  run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb 2>&1 | tee -a "$WL"
+  run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp 2>&1 | tee -a "$WL"
+  bl_post "$WB" done warp "$(bl_parse warp "$WL")"; rm -f "$WL"
+fi
 
-# 2) fio (NFS) — write + cold sequential read
-want fio && run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio
+# 2) fio — registered as an internal "fio" run
+if want fio; then
+  FB="fio_$(date +%s)"; FL=$(mktemp); bl_post "$FB" running fio '[]'
+  run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" fio 2>&1 | tee -a "$FL"
+  bl_post "$FB" done fio "$(bl_parse fio "$FL")"; rm -f "$FL"
+fi
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
 # Params come from detect_ec (EC 2/1 -> accel 3 / rt 12 / pf 24), the SAME table
@@ -119,12 +201,16 @@ want fio && run "2/4 fio (mount-s3 write + cold seq read)" env GW="$GW" NFS="$GW
 # memory cgroup: the FUSE mount died 14 files into a 476-file read and every rank
 # then failed with "Transport endpoint is not connected". Override with
 # MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
-want mlperf && run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
-  env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
-  MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
-  MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
-  MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
-  "$HERE/run_cluster.sh" mlperf
+if want mlperf; then
+  MB="mlperf_$(date +%s)"; ML=$(mktemp); bl_post "$MB" running "mlperf resnet50" '[]'
+  run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
+    env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
+    MLPERF_IFACE=mps3 MLPERF_KEEP=1 \
+    MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
+    MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
+    "$HERE/run_cluster.sh" mlperf 2>&1 | tee -a "$ML"
+  bl_post "$MB" done "mlperf resnet50" "$(bl_parse 'mlperf resnet50' "$ML")"; rm -f "$ML"
+fi
 
 # 4) read-through cache: direct-S3 vs cache-S3 vs cache-mp-s3 vs cache-NFS
 want cache && run "4/4 read-through cache ($CACHE_TABLE via router)" \
