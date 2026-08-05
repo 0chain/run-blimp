@@ -34,6 +34,9 @@ else                    EC_CONC=16; EC_FIO_JOBS=16; EC_FIO_IODEPTH=16; EC_FIO_MI
   # 68 GiB set = 2x the 32 GiB gateway RAM: the warp GET can NOT be served from
   # gateway page cache (34 GiB barely exceeded RAM and read cache-favorably).
   EC_DATASET_GB=68;  EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
+# WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster
+# to conc=64 to see if more parallel GET streams lift blobber-served read throughput).
+EC_CONC="${WARP_CONC:-$EC_CONC}"
 FJ="${FIO_JOBS:-$EC_FIO_JOBS}"; FSZ="${FIO_SIZE:-${EC_FIO_MIB}M}"; FID="$EC_FIO_IODEPTH"
 echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC fio-jobs=$EC_FIO_JOBS fio-iodepth=$EC_FIO_IODEPTH per-stream=${EC_FIO_MIB}MiB obj=$OSZ mlperf-accel=$EC_ACCEL rt=$EC_RT pf=$EC_PF"
 
@@ -66,6 +69,12 @@ bench_ttfb(){ echo "== 1KiB TTFB (PUT conc=$EC_CONC 10s, GET conc=1 ${TTFB_DUR}s
 # set (> gateway RAM) — a fixed 30s only writes ~24GB and the GET then reads a
 # cache-favorable subset. Match it: probe 8s, set PUT_DUR = budget*1.1/rate (floor DUR).
 bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
+  # Start clean. warp PUT uses --keep-data (the GET reads back what PUT wrote),
+  # so a killed/hung PUT leaves the full ~EC_DATASET_GB set on the blobbers. That
+  # both skews the next GET and — on a disk sized for ONE dataset — starves the
+  # very next write into disk_full (which mount-s3/warp then hang on). Purge the
+  # warp scratch buckets BEFORE writing, same as bench_fio does for its bucket.
+  clean_bkt warpbench warpprobe
   echo "== warp probe (8s) to size PUT to ${BUD}MiB set =="
   local PR; PR=$(W put --bucket=warpprobe --obj.size="$OSZ" --concurrent="$EC_CONC" --duration=8s 2>&1 | grep -oE 'Average: [0-9.]+ [KMGT]?i?B/s' | head -1 | awk '{v=$2+0;u=$3; if(u~/GiB/)v*=1024; else if(u~/KiB/)v/=1024; printf "%d",v}')
   [ -z "$PR" ] || [ "$PR" -le 0 ] && PR=0
@@ -217,6 +226,15 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # EXACT run_bench resnet50 profile (zs3-init line 10936 / train line 11173):
   #   2/1 -> accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain 34*7=238 / neval 64
   #   8/1 -> accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain 136*7=952 / neval 64
+  # TUNING NOTE (2026-08-04, cluster 1785851761080 / c6in.4xlarge, 66 GB set over
+  # mp-s3): the EC-2/1 default (accel 3 / rt 12 / pf 24) is AU-bound and reads
+  #   1682 MB/s (AU 98%). Bumping to accel 4 / rt 16 / pf 32 lifts it to ~2164 MB/s
+  #   (AU 96%, ~15.4k -> ~19.8k samples/s) — more torch ranks + read threads +
+  #   prefetch depth saturate the read path harder. Override for that run with:
+  #     MLPERF_ACCELS=4 MLPERF_READ_THREADS=16 MLPERF_PREFETCH=32
+  #   (needs a >=16 vCPU client, else the accel-1 mount-s3 OOM guard below forces 1).
+  #   ACID on/off makes ~no difference here (mlperf is AU-bound; see
+  #   devOps/0chain-debug/zs3_acid_concurrent_download_corruption_20260804.md).
   local ACC="${MLPERF_ACCELS:-$EC_ACCEL}" RT="${MLPERF_READ_THREADS:-$EC_RT}" PF="${MLPERF_PREFETCH:-$EC_PF}"
   # ACCEL 1 ON ANY CLIENT SMALLER THAN A *.4xlarge (16 vCPU).
   # The EC-derived profile (2/1 -> accel 3) is the CLUSTER's run_bench profile and
