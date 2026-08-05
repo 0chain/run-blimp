@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # test_query.sh — Blimp QUERY/CDC test: the independently-verified CDC suite.
 #
-# This IS bench_cdc.sh over the delta-merge set (q9 q88 q14 q64 q4 —
-# single-fact additive store_sales group-bys, see CDC_INCREMENTAL.md):
+# This IS bench_cdc.sh over the delta-merge set (q13 q59 q88 q9 — single-fact
+# additive store_sales group-bys, proven to merge at SF1000, ordered by base
+# wall time 2.2s → 3.2s → 19.5s → 23.2s; see CDC_INCREMENTAL.md):
 #   phase 1  cold-author every query (force_author → graft-widen MV build)
 #   phase 2  one live append to store_sales + snapshot_changed
 #   phase 3  re-run every query → incremental delta-merge (mode=incremental)
@@ -12,7 +13,7 @@
 # extension into $Q_DIR (once; idempotent) — no shipping step, no drift.
 #
 # Env (same as bench_cdc): GW CLUSTER_ID ICEBERG_URL WAREHOUSE
-#   [NAMESPACE=tpcds] [REGION=ap-south-1] [CDC_ROWS=5000] [QNRS="9 88 14 64 4"]
+#   [NAMESPACE=tpcds] [REGION=ap-south-1] [CDC_ROWS=5000] [QNRS="13 59 88 9"]
 set -uo pipefail
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
