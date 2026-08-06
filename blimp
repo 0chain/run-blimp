@@ -1236,6 +1236,11 @@ cmd_acid(){
     elif printf '%s\n' "$out" | grep -qE 'NOT LINEARIZABLE|result=Illegal'; then
       acid_fail=$((acid_fail+1)); acid_bad="$acid_bad|FAIL $label/$profile"
     else
+      # A NO-RESULT leg means ptest died BEFORE any verdict — almost always the
+      # seed PUT. Its reason is the whole diagnosis, so print it: greping only
+      # for RESULT threw the error away and left the leg silently unexplained
+      # ("404 NoSuchBucket" on the router looked identical to "unreachable").
+      printf '%s\n' "$out" | grep -v '^$' | tail -2 | sed 's/^/     ! /'
       acid_noresult=$((acid_noresult+1)); acid_bad="$acid_bad|NO-RESULT $label/$profile"
     fi
   }
@@ -1252,7 +1257,29 @@ cmd_acid(){
 
   bold "ACID / linearizability — node $GW  (bucket s3://$BKT)"
   run_leg "gateway S3 :$S3_PORT"  -mode s3     -endpoint "$GW:$S3_PORT"
-  run_leg "router :$ROUTER_PORT"  -mode router -endpoint "$GW:$ROUTER_PORT"
+
+  # The router is a READ-THROUGH cache: it proxies writes to whatever origin
+  # --setup retargeted it at, NOT to the gateway's own S3. So creating $BKT on
+  # :9000 (above) is not enough — the origin needs it too, or every seed PUT
+  # through :8088 dies "404 NoSuchBucket" and the leg reports no verdict. That
+  # is the recommended prod wiring, so the router leg was unrunnable by default.
+  router_ready=1
+  if [ -n "${S3_ENDPOINT:-}" ]; then
+    AWS_ACCESS_KEY_ID="${S3_KEY:-$GW_AK}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-$GW_SK}" \
+      aws s3 mb "s3://$BKT" --endpoint-url "$S3_ENDPOINT" >/dev/null 2>&1 || true
+    AWS_ACCESS_KEY_ID="${S3_KEY:-$GW_AK}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-$GW_SK}" \
+      aws s3 ls "s3://$BKT" --endpoint-url "$S3_ENDPOINT" >/dev/null 2>&1 || router_ready=0
+  fi
+  if [ "$router_ready" = 1 ]; then
+    run_leg "router :$ROUTER_PORT"  -mode router -endpoint "$GW:$ROUTER_PORT"
+  else
+    # Say so loudly and count it — an unrunnable leg is not a pass, but it is
+    # also not evidence of a consistency bug, and must not read as one.
+    echo; bold "== router :$ROUTER_PORT =="
+    echo "!! router leg SKIPPED: test bucket s3://$BKT absent on the router origin (${S3_ENDPOINT:-unset})"
+    echo "   the router writes through to the origin; create the bucket there to run this leg."
+    acid_noresult=$((acid_noresult+2)); acid_bad="$acid_bad|SKIPPED router (origin lacks s3://$BKT)"
+  fi
 
   # mountpoint-s3 leg — mount the bucket as a filesystem over the gateway S3 and
   # run the file backend against it. Always remount (a stale FUSE endpoint reads
