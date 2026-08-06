@@ -1220,6 +1220,33 @@ cmd_acid(){
   export AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" AWS_REGION=us-east-1
   aws s3 mb "s3://$BKT" --endpoint-url "http://$GW:$S3_PORT" >/dev/null 2>&1 || true
 
+  # ── ACID must be ARMED for this test, and only for this test ───────────────
+  #
+  # The gateway defaults ZS3_ACID_ALL to OFF (2026-08-06): the warp benchmark
+  # that argued strict whole-file verify was free is the same tool that produced
+  # the phantom EOF errors, so it cannot be used to justify paying that cost on
+  # every deployment. A linearizability test against a gateway with ACID off is
+  # measuring the wrong configuration and will report torn reads that say
+  # nothing about the ACID path.
+  #
+  # So: turn it ON here, and turn it back OFF when we are done — including on
+  # failure or Ctrl-C, via the trap. POST /admin/acid is a RUNTIME pin and is
+  # NOT persisted, so a gateway restart reverts to ZS3_ACID_ALL regardless;
+  # this only affects the live process for the duration of the run.
+  acid_pin(){ # <true|false>
+    curl -s -m 15 -o /dev/null -X POST "http://$GW:$S3_PORT/admin/acid" \
+      -H "Authorization: Bearer zus-${CLUSTER_ID:-}" -H "Content-Type: application/json" \
+      -d "{\"enabled\":$1}" 2>/dev/null || true
+  }
+  ACID_WAS=$(curl -s -m 15 "http://$GW:$S3_PORT/admin/acid" \
+    -H "Authorization: Bearer zus-${CLUSTER_ID:-}" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
+  [ -n "$ACID_WAS" ] || ACID_WAS=false
+  bold "== arming ACID for the test (was: $ACID_WAS) =="
+  acid_pin true
+  # Restore on ANY exit path — a test that leaves the gateway pinned would make
+  # every later benchmark measure the ACID cost without saying so.
+  trap 'bold "== restoring ACID to $ACID_WAS =="; acid_pin "$ACID_WAS"' RETURN INT TERM
+
   # Per-leg verdict tracking. The summary MUST reflect what actually happened —
   # a leg is one of: PASS (RESULT: LINEARIZABLE), FAIL (NOT LINEARIZABLE / any
   # result=Illegal), or NO-RESULT (the checker produced no verdict at all —

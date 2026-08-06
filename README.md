@@ -254,6 +254,35 @@ that this distributed stack still behaves like one correct store: a value you
 just wrote is the value everyone reads, and a read that races an overwrite
 never returns a stale copy or a torn mix of the old and new bytes.
 
+> **ACID is OFF by default on the gateway, and `--acid` turns it on for you.**
+> As of 2026-08-06 the gateway defaults `ZS3_ACID_ALL` to off: the warp
+> benchmark that argued strict whole-file verify was free is the same tool that
+> produced the phantom `EOF` errors, so it cannot be used to justify paying that
+> cost on every deployment. `ZS3_ACID_BUCKETS` still keeps the MV warehouse
+> buckets strict.
+>
+> `blimp --acid` arms it via `POST /admin/acid` before the run and restores the
+> previous setting afterwards — including on failure or Ctrl-C. That pin is a
+> RUNTIME setting and is not persisted, so a gateway restart reverts to
+> `ZS3_ACID_ALL` regardless.
+>
+> **If you run the porcupine checker by hand, arm it yourself first** — a
+> linearizability test against a gateway with ACID off is measuring the wrong
+> configuration, and any torn read it reports says nothing about the ACID path:
+>
+> ```bash
+> curl -X POST http://$GW:9000/admin/acid \
+>   -H "Authorization: Bearer zus-$CLUSTER_ID" \
+>   -H 'Content-Type: application/json' -d '{"enabled":true}'
+> # ... run the test ...
+> curl -X POST http://$GW:9000/admin/acid \
+>   -H "Authorization: Bearer zus-$CLUSTER_ID" \
+>   -H 'Content-Type: application/json' -d '{"enabled":false}'
+> ```
+>
+> Leaving it pinned on makes every LATER benchmark quietly pay the ACID cost —
+> which is exactly how a misleading measurement gets made.
+
 It uses [porcupine](https://github.com/anishathalye/porcupine), the same
 linearizability model-checker used in Jepsen distributed-systems testing. Many
 clients hammer the same keys with concurrent writes and reads; porcupine then
