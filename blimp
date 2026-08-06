@@ -88,6 +88,11 @@ CLUSTER_ID=$CLUSTER_ID
 GW=$GW
 GATEWAY=$GW
 ICEBERG_URL=$ICEBERG_URL
+# The address LOCAL tools dial. Empty when the catalog is someone else's (then
+# ICEBERG_URL is the only correct address). Set only when THIS node runs it, so
+# seed_tpcds.py etc. never loop out through our own public IP and get blocked by
+# our own security group — see local_host().
+ICEBERG_URL_LOCAL=${ICEBERG_URL_LOCAL:-}
 WAREHOUSE=$WAREHOUSE
 ORIGIN_BUCKET=$ORIGIN_BUCKET
 NAMESPACE=$NAMESPACE
@@ -131,6 +136,38 @@ this_host(){
   hostname -I 2>/dev/null | awk '{print $1}'
 }
 
+# ---- the address THIS node uses to reach services THIS node runs -------------
+#
+# NOT the same question as this_host(). this_host() answers "what address does
+# the CLUSTER use to reach me?" and is correctly the PUBLIC address in external
+# mode. Reusing that for our OWN calls makes the box dial itself through the
+# public path, which a normal restrictive security group blocks:
+#
+#   ConnectTimeout host='18.141.209.155' port=8181  /v1/config?warehouse=...
+#
+# That is what killed the CDC tick on cluster 1786037195000 (2026-08-06) — 0 rows
+# appended, so nothing went stale, so nothing delta-merged, and the whole query
+# suite reported "full re-author / NO-BASELINE". The optimizer was fine; the test
+# never fed it. It reads as an optimizer regression, which is why this deserves
+# its own function rather than a comment on this_host().
+#
+# Anything we started locally is reachable on loopback, always, regardless of
+# security groups, NAT, or which cloud we are on.
+local_host(){
+  # Only meaningful for services this script stood up. If the catalog/S3 are
+  # SOMEONE ELSE'S (the user supplied ICEBERG_URL / S3_ENDPOINT), loopback is
+  # wrong and the caller must keep using the real address.
+  printf '127.0.0.1'
+}
+
+# local_url — rewrite a URL we advertise into one we can dial ourselves. Used for
+# services THIS script started; a caller-supplied endpoint is returned unchanged.
+local_url(){ # <url> <started_here:0|1>
+  local u="$1" mine="${2:-0}"
+  [ "$mine" = "1" ] || { printf '%s' "$u"; return; }
+  printf '%s' "$u" | sed -E "s|://[^/:]+|://$(local_host)|"
+}
+
 # ---- stand up an Iceberg REST catalog here (docker compose) ------------------
 # A single `docker run` — no compose plugin needed on the client box (the only
 # thing that ever required it). The catalog is one container; compose bought us
@@ -163,6 +200,7 @@ standup_iceberg(){
               | sed -n 's/^CATALOG_URI=//p' | head -1)
     if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ] && [ "${cur_uri#*transaction_mode=IMMEDIATE}" != "$cur_uri" ]; then
       ICEBERG_URL="http://$(this_host):8181"
+      ICEBERG_URL_LOCAL="http://$(local_host):8181"; export ICEBERG_URL_LOCAL
       bold "  Iceberg catalog already up over $WAREHOUSE — reusing it ($ICEBERG_URL)"
       return 0
     fi
@@ -209,7 +247,11 @@ standup_iceberg(){
   done
   curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1 || die "Iceberg catalog did not come up on :8181 (check: $DKR logs iceberg-rest)"
   ICEBERG_URL="http://$(this_host):8181"
-  bold "  Iceberg catalog up — cluster reaches it at $ICEBERG_URL"
+  # The cluster reaches it at ICEBERG_URL; WE reach it on loopback. Both are
+  # written to the wiring so local tools (seed_tpcds.py, register_tpcds_tables.py)
+  # never dial our own public address.
+  ICEBERG_URL_LOCAL="http://$(local_host):8181"; export ICEBERG_URL_LOCAL
+  bold "  Iceberg catalog up — cluster reaches it at $ICEBERG_URL (local tools use $ICEBERG_URL_LOCAL)"
 }
 
 # ---- create an S3 warehouse bucket here (awscli) ----------------------------

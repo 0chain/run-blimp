@@ -299,6 +299,14 @@ for ft in $(facts_of); do
   # 4:2:1 store:catalog:web with returns at ~10% of their parent, which is what
   # `seed_tpcds.py --tick` emits (--ratios / --returns-ratio to change it).
   #
+  # --catalog prefers ICEBERG_URL_LOCAL: seed_tpcds.py runs HERE, while
+  # ICEBERG_URL is the address the CLUSTER uses — in external mode that is this
+  # node's PUBLIC ip, and dialling our own public ip is blocked by any
+  # restrictive security group. That timed out on cluster 1786037195000
+  # (2026-08-06), added 0 rows, and made every query below report "full
+  # re-author / NO-BASELINE" — which reads like an optimizer regression but is
+  # a connectivity failure.
+  #
   # It is also ONE process, which is what lets returns be REFERENTIAL: the
   # returns rows are keyed on (item_sk, ticket/order number) of the sales rows
   # written microseconds earlier. Independently generated returns never join
@@ -316,7 +324,7 @@ for ft in $(facts_of); do
   if [ -z "$APPEND_TABLES" ]; then
     echo ">> phase 2: CDC tick (base=$CDC_ROWS rows, ratios=${CDC_RATIOS:-4:2:1}, returns=${CDC_RETURNS_RATIO:-0.1}) + snapshot_changed"
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
-      "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
+      "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
       --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" \
       ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} \
       --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
@@ -334,7 +342,7 @@ for ft in $(facts_of); do
     NOTIFY_TABLES="$APPEND_TABLES"
     for at in $APPEND_TABLES; do
       seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
-        "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
+        "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
         --namespace "$NAMESPACE" --table "$at" --rows "$CDC_ROWS" --s3-region "$REGION" \
         --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
         ${CDC_YEARS:+--years "$CDC_YEARS"} \

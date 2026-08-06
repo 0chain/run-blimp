@@ -287,7 +287,7 @@ cycle(){ # cycle <label> <seed-extra-args...> — commit, webhook, inline re-ser
   local ft="${BENCH_FACT:-$(query_fact)}"
   # Source-bucket creds must win over any stale ~/.aws/credentials profile.
   AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
-  "$PY3" "$HERE/seed_tpcds.py" --catalog "$ICEBERG_URL" --warehouse "$WAREHOUSE" \
+  "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
     --namespace "$NAMESPACE" --table "$ft" --rows "$CDC_ROWS" \
     --s3-region "$REGION" "$@" >/dev/null 2>&1
   curl -s -m 60 "$QAPI/admin/source/snapshot_changed" -H "Authorization: Bearer $TOKEN" \
