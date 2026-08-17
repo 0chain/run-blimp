@@ -138,6 +138,7 @@ bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
   fi
   if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
        mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
+       --maximum-throughput-gbps "${MPS3_TPUT_GBPS:-25}" --max-threads "${MPS3_MAX_THREADS:-64}" \
        --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MP"; then
     echo "!! fio SKIPPED: could not mount s3://$BKT at $MP via mountpoint-s3"; return 0
   fi
@@ -301,6 +302,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   fi
   if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
        mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
+       --maximum-throughput-gbps "${MPS3_TPUT_GBPS:-25}" --max-threads "${MPS3_MAX_THREADS:-64}" \
        --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MPS3"; then
     echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"; return 0
   fi
@@ -379,7 +381,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     # 2026-08-02). Path-style is correct for a MinIO-compatible endpoint either
     # way, so force it unconditionally rather than branch on IP-vs-hostname.
     if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
-         mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
+         mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" --maximum-throughput-gbps "${MPS3_TPUT_GBPS:-25}" --max-threads "${MPS3_MAX_THREADS:-64}" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
       echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"
       return 0
     fi
