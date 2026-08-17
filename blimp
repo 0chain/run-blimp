@@ -1273,6 +1273,9 @@ for f in "$@"; do
   case "$f" in
     --verify)       VERIFY=1; export VERIFY ;;
     --force-author) FORCE_AUTHOR=1; export FORCE_AUTHOR ;;
+    # Positional sub-arg for --encryption / --immutable (on|off|status); consumed
+    # by the dispatch below, not a global flag.
+    on|off|true|false|1|0|status) : ;;
     *)              echo "unknown flag: $f"; exit 2 ;;
   esac
 done
@@ -1543,8 +1546,8 @@ case "$CMD" in
   --storage|storage)  cmd_storage ;;
   --evict|evict)      cmd_evict ;;
   --acid|acid)        cmd_acid ;;
-  --encryption|encryption) cmd_encryption "${2:-}" ;;
-  --immutable|immutable)   cmd_immutable "${2:-}" ;;
+  --encryption|encryption) cmd_encryption "${1:-}" ;;
+  --immutable|immutable)   cmd_immutable "${1:-}" ;;
   --query|query)      cmd_query ;;
   --bench|bench)      cmd_bench ;;
   ""|-h|--help|help)  usage ;;
