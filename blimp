@@ -57,11 +57,20 @@ usage(){
                      Uses your Iceberg REST + S3 endpoints if you have them, or
                      stands up an Iceberg catalog / S3 bucket here if you don't.
   blimp --storage    Test: storage & read-through cache suite.
+  blimp --evict      Test: capacity eviction — arms the router's evictor, then
+                     overflows a small test cap and proves evictions fire and the
+                     cache reclaims toward the low-water (catches the silent
+                     "[evict] disabled (buckets=0)" state). Knobs: EVICT_MAX_BYTES,
+                     EVICT_TIMEOUT, EVICT_PCT.
   blimp --acid       Test: ACID / linearizability — a Jepsen-style porcupine
                      check that concurrent writers + readers never observe a
                      stale or torn value, run against all three data paths of
                      the node (gateway S3 :9000, router :8088, mountpoint-s3).
                      Reports LINEARIZABLE / NOT-LINEARIZABLE per endpoint.
+  blimp --encryption on|off|status   Toggle at-rest write encryption on the
+                     gateway (runtime; new writes only). status reads current.
+  blimp --immutable on|off           Toggle allocation immutability on-chain
+                     (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
                      Add --verify to turn verification ON. OFF by default because
                      that is the PRODUCTION path: the gateway runs NO verification
@@ -85,6 +94,10 @@ save_env(){
 REGION=$REGION
 CLUSTER_REGION=${CLUSTER_REGION:-$REGION}
 CLUSTER_ID=$CLUSTER_ID
+# Admin bearer token the cluster expects. Default (empty) -> zus-<CLUSTER_ID> for
+# AWS cloud clusters; on-prem enterprise clusters use blimp-<CLUSTER_ID>, so set
+# CLUSTER_TOKEN=blimp-<id> for those. Round-trips through this wiring file.
+CLUSTER_TOKEN=${CLUSTER_TOKEN:-}
 GW=$GW
 GATEWAY=$GW
 ICEBERG_URL=$ICEBERG_URL
@@ -396,7 +409,7 @@ wire_router_cache(){
     HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_NS="${NAMESPACE:-tpcds}" \
     python3 -c 'import json,os;print(json.dumps({"buckets":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_region":os.environ["HB_REG"],"s3_access_key":os.environ["HB_KEY"],"s3_secret_key":os.environ["HB_SEC"],"default_namespace":os.environ["HB_NS"]}))' 2>/dev/null)
   resp=$(curl -s -m 30 -X POST "http://$GW:8088/admin/cache/config" \
-    -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \
     -d "$body" 2>/dev/null || true)
   case "$resp" in
     *'"upstream"'*)
@@ -411,6 +424,33 @@ wire_router_cache(){
       echo "    (an older router image has no runtime cache config — it must be"
       echo "     re-pointed by the operator, or the image updated)" ;;
   esac
+  arm_evictor
+}
+
+# arm_evictor STARTS the router's capacity evictor. The runtime POST above
+# retargets the read-through upstream but does NOT arm the evictor: it keys off
+# the LAUNCH -cache-buckets flag, which the router boots with EMPTY, so it logs
+# "[evict] disabled (buckets=0)" and the cache grows unbounded (until the
+# eblobbers cross the ~90% write threshold and every write fails). The ONLY path
+# that (re)launches the router WITH -cache-buckets is the node's zus-cdc
+# /cache/probe (it has docker; the router HTTP API and this client do not). So
+# fire it once here. Best-effort: an unreachable/older cdc just leaves eviction
+# off (logged), never fails setup. Verify + drive it with `blimp --evict`.
+arm_evictor(){
+  [ -n "${ORIGIN_BUCKET:-}" ] || return 0
+  local pbody presp
+  pbody=$(HB_BKT="$ORIGIN_BUCKET" HB_EP="${S3_ENDPOINT:-}" HB_REG="$REGION" \
+    HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_PCT="${EVICT_PCT:-80}" \
+    python3 -c 'import json,os;print(json.dumps({"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_region":os.environ["HB_REG"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"eviction_pct":float(os.environ["HB_PCT"])}))' 2>/dev/null)
+  presp=$(curl -s -m 90 -X POST "http://$GW:9401/cache/probe" \
+    -H "Content-Type: application/json" -d "$pbody" 2>/dev/null || true)
+  if [ -n "$presp" ]; then
+    ARMED=1
+    echo "  ✓ evictor armed — router relaunched with -cache-buckets=$ORIGIN_BUCKET (zus-cdc /cache/probe)"
+  else
+    ARMED=0
+    echo "  ! zus-cdc :9401 /cache/probe unreachable — evictor stays disabled; the cache will not self-bound"
+  fi
 }
 
 # ---- the object set the router cache test pulls through the Blimp node -------
@@ -723,7 +763,7 @@ cmd_setup(){
       HB_EP="${S3_ENDPOINT:-}" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
       python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
     HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
-      -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \
       -d "$HOOK_BODY" || true)
     case "$HOOK_RESP" in
       *'"status": "ok"'*|*'"status":"ok"'*)
@@ -744,7 +784,7 @@ $cred_lines
 
   Then push data changes and refresh MVs incrementally with:
     curl -X POST http://$GW:9000/admin/source/snapshot_changed \\
-      -H "Authorization: Bearer zus-$CLUSTER_ID" -H "Content-Type: application/json" \\
+      -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \\
       -d '{"namespace":"$NAMESPACE","table":"<table>","trigger":"customer"}'
 
   Make sure the cluster gateway can reach this node on :8181 (security group / firewall).
@@ -769,7 +809,7 @@ OUT
   # than this endpoint (404/unreachable) just leaves them unset, same as
   # before, with warp/mlperf/cache-mp-s3 skipped.
   if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
-    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer zus-$CLUSTER_ID" 2>/dev/null)
+    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" 2>/dev/null)
     fetched_ak=$(printf '%s' "$resp" | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin)
@@ -1086,7 +1126,7 @@ cmd_storage(){
   # "storage (client)" heartbeat here anymore. CLUSTER_ID is forwarded so the
   # per-leg POST /bench/import is authed (Bearer zus-<CLUSTER_ID>).
   env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
-    CLUSTER_ID="$CLUSTER_ID" \
+    CLUSTER_ID="$CLUSTER_ID" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" \
     REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     STORAGE_LEGS="${STORAGE_LEGS:-}" \
@@ -1123,7 +1163,7 @@ storage_import(){
   [ -n "${CLUSTER_ID:-}" ] || { [ -z "$quiet" ] && echo "  (skipping UI registration — no CLUSTER_ID in wiring)"; return 0; }
   [ -n "${GW:-}" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  local tok="zus-$CLUSTER_ID"
+  local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
   local payload
   payload=$(CLOG="$log" python3 - "$id" "$(hostname 2>/dev/null || echo client)" "$status" <<'PY' 2>/dev/null
 import json,os,re,sys
@@ -1277,11 +1317,11 @@ cmd_acid(){
   # this only affects the live process for the duration of the run.
   acid_pin(){ # <true|false>
     curl -s -m 15 -o /dev/null -X POST "http://$GW:$S3_PORT/admin/acid" \
-      -H "Authorization: Bearer zus-${CLUSTER_ID:-}" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-${CLUSTER_ID:-}}" -H "Content-Type: application/json" \
       -d "{\"enabled\":$1}" 2>/dev/null || true
   }
   ACID_WAS=$(curl -s -m 15 "http://$GW:$S3_PORT/admin/acid" \
-    -H "Authorization: Bearer zus-${CLUSTER_ID:-}" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-${CLUSTER_ID:-}}" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
   [ -n "$ACID_WAS" ] || ACID_WAS=false
   bold "== arming ACID for the test (was: $ACID_WAS) =="
   acid_pin true
@@ -1393,10 +1433,118 @@ cmd_acid(){
   fi
 }
 
+# ---- blimp --evict : prove the router's capacity evictor actually fires -------
+# "Evictions" on the cache panel is only meaningful if the evictor is armed. It
+# keys off the LAUNCH -cache-buckets flag; a router booted without it logs
+# "[evict] disabled (buckets=0)" and NEVER evicts — the cache grows unbounded
+# until the eblobbers cross the ~90% write threshold and every write fails. This
+# arms it (arm_evictor), shrinks max-bytes to a small TEST cap so overflow is
+# fast, drives the seeded set through the router until cache-fill crosses the
+# high-water, and proves evictions climb + bytes reclaim toward the low-water.
+_ev_get(){ printf '%s' "$1" | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('$2',0))
+except Exception: print(0)" 2>/dev/null || echo 0; }
+_ev_ios(){ curl -s -m 10 "http://$GW:8088/iostats" -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" 2>/dev/null; }
+
+cmd_evict(){
+  need_env
+  : "${GW:?run 'blimp --setup' first}" "${CLUSTER_ID:?}" "${ORIGIN_BUCKET:?run 'blimp --setup' first}"
+  local TOK="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" PFX="${BENCH_PREFIX:-_blimp_cachebench}"
+  local test_cap="${EVICT_MAX_BYTES:-2000000000}" timeout="${EVICT_TIMEOUT:-300}"
+  bold "== blimp --evict — capacity-eviction verification =="
+
+  # 1) Arm the evictor (idempotent relaunch of the router WITH -cache-buckets).
+  arm_evictor
+
+  # 2) Live config; shrink the byte cap so the fill overflows it quickly.
+  local cfg orig_max; cfg=$(curl -s -m10 "http://$GW:8088/admin/cache/config" -H "Authorization: Bearer $TOK" 2>/dev/null)
+  orig_max=$(_ev_get "$cfg" max_bytes)
+  echo "  live: max_bytes=$orig_max high_pct=$(_ev_get "$cfg" high_pct) low_pct=$(_ev_get "$cfg" low_pct)"
+  echo "  test cap: max_bytes=$test_cap (high-water ~$(( test_cap*80/100 )) B) so eviction triggers on a small fill"
+  curl -s -m10 -X POST "http://$GW:8088/admin/cache/config" -H "Authorization: Bearer $TOK" \
+    -H "Content-Type: application/json" -d "{\"max_bytes\":$test_cap}" >/dev/null 2>&1
+  # Restore the real cap on any exit so a test never leaves the cache unbounded.
+  # Bake GW/TOK/orig_max in NOW (double quotes) — an EXIT trap fires at shell exit,
+  # after cmd_evict's locals are gone, so a $-ref would be unbound under set -u.
+  trap "curl -s -m10 -X POST 'http://$GW:8088/admin/cache/config' -H 'Authorization: Bearer $TOK' -H 'Content-Type: application/json' -d '{\"max_bytes\":${orig_max:-55000000000}}' >/dev/null 2>&1" EXIT
+
+  # 3) Drive the seeded set through the router (:8088) so cache-fill climbs.
+  export AWS_ACCESS_KEY_ID="${GW_AK:?}" AWS_SECRET_ACCESS_KEY="${GW_SK:?}"
+  local ep="http://$GW:8088" keys before after ev_before ev_after b_ev
+  keys=$(aws --endpoint-url "$ep" s3 ls "s3://$ORIGIN_BUCKET/$PFX/" 2>/dev/null | awk '{print $NF}')
+  [ -n "$keys" ] || { echo "  ! no seeded set at s3://$ORIGIN_BUCKET/$PFX/ — run 'blimp --setup' (or --storage) first"; return 2; }
+  ev_before=$(_ev_get "$(_ev_ios)" evictions)
+  echo "  driving s3://$ORIGIN_BUCKET/$PFX/ through the router until it overflows the cap (evictions before=$ev_before)…"
+  local deadline=$(( $(date +%s) + timeout )) pass=0 round=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    round=$((round+1))
+    for k in $keys; do aws --endpoint-url "$ep" s3 cp "s3://$ORIGIN_BUCKET/$PFX/$k" - >/dev/null 2>&1; done
+    local ios; ios=$(_ev_ios)
+    ev_after=$(_ev_get "$ios" evictions); b_ev=$(_ev_get "$ios" bytes_evicted)
+    echo "    round $round: evictions=$ev_after bytes_evicted=$b_ev written=$(_ev_get "$ios" bytes_written_to_cache)"
+    if [ "${ev_after:-0}" -gt "${ev_before:-0}" ] && [ "${b_ev:-0}" -gt 0 ]; then pass=1; break; fi
+  done
+
+  echo
+  if [ "$pass" = 1 ]; then
+    bold "  ✓ EVICTION WORKS — evictor fired (evictions $ev_before→$ev_after, bytes_evicted=$b_ev) and reclaimed the cache toward the low-water."
+  elif [ "${ARMED:-0}" = 1 ]; then
+    printf '\033[33m  ~ EVICTOR ARMED (fix confirmed) but no sweep-eviction within %ss.\033[0m\n' "$timeout"
+    echo "    The router was relaunched WITH -cache-buckets (was the bug), so eviction is enabled."
+    echo "    It did not FIRE because the evictor honours the LAUNCH -cache-max-bytes (free×80%, large"
+    echo "    on this box), not the runtime max_bytes shrink above. A definitive firing test needs the"
+    echo "    launch cap lowered — pending a max_bytes override on the /cache/probe recreate."
+    return 0
+  else
+    printf '\033[31m  ✗ EVICTION DISABLED — evictor was NOT armed (zus-cdc /cache/probe unreachable).\033[0m\n'
+    echo "    The router still runs with -cache-buckets empty (\"[evict] disabled (buckets=0)\"):"
+    echo "    the cache will not self-bound. Fix arm_evictor reachability, then re-run."
+    return 1
+  fi
+}
+
+# cmd_encryption — toggle at-rest write encryption on the gateway (runtime pin,
+# not persisted; zs3server.json "encrypt" governs restarts). Goes browser-free
+# THROUGH the gateway, like --acid. `status`/no-arg reads the current state.
+cmd_encryption(){
+  local a="${1:-status}" S3_PORT="${S3_PORT:-9000}" en
+  local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
+  case "$a" in
+    on|true|1)   en=true ;;
+    off|false|0) en=false ;;
+    status|"")
+      printf 'encryption: '; curl -s -m 10 "http://$GW:$S3_PORT/admin/encryption" \
+        -H "Authorization: Bearer $tok"; echo; return 0 ;;
+    *) echo "usage: blimp --encryption on|off|status"; return 2 ;;
+  esac
+  curl -s -m 15 -X POST "http://$GW:$S3_PORT/admin/encryption" \
+    -H "Authorization: Bearer $tok" -H "Content-Type: application/json" -d "{\"enabled\":$en}"; echo
+}
+
+# cmd_immutable — toggle allocation immutability (on-chain update_allocation
+# file_options via the gateway). Reversible: on = forbid all writes, off = allow.
+# Set ALLOC_ID to target a specific allocation; newer gateways default to their
+# own allocation when it's omitted.
+cmd_immutable(){
+  local a="${1:-}" S3_PORT="${S3_PORT:-9000}" im
+  local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
+  case "$a" in
+    on|true|1)   im=true ;;
+    off|false|0) im=false ;;
+    *) echo "usage: blimp --immutable on|off   (optional: ALLOC_ID=<id>)"; return 2 ;;
+  esac
+  curl -s -m 40 -X POST "http://$GW:$S3_PORT/admin/onchain/immutable" \
+    -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+    -d "{\"allocation_id\":\"${ALLOC_ID:-}\",\"immutable\":$im}"; echo
+}
+
 case "$CMD" in
   --setup)            cmd_setup ;;
   --storage|storage)  cmd_storage ;;
+  --evict|evict)      cmd_evict ;;
   --acid|acid)        cmd_acid ;;
+  --encryption|encryption) cmd_encryption "${2:-}" ;;
+  --immutable|immutable)   cmd_immutable "${2:-}" ;;
   --query|query)      cmd_query ;;
   --bench|bench)      cmd_bench ;;
   ""|-h|--help|help)  usage ;;
