@@ -56,16 +56,11 @@ usage(){
   blimp --setup      Connect a Blimp cluster to your data (run on your app node).
                      Uses your Iceberg REST + S3 endpoints if you have them, or
                      stands up an Iceberg catalog / S3 bucket here if you don't.
-  blimp --storage    Test: storage & read-through cache suite.
-  blimp --evict      Test: capacity eviction — arms the router's evictor, then
-                     overflows a small test cap and proves evictions fire and the
-                     cache reclaims toward the low-water (catches the silent
-                     "[evict] disabled (buckets=0)" state). Knobs: EVICT_MAX_BYTES,
-                     EVICT_TIMEOUT, EVICT_PCT.
+  blimp --storage    Test: storage suite.
   blimp --acid       Test: ACID / linearizability — a Jepsen-style porcupine
                      check that concurrent writers + readers never observe a
-                     stale or torn value, run against all three data paths of
-                     the node (gateway S3 :9000, router :8088, mountpoint-s3).
+                     stale or torn value, run against the node's data paths
+                     (gateway S3 :9000, mountpoint-s3).
                      Reports LINEARIZABLE / NOT-LINEARIZABLE per endpoint.
   blimp --encryption on|off|status   Toggle at-rest write encryption on the
                      gateway (runtime; new writes only). status reads current.
@@ -97,7 +92,7 @@ CLUSTER_ID=$CLUSTER_ID
 # Admin bearer token the cluster expects. Default (empty) -> zus-<CLUSTER_ID> for
 # AWS cloud clusters; on-prem enterprise clusters use blimp-<CLUSTER_ID>, so set
 # CLUSTER_TOKEN=blimp-<id> for those. Round-trips through this wiring file.
-CLUSTER_TOKEN=${CLUSTER_TOKEN:-}
+CLUSTER_TOKEN=${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}
 GW=$GW
 GATEWAY=$GW
 ICEBERG_URL=$ICEBERG_URL
@@ -842,12 +837,13 @@ except Exception: print("")' 2>/dev/null)
     ensure_acid_tools || true   # porcupine ACID checker (Go build); non-fatal
   fi
 
-  # 3. Read-through cache. The router only caches buckets named in its
-  #    -cache-buckets flag, and setup never set it — so on every cluster the
-  #    router ran as a pass-through and the cache legs measured nothing. Report
-  #    it here, at setup, instead of after a 25-minute benchmark.
-  wire_router_cache
-  seed_router_cache_set
+  # 3. Read-through cache (router :8088) — not surfaced from run-blimp for now.
+  #    wire_router_cache / seed_router_cache_set are kept intact; set
+  #    BLIMP_ROUTER=1 to re-enable the router wiring at setup.
+  if [ "${BLIMP_ROUTER:-0}" = 1 ]; then
+    wire_router_cache
+    seed_router_cache_set
+  fi
 
   echo; bold "setup done — everything is wired. Validate with:  blimp --query    (and  blimp --storage )"
 }
@@ -915,6 +911,12 @@ need_env(){
   # shellcheck disable=SC1090
   . "$ENVF"
   GW="${GW:-${GATEWAY:-}}"; export GW GATEWAY="$GW"
+  # On-prem/blimp-net clusters authenticate with blimp-<id> (the gateway's
+  # ZS3_ADMIN_TOKEN). Default CLUSTER_TOKEN to that when the wiring didn't set it,
+  # so bench-run registration (/bench/import) and admin calls use the token the
+  # gateway/cdc expect — a zus-<id> fallback was silently dropping run-blimp runs
+  # from the UI bench list.
+  : "${CLUSTER_TOKEN:=blimp-${CLUSTER_ID:-}}"; export CLUSTER_TOKEN
 }
 
 # ensure_storage_tools — the --storage suite's benchmark tools, installed
@@ -1370,6 +1372,10 @@ cmd_acid(){
   bold "ACID / linearizability — node $GW  (bucket s3://$BKT)"
   run_leg "gateway S3 :$S3_PORT"  -mode s3     -endpoint "$GW:$S3_PORT"
 
+  # Router (:8088) ACID leg is disabled by default — the read-through cache is
+  # not surfaced from run-blimp for now. Set ACID_ROUTER=1 to run it. The leg
+  # code below is kept intact.
+  if [ "${ACID_ROUTER:-0}" = 1 ]; then
   # The router is a READ-THROUGH cache: it proxies writes to whatever origin
   # --setup retargeted it at, NOT to the gateway's own S3. So creating $BKT on
   # :9000 (above) is not enough — the origin needs it too, or every seed PUT
@@ -1391,6 +1397,7 @@ cmd_acid(){
     echo "!! router leg SKIPPED: test bucket s3://$BKT absent on the router origin (${S3_ENDPOINT:-unset})"
     echo "   the router writes through to the origin; create the bucket there to run this leg."
     acid_noresult=$((acid_noresult+2)); acid_bad="$acid_bad|SKIPPED router (origin lacks s3://$BKT)"
+  fi
   fi
 
   # mountpoint-s3 leg — mount the bucket as a filesystem over the gateway S3 and
@@ -1510,6 +1517,8 @@ cmd_evict(){
 # not persisted; zs3server.json "encrypt" governs restarts). Goes browser-free
 # THROUGH the gateway, like --acid. `status`/no-arg reads the current state.
 cmd_encryption(){
+  need_env   # source the wiring (GW / CLUSTER_ID / CLUSTER_TOKEN); without this
+             # $CLUSTER_ID is unbound under `set -u` and every call aborts.
   local a="${1:-status}" S3_PORT="${S3_PORT:-9000}" en
   local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
   case "$a" in
@@ -1529,6 +1538,8 @@ cmd_encryption(){
 # Set ALLOC_ID to target a specific allocation; newer gateways default to their
 # own allocation when it's omitted.
 cmd_immutable(){
+  need_env   # source the wiring (GW / CLUSTER_ID / CLUSTER_TOKEN); without this
+             # $CLUSTER_ID is unbound under `set -u` and every call aborts.
   local a="${1:-}" S3_PORT="${S3_PORT:-9000}" im
   local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
   case "$a" in
@@ -1544,7 +1555,6 @@ cmd_immutable(){
 case "$CMD" in
   --setup)            cmd_setup ;;
   --storage|storage)  cmd_storage ;;
-  --evict|evict)      cmd_evict ;;
   --acid|acid)        cmd_acid ;;
   --encryption|encryption) cmd_encryption "${1:-}" ;;
   --immutable|immutable)   cmd_immutable "${1:-}" ;;

@@ -28,7 +28,7 @@ ask(){ local cur="${!1:-}"; if [ -n "$cur" ]; then printf '%s' "$cur"; return; f
 
 echo "==================== Blimp cluster storage test suite ===================="
 echo "Enter the cluster endpoints (all reachable on the VPC PRIVATE network)."
-GW=$(ask GW            "Gateway PRIVATE IP (serves NFS :2049, S3 :9000, router :8088):")
+GW=$(ask GW            "Gateway PRIVATE IP (serves NFS :2049, S3 :9000):")
 GW_AK=$(ask GW_AK      "Gateway S3 access key:")
 GW_SK=$(ask GW_SK      "Gateway S3 secret key:")
 ROUTER="${ROUTER:-http://$GW:8088}"
@@ -67,7 +67,7 @@ fi
 export GW GW_AK GW_SK ROUTER NFS_MNT EC ORIGIN_BUCKET REGION S3_ENDPOINT S3_KEY S3_SECRET
 
 echo ""
-echo "gateway=$GW  EC=$EC  router=$ROUTER  origin=s3://$ORIGIN_BUCKET/$CACHE_TABLE ($REGION)"
+echo "gateway=$GW  EC=$EC  origin=s3://$ORIGIN_BUCKET/$CACHE_TABLE ($REGION)"
 echo "----------------------------------------------------------------------"
 # capture our own output so the final summary can be extracted from it
 CAP="${CAP:-/tmp/test_cache_out.log}"; : > "$CAP"
@@ -78,10 +78,10 @@ run(){ echo; echo ">>> $1"; shift; "$@"; }
 # gateway's own run_bench fio/warp/mlperf rows). cdc auto-fills the tier columns by
 # running run_bench's __tiers__ sampler between the running and done imports. Token
 # = zus-<CLUSTER_ID>; best-effort (skips silently if wiring/py absent).
-BL_TOK="zus-${CLUSTER_ID:-}"
+BL_TOK="${CLUSTER_TOKEN:-zus-${CLUSTER_ID:-}}"
 bl_post(){ # <bid> <status> <type> <metrics_json> [logfile]
   [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] && command -v python3 >/dev/null 2>&1 || return 0
-  BL_ID="$1" BL_ST="$2" BL_TY="$3" BL_M="$4" BL_LOG="${5:-}" BL_GW="$GW" BL_CID="$CLUSTER_ID" python3 - <<'PY' 2>/dev/null || true
+  BL_ID="$1" BL_ST="$2" BL_TY="$3" BL_M="$4" BL_LOG="${5:-}" BL_GW="$GW" BL_CID="$CLUSTER_ID" BL_TOK="$BL_TOK" python3 - <<'PY' 2>/dev/null || true
 import os,json,re,urllib.request
 m=json.loads(os.environ["BL_M"] or "[]")
 lg=""
@@ -91,7 +91,7 @@ except Exception: pass
 d=json.dumps({"id":os.environ["BL_ID"],"type":os.environ["BL_TY"],"status":os.environ["BL_ST"],"log":lg,
   "summary":{"type":os.environ["BL_TY"],"metrics":m,"config":"run-blimp client-side run","status":os.environ["BL_ST"]}}).encode()
 r=urllib.request.Request("http://%s:9401/bench/import"%os.environ["BL_GW"],data=d,
-  headers={"Authorization":"Bearer zus-"+os.environ["BL_CID"],"Content-Type":"application/json"},method="POST")
+  headers={"Authorization":"Bearer "+os.environ["BL_TOK"],"Content-Type":"application/json"},method="POST")
 try: urllib.request.urlopen(r,timeout=15)
 except Exception: pass
 PY
@@ -170,7 +170,10 @@ PY
 #   STORAGE_LEGS=warp,fio       several
 #   (unset / all)               everything, as before
 LEGS="${STORAGE_LEGS:-all}"
-want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
+# The router read-through cache leg is NOT surfaced from run-blimp for now, so it
+# is opt-in only: `all` no longer includes it — request it explicitly with
+# STORAGE_LEGS=cache. (Leg code below is kept intact.)
+want(){ case "$1" in cache) case ",$LEGS," in *",cache,"*) return 0;; esac; return 1;; esac; case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
 [ "$LEGS" != "all" ] && echo "[legs] running only: $LEGS"
 
 # NO AUTOMATIC CLEANUP. A trap used to delete the bench artifacts on every exit —
