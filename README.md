@@ -10,7 +10,7 @@ only reads it.
 ```
    ┌─ your Iceberg node (any cloud) ─┐     ┌──── Blimp node (AWS) ────┐
    │  blimp CLI                      │     │  gateway                 │
-   │  Iceberg REST  :8181  ──────────┼────▶│   S3 :9000 · router      │
+   │  Iceberg REST  :8181  ──────────┼────▶│   S3 :9000               │
    │  your S3 / MinIO data           │ wire│   eblobbers              │
    └───────────────┬─────────────────┘     └───────────┬──────────────┘
                    └────── snapshot_changed webhook ─────┘
@@ -175,9 +175,7 @@ across reboots. Requires a gateway image ≥ 2026-07-27; on older images the
 call fails gracefully and `--setup` prints the manual steps.
 
 Manual fallback (older gateway image, or the admin-API call failed): paste
-`--setup`'s printed values into the Blimp node UI (Production tab). `--setup`
-also retargets the read-through cache router at the new bucket itself
-(`POST /admin/cache/config`) — that isn't a separate manual step.
+`--setup`'s printed values into the Blimp node UI (Production tab).
 
 External / cross-account mode **requires** `S3_KEY`/`S3_SECRET`; `--setup`
 sends them in the `/admin/source/configure` body. In vpc mode leave them
@@ -288,20 +286,19 @@ linearizability model-checker used in Jepsen distributed-systems testing. Many
 clients hammer the same keys with concurrent writes and reads; porcupine then
 searches for *any* ordering of those operations consistent with a single
 correct register. If none exists, the history is **NOT LINEARIZABLE** and the
-offending operation is reported. It runs against **all three read paths**, each
+offending operation is reported. It runs against **both read paths**, each
 under two profiles:
 
 | Path | What it is |
 |------|------------|
 | **gateway S3 :9000** | the raw S3 API → gosdk → blobbers |
-| **router :8088** | the read-through cache S3 endpoint in front of the gateway |
 | **mountpoint-s3** | the gateway bucket mounted as a POSIX filesystem (the fio / mlperf / customer mount path) |
 
 - **single-writer** — one client writes a key while N clients read it. This is
   the read-after-write guarantee an object store actually promises; a stale or
   torn read here is a genuine consistency bug.
 - **multi-writer** — every client both writes and reads the shared keys, a
-  stricter total-order probe. (High "errors" counts on the FUSE/router legs are
+  stricter total-order probe. (High "errors" counts on the FUSE leg are
   just the client refusing two concurrent writers to one key — the verdict is
   over the operations that *completed*.)
 
@@ -311,8 +308,8 @@ blimp --acid
 ```
 
 A clean run prints `LINEARIZABLE` for every leg — read-after-write is preserved
-and no torn erasure-decode is ever exposed, whether you reach the node over S3,
-through the cache, or as a mounted filesystem. `--setup` builds the checker (a
+and no torn erasure-decode is ever exposed, whether you reach the node over S3
+or as a mounted filesystem. `--setup` builds the checker (a
 small Go program under `acid/`) automatically; it needs no configuration beyond
 the gateway S3 keys already in your wiring. Run the checker from a box **other
 than the gateway** (e.g. the Iceberg node) — co-locating the load generator on a
@@ -322,10 +319,6 @@ client artifact, not a consistency failure — verified separately with `aws s3
 cp` md5 checks that pass byte-for-byte with the strict ACID verify on and off.)
 
 ## Notes
-
-**Router cache-freshness guarantee.** Router ON: an append still changes the
-served result (immutable Iceberg files = new keys = no stale hit). Router OFF:
-a source read writes zero bytes to the cache.
 
 **Blimp node stop/start (self-heal, no touch).** Raw EC2 stop/start: private IPs
 survive (in-VPC wiring reconnects untouched); public IPs change and the control
@@ -481,8 +474,8 @@ fio    NFS write 1137 MiB/s · read 937 MiB/s
 
 Those are from a 2/1 cluster on larger instances. On a small node (c6in.large,
 2 vCPU) the same suite gave `fio NFS write 75.0MiB/s · read 352MiB/s` — the
-cache leg is only meaningful when the origin set is large enough to exercise it
-(a single 17 MB object measures nothing, and reports the router as *slower* than
+NFS leg is only meaningful when the origin set is large enough to exercise it
+(a single 17 MB object measures nothing and reports it as *slower* than
 direct S3 purely from per-request overhead). Size the set to the cluster.
 
 **E. `blimp --bench` — MV lifecycle timing profile:**

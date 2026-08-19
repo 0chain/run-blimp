@@ -208,7 +208,7 @@ reads only |MV|+|delta| — not the fact again.
 
 ---
 
-## PART H — optional: storage, router, stop/start
+## PART H — optional: storage, stop/start
 
 ```bash
 # storage & cache suite (sized for the node; see caps in README)
