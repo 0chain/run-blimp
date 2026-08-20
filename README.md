@@ -2,13 +2,13 @@
 
 ## Blimp
 
-Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per Blimp node) that keeps your AI/ML context fresh with CDC delta-merges served queries in 1-2s. One small, simple, scalable Blimp node runs in your own VPC; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost. → [blimp.software](https://blimp.software)
+Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per Blimp node) that keeps your AI/ML context fresh with CDC delta-merges served queries in 1-2s. One scalable Blimp node runs on any server or cloud you control; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost. → [blimp.software](https://blimp.software)
 
 `blimp` connects a **Blimp node** to **your** data which stays in your environment; Blimp
 only reads it.
 
 ```
-   ┌─ your Iceberg node (any cloud) ─┐     ┌──── Blimp node (AWS) ────┐
+   ┌─ your Iceberg node (any cloud) ─┐     ┌─────── Blimp node ───────┐
    │  blimp CLI                      │     │  gateway                 │
    │  Iceberg REST  :8181  ──────────┼────▶│   S3 :9000               │
    │  your S3 / MinIO data           │ wire│   eblobbers              │
@@ -17,18 +17,19 @@ only reads it.
                           (your pipeline, on each Iceberg commit)
 ```
 
-Vpc-mode reaches the Blimp node's gateway on its private IP with the Iceberg node's
-IAM role (no keys); cross-region / cross-account / non-AWS reach it over public DNS.
-`blimp --setup` detects which and wires it accordingly.
+If your Iceberg node is already networked to the Blimp node (e.g. the same
+private network/account) — **vpc mode** — `--setup` reaches the gateway on
+its private IP using the node's own identity, no keys to type. Otherwise —
+**external mode** — it reaches the gateway over public DNS with explicit S3
+keys. `blimp --setup` detects which and wires it accordingly.
 
-**All three (same VPC, cross-region/peered, different cloud) are supported and
-proven by this kit for demo/test setup — pick whichever matches where your
-Iceberg node already lives.** For **production**, run the Iceberg node in the
-**same VPC as the Blimp node** (same account, same region — ideally the same
-AZ): that path uses private IPs and the IAM instance role with no S3 keys, and
-every S3 call to the origin stays on the VPC S3 gateway endpoint with no
-internet egress. Cross-region, cross-account, or cross-cloud setups work, but
-add network hops and (outside same-account/region) real data-transfer egress
+**Both paths are supported and proven by this kit for demo/test setup — pick
+whichever matches where your Iceberg node already lives.** For
+**production**, run the Iceberg node on the same private network as the
+Blimp node (same account/region, ideally the same zone): that path uses
+private IPs with no S3 keys, and every S3 call to the origin stays off the
+public internet. A different network, account, or cloud works too, but adds
+network hops and (outside the same account/region) real data-transfer egress
 cost on every read — fine for a demo or a one-off test, but not the
 recommended production topology.
 
@@ -56,9 +57,9 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 > docker build -t blimp-kit . && \
 > docker run --rm --network host -e CLUSTER_ID=… -e WAREHOUSE=s3://… blimp-kit --setup
 > ```
-> `--network host` lets it use the node's IAM role + reach the gateway private
-> IP (that's what makes vpc mode key-free). See `docker-compose.yml` to bring up
-> the catalog + CLI together.
+> `--network host` lets it use the node's own identity and reach the gateway
+> private IP (that's what makes vpc mode key-free). See `docker-compose.yml`
+> to bring up the catalog + CLI together.
 
 ## Quick start — the `blimp` command, beginning to end
 
@@ -97,14 +98,14 @@ Fully **interactive** — every value is prompted with a default (Enter accepts)
 any env var already set skips its prompt (that's the zero-touch/CI path):
 
 ```
-AWS region [ap-south-1]:
+S3 region [ap-south-1]:
 Blimp cluster id (from blimp.software): 1784970467881
 ```
 
 It then runs the **network assessment**: probes the gateway's *private* IP.
-Reachable → **vpc mode** (private IPs, IAM instance role, no keys typed).
-Not reachable (other cloud/account) → **external mode** (public DNS
-`zus-<id>-0.zus.network`, explicit S3 keys):
+Reachable → **vpc mode** (no keys typed). Not reachable (other network/
+account/cloud) → **external mode** (public DNS `zus-<id>-0.zus.network`,
+explicit S3 keys):
 
 ```
 network assessment → MODE=vpc (gateway private 10.10.12.249 reachable: yes)
@@ -121,16 +122,16 @@ Guardrails `--setup` enforces (each is a real failure mode):
    bucket breaks the gateway's catalog-metadata reads → MV author refuses
    ("grain not sampleable"). Divergence warns and offers to fix.
 2. **Bucket access grant** (vpc/same-account): applies a bucket policy for the
-   gateway's instance role + your account — no silent 403 at author time.
-3. **Blank keys = IAM instance role** — the correct vpc answer; real keys are
-   only ever typed in external mode.
+   gateway's own identity + your account — no silent 403 at author time.
+3. **Blank keys are the correct vpc answer** — real keys are only ever typed
+   in external mode.
 
 **What `--setup` does, in order:**
 
 1. **Deps bootstrap** — installs docker / python venv + pyiceberg / aws CLI /
    unzip if missing (`BLIMP_SKIP_DEPS=1` to manage yourself).
 2. **Network assessment** — probes the gateway's private IP → picks vpc mode
-   (IAM role, no keys) or external mode (public DNS, explicit keys).
+   (no keys) or external mode (public DNS, explicit keys).
 3. **Catalog** — reuses your Iceberg REST URL, or stands one up here via
    `docker run` (iceberg-rest on :8181 over your warehouse).
 4. **Bucket grant** (vpc/same-account) — applies the bucket policy so the
@@ -177,9 +178,9 @@ call fails gracefully and `--setup` prints the manual steps.
 Manual fallback (older gateway image, or the admin-API call failed): paste
 `--setup`'s printed values into the Blimp node UI (Production tab).
 
-External / cross-account mode **requires** `S3_KEY`/`S3_SECRET`; `--setup`
-sends them in the `/admin/source/configure` body. In vpc mode leave them
-unset — the gateway reads via its IAM role.
+External mode **requires** `S3_KEY`/`S3_SECRET`; `--setup` sends them in the
+`/admin/source/configure` body. In vpc mode leave them unset — the gateway
+reads via its own identity.
 
 > Firewall: the gateway must reach this node on the catalog port. If the
 > Blimp node security group doesn't open 8181, serve the catalog on an open port
@@ -320,18 +321,19 @@ cp` md5 checks that pass byte-for-byte with the strict ACID verify on and off.)
 
 ## Notes
 
-**Blimp node stop/start (self-heal, no touch).** Raw EC2 stop/start: private IPs
-survive (in-VPC wiring reconnects untouched); public IPs change and the control
-plane's 60s cron reconciles the DB + every `zus-<id>-N` DNS record (gateway
-**and** blobbers) in ~1–2 min. MVs + wiring persist — re-run `--query`: the MV
-serves without re-author, CDC keeps merging.
+**Blimp node stop/start (self-heal, no touch).** Raw instance stop/start:
+private IPs survive (private-network wiring reconnects untouched); public IPs
+change and the control plane's 60s cron reconciles the DB + every
+`zus-<id>-N` DNS record (gateway **and** blobbers) in ~1–2 min. MVs + wiring
+persist — re-run `--query`: the MV serves without re-author, CDC keeps
+merging.
 
 **Credentials model.**
-- **vpc mode: nothing typed.** Iceberg node + gateway each use their IAM instance
-  role (EC2 metadata); bucket access is a policy naming the role.
+- **vpc mode: nothing typed.** Iceberg node + gateway each use their own
+  instance identity; bucket access is a policy naming that identity.
 - **external mode:** S3 keys typed once into `--setup` (`~/.blimp_env`,
-  mode 600); pasted into the Blimp node UI they are stored in **AWS Secrets
-  Manager** — only the ARN reaches Blimp node config, never state/logs.
+  mode 600); pasted into the Blimp node UI they are stored in a secrets
+  manager — only a reference reaches Blimp node config, never state/logs.
 - Gateway admin API: `Authorization: Bearer zus-<CLUSTER_ID>`.
 
 ---
@@ -349,10 +351,11 @@ serves without re-author, CDC keeps merging.
 
 ## Verified walkthrough (real commands + output)
 
-A fresh Ubuntu 24.04 EC2 node in the cluster's VPC, cluster `1784970467881`.
-Every line below is the actual command and its actual output from a live run.
+A fresh Ubuntu 24.04 cloud VM on the cluster's private network, cluster
+`1784970467881`. Every line below is the actual command and its actual
+output from a live run.
 
-**1. Confirm the node's identity + IAM role (no keys anywhere).**
+**1. Confirm the node's identity (no keys anywhere).**
 ```
 $ whoami; hostname; hostname -I
 ubuntu
@@ -405,7 +408,7 @@ not production operation.
 **A. `blimp --query` — author + incremental CDC:**
 
 Five queries against a single fact, appending to all five facts each cycle so a
-multi-fact query exercises a multi-fact merge. Live run, AWS SF1 cluster
+multi-fact query exercises a multi-fact merge. Live run, SF1 cluster
 `1785550395356`, 2026-08-01:
 ```
 == CDC bench: cluster=1785550395356 gw=10.10.114.87 rows/append=5000 suites=[store_sales:9 88 14 64 4] ==
@@ -459,7 +462,7 @@ DNS reconciled by the 60s cron (no touch):
 post-restart q1: merge_ms=5138 mode=incremental   RESULT: PASS
 ```
 
-**C. External-cloud host** (non-AWS box, over public DNS):
+**C. External-cloud host** (a different network, over public DNS):
 ```
 network assessment → MODE=external (gateway private unknown reachable: no)
 live query over zus-1784970467881-0.zus.network:9000
@@ -478,7 +481,7 @@ as *slower* than expected purely from per-request overhead.
 **E. `blimp --bench` — MV lifecycle timing profile:**
 
 Phase A cold-authors the same query `AUTHOR_ITERS` times (evicting the MV
-between iterations); phase B appends and refreshes `ITERS` times. Live run, AWS
+between iterations); phase B appends and refreshes `ITERS` times. Live run,
 SF1 cluster `1785550395356`, 2026-08-01:
 ```
 == MV lifecycle benchmark v2: cluster 1785550395356 (authors=3, appends=3, upserts=3, rows/cycle=50000) ==
