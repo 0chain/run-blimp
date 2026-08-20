@@ -64,6 +64,7 @@ usage(){
                      Reports LINEARIZABLE / NOT-LINEARIZABLE per endpoint.
   blimp --encryption on|off|status   Toggle at-rest write encryption on the
                      gateway (runtime; new writes only). status reads current.
+  blimp --gc         Reclaim orphaned blobber storage (fleet orphan sweep).
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
@@ -1291,12 +1292,43 @@ cmd_immutable(){
     -d "{\"allocation_id\":\"${ALLOC_ID:-}\",\"immutable\":$im}"; echo
 }
 
+# cmd_gc — reclaim orphaned blobber storage. Triggers the gateway's fleet orphan
+# sweep (drain pending-reap + physical reconcile of /.fleet/blobs vs the dedup
+# index), which deletes content-blobs no object references — e.g. left behind
+# when a delete could not run because the disk was write-degraded. Loops until a
+# pass reclaims nothing. Reads GW + CLUSTER_TOKEN from the wiring file.
+cmd_gc(){
+  need_env
+  : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
+  local S3_PORT="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}"
+  local url="http://$GW:$S3_PORT/admin/fleet/orphan-sweep"
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$GW:$S3_PORT/minio/health/live" 2>/dev/null)" != 200 ]; then
+    die "gateway $GW:$S3_PORT unreachable — check GW= in $ENVF and the security group"
+  fi
+  echo "== fleet blobber GC (orphan sweep) on $GW =="
+  local total=0 pass=0 r n
+  while :; do
+    pass=$((pass+1))
+    r=$(curl -s -m 900 -X POST "$url" -H "Authorization: Bearer $tok" 2>&1)
+    n=$(printf '%s' "$r" | sed -n 's/.*"reclaimed":\([0-9][0-9]*\).*/\1/p')
+    case "$n" in
+      ''|*[!0-9]*) echo "  pass $pass: unexpected response: $r"; return 1 ;;
+    esac
+    echo "  pass $pass: reclaimed $n blob(s)"
+    total=$((total+n))
+    [ "$n" -eq 0 ] && break
+    [ "$pass" -ge 30 ] && { echo "  (stopping after 30 passes; re-run 'blimp --gc' to continue)"; break; }
+  done
+  echo "== done: reclaimed $total orphan blob(s) =="
+}
+
 case "$CMD" in
   --setup)            cmd_setup ;;
   --storage|storage)  cmd_storage ;;
   --acid|acid)        cmd_acid ;;
   --encryption|encryption) cmd_encryption "${1:-}" ;;
   --immutable|immutable)   cmd_immutable "${1:-}" ;;
+  --gc|gc)            cmd_gc ;;
   --query|query)      cmd_query ;;
   --bench|bench)      cmd_bench ;;
   ""|-h|--help|help)  usage ;;
