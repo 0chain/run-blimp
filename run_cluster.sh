@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # run_cluster.sh — the customer-runnable slice of the cluster's
 # /opt/cdc/run_bench.sh. Only the 2/1 and 8/1 benchmark tests (warp put/get,
-# 1KiB TTFB, fio, mlperf resnet50), with the SAME specs the in-cluster Blimp
+# 1KiB TTFB, mlperf resnet50), with the SAME specs the in-cluster Blimp
 # "Benchmarks" UI runs — but from this client box against the gateway + NFS.
 # All cluster-internal machinery (summary JSON, /opt/cdc, UI wiring, bucket
 # janitor) is stripped.
 #
-# Prereq: setup_tests.sh installed warp v1.1.4, fio 3.28, dlio-benchmark 2.0
+# Prereq: setup_tests.sh installed warp v1.1.4, dlio-benchmark 2.0
 # (/opt/dlio/venv_mlperf); box is in the cluster VPC.
 #
 # Usage:
 #   GW=10.10.150.76 NFS=10.10.150.76 EC=2/1 AK=<gw-key> SK=<gw-secret> \
-#   ./run_cluster.sh <warp|ttfb|fio|mlperf|all>
+#   ./run_cluster.sh <warp|ttfb|mlperf|all>
 #
 # EC=2/1 or 8/1 selects the same detect_ec params as run_bench. Overrides:
-#   BENCH_DURATION (30) TTFB_DUR (30) WARP_OBJ_SIZE (96MiB) FIO_SIZE FIO_JOBS
+#   BENCH_DURATION (30) TTFB_DUR (30) WARP_OBJ_SIZE (96MiB)
 #   MLPERF_NUM_FILES (200) NFS_MNT (/mnt/zusnfs). Disk-fill guard aborts at 90%.
 
 set -uo pipefail
@@ -23,22 +23,21 @@ EC="${EC:-2/1}"; DUR="${BENCH_DURATION:-30}"; TTFB_DUR="${TTFB_DUR:-30}"; MNT="$
 OSZ="${WARP_OBJ_SIZE:-96MiB}"
 
 # --- detect_ec: identical table to /opt/cdc/run_bench.sh ------------------------
-#   2/1 -> warp-conc 16, fio 16 jobs / iodepth 16 / 2304 MiB per stream (36 GiB),
+#   2/1 -> warp-conc 16,
 #          mlperf resnet50 accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain=34*7
-#   8/1 -> warp-conc 64, fio 32 jobs / iodepth 8  / 4608 MiB per stream (144 GiB),
+#   8/1 -> warp-conc 64,
 #          mlperf resnet50 accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain=136*7
 d="${EC%%/*}"
-if [ "$d" -ge 8 ]; then EC_CONC=64; EC_FIO_JOBS=32; EC_FIO_IODEPTH=8;  EC_FIO_MIB=4608
+if [ "$d" -ge 8 ]; then EC_CONC=64
   EC_DATASET_GB=136; EC_ACCEL=6; EC_RT=24; EC_PF=48
-else                    EC_CONC=16; EC_FIO_JOBS=16; EC_FIO_IODEPTH=16; EC_FIO_MIB=2304
+else                    EC_CONC=16
   # 68 GiB set = 2x the 32 GiB gateway RAM: the warp GET can NOT be served from
   # gateway page cache (34 GiB barely exceeded RAM and read cache-favorably).
   EC_DATASET_GB=68;  EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
 # WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster
 # to conc=64 to see if more parallel GET streams lift blobber-served read throughput).
 EC_CONC="${WARP_CONC:-$EC_CONC}"
-FJ="${FIO_JOBS:-$EC_FIO_JOBS}"; FSZ="${FIO_SIZE:-${EC_FIO_MIB}M}"; FID="$EC_FIO_IODEPTH"
-echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC fio-jobs=$EC_FIO_JOBS fio-iodepth=$EC_FIO_IODEPTH per-stream=${EC_FIO_MIB}MiB obj=$OSZ mlperf-accel=$EC_ACCEL rt=$EC_RT pf=$EC_PF"
+echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC obj=$OSZ mlperf-accel=$EC_ACCEL rt=$EC_RT pf=$EC_PF"
 
 W(){ warp "$1" --host="$GW:9000" --access-key="${AK:?set AK}" --secret-key="${SK:?set SK}" --tls=false --no-color "${@:2}"; }
 # clean_bkt — remove a warp/ttfb scratch bucket after use (warp --keep-data leaves it
@@ -50,8 +49,8 @@ disk_guard(){ mountpoint -q "$MNT" || return 0; local p; p=$(df --output=pcent "
   echo "  [$MNT ${p:-?}% used]"; [ "${p:-0}" -ge 90 ] && { echo "!! ${p}% >=90% — abort (disk-fill guard)"; exit 1; }; }
 mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
   if ! sudo mount -t nfs4 -o nconnect=16,rsize=1048576,wsize=1048576 "$NFS":/ "$MNT"; then
-    # Fail LOUD and make callers skip: falling through would run fio against
-    # the local disk under the mountpoint dir and report the client box's
+    # Fail LOUD and make callers skip: falling through would run the benchmark
+    # against the local disk under the mountpoint dir and report the client box's
     # speed as the cluster's (observed on an external-mode host, 2026-07-27).
     echo "SKIP: NFS $NFS:/ unreachable (external-mode host? NFS is VPC-only)"
     return 1
@@ -73,7 +72,7 @@ bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
   # so a killed/hung PUT leaves the full ~EC_DATASET_GB set on the blobbers. That
   # both skews the next GET and — on a disk sized for ONE dataset — starves the
   # very next write into disk_full (which mount-s3/warp then hang on). Purge the
-  # warp scratch buckets BEFORE writing, same as bench_fio does for its bucket.
+  # warp scratch buckets BEFORE writing.
   clean_bkt warpbench warpprobe
   echo "== warp probe (8s) to size PUT to ${BUD}MiB set =="
   local PR; PR=$(W put --bucket=warpprobe --obj.size="$OSZ" --concurrent="$EC_CONC" --duration=8s 2>&1 | grep -oE 'Average: [0-9.]+ [KMGT]?i?B/s' | head -1 | awk '{v=$2+0;u=$3; if(u~/GiB/)v*=1024; else if(u~/KiB/)v/=1024; printf "%d",v}')
@@ -86,86 +85,11 @@ bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
   W get --bucket=warpbench --list-existing --noclear --concurrent="$EC_CONC" --duration="${DUR}s" 2>&1 | grep -iE 'Average:|Errors:' | head -2
   clean_bkt warpbench warpprobe; }
 
-# --- fio write + read over MOUNTPOINT-S3 (was: NFS mount) --------------------------
-# Switched off NFS (2026-08-04): NFS :2049 is VPC-only by security group, so the
-# external kit could never run this leg against a real deployment, and the product
-# read path being certified is mount-s3 (same as mlperf). mount-s3 constraints
-# baked in (each cost a wedge to learn on a live box):
-#   * NO --direct/libaio: FUSE has no O_DIRECT; fio's open O_WRONLY without
-#     O_TRUNC on an existing key is EPERM under mount-s3, and the default
-#     layout-then-reopen pattern deadlocked buffered writes with ZERO bytes on
-#     the wire. --create_on_open=1 makes the measured write BE the file create.
-#   * psync engine both legs; end_fsync=1 so upload-on-close completion is
-#     inside the timed window (otherwise the last part is untimed).
-#   * RAM guard: mount-s3 buffers in-flight parts in memory; 6 concurrent 1 GiB
-#     streams wedged a 3 GB client (I/O errors, mount needed a remount). Cap
-#     jobs at (RAM_GB) with a floor of 2.
-#   * unique run dir: mp-s3 keys can't be re-laid-out in place.
-# READ: sequential buffered psync — same cold-by-working-set rationale as before
-# (set > gateway RAM), served via ranged GETs + mount-s3 readahead.
-bench_fio(){ : "${AK:?set AK}" "${SK:?set SK}"
-  local BKT="${FIO_BUCKET:-bench-fio}" MP="${MPS3_FIO_MNT:-/mnt/mps3-fio}"
-  local RAMG NJ; RAMG=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo)
-  NJ=$FJ; [ "$RAMG" -lt "$NJ" ] && { NJ=$RAMG; [ "$NJ" -lt 2 ] && NJ=2
-    echo "  [fio] client has ${RAMG}G RAM -> $NJ jobs instead of $FJ (mount-s3 buffer guard)"; }
-  # mount-s3 CONCURRENCY cap (separate from the RAM guard): one mount-s3 daemon
-  # stalls its multipart-upload COMPLETION path under many big concurrent files.
-  # Observed on a 16-vCPU/32 GiB box: 16 x 2.3 GiB writes finished to the FUSE
-  # mount but mount-s3 only uploaded 9/16, wedging the rest in fio's end_fsync
-  # with zero network I/O on either side. Cap concurrent writers (RAM was not
-  # the limit — it was mount-s3's upload concurrency). Tune via MPS3_FIO_MAX_JOBS.
-  local MPCAP="${MPS3_FIO_MAX_JOBS:-4}"
-  [ "$NJ" -gt "$MPCAP" ] && { echo "  [fio] mount-s3 concurrency cap: $NJ -> $MPCAP writers (MPS3_FIO_MAX_JOBS)"; NJ=$MPCAP; }
-  command -v mount-s3 >/dev/null 2>&1 || { echo "!! fio SKIPPED: mount-s3 not installed"; return 0; }
-  AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://$GW:9000" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
-  # Start each fio run against a CLEAN bucket. mount-s3 stalls its upload
-  # pipeline writing into a bucket carrying accumulated data from prior runs
-  # (a killed run leaves GiBs behind, and the next fio then hangs even at low
-  # concurrency). Purge the bench bucket's contents first — objects here are
-  # scratch, regenerated every run.
-  AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://$GW:9000" s3 rm "s3://$BKT/" --recursive --only-show-errors >/dev/null 2>&1 || true
-  sudo mkdir -p "$MP"
-  grep -qs '^user_allow_other' /etc/fuse.conf || \
-    echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
-  # Always remount: `mountpoint -q` reports a stale FUSE endpoint as mounted.
-  fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true
-  # mount-s3 REFUSES a non-empty mountpoint ("fuse: mountpoint is not empty").
-  # If a prior run (or a manual use of this path as a plain dir) left files
-  # behind, recreate the mountpoint clean. Guarded: only when it is NOT a live
-  # mount, so we never rm through an active FUSE endpoint.
-  if ! mountpoint -q "$MP" && [ -n "$(ls -A "$MP" 2>/dev/null)" ]; then
-    sudo rm -rf "$MP" && sudo mkdir -p "$MP"
-  fi
-  if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
-       mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
-       --maximum-throughput-gbps "${MPS3_TPUT_GBPS:-25}" --max-threads "${MPS3_MAX_THREADS:-64}" \
-       --allow-delete --allow-overwrite --metadata-ttl minimal "$BKT" "$MP"; then
-    echo "!! fio SKIPPED: could not mount s3://$BKT at $MP via mountpoint-s3"; return 0
-  fi
-  local D="$MP/bench-fio-$$"; sudo mkdir -p "$D"
-  echo "== fio WRITE ($NJ jobs x $FSZ, bs=1M, psync/create_on_open, mount-s3) =="
-  # HARD TIMEOUT: mp-s3 FUSE write of large files can WEDGE — fio hangs in end_fsync
-  # while mount-s3 uploads 0 bytes (measured 2026-08-05: 4.2 MB/s on a 4xlarge
-  # gateway, full wedge on a c6in.large). Cap it so the suite can NEVER hang; on
-  # timeout, say so and point at native S3 (the warp PUT above) for real write BW.
-  local FIO_WR_TO="${FIO_WRITE_TIMEOUT:-180}"
-  # --percentile_list=50:99 + grep the clat line so the summary can report clat p50/p99
-  # (previously only the WRITE:/READ: bandwidth line was kept, so clat showed n/a).
-  if ! sudo timeout -s KILL "$FIO_WR_TO" fio --name=w --directory="$D" --rw=write --bs=1M --size="$FSZ" --numjobs="$NJ" \
-       --ioengine=psync --create_on_open=1 --fallocate=none --end_fsync=1 --percentile_list=50:99 --group_reporting 2>&1 | grep -iE 'WRITE:|clat perc|th=\['; then
-    echo "  !! fio mp-s3 WRITE stalled/timed out (>${FIO_WR_TO}s) — mount-s3 FUSE write wedges on large files; use native S3 (warp PUT above) for write throughput"
-  fi
-  echo "== fio SEQ READ (buffered psync, blobber-served: set ${NJ}x${FSZ} > gw RAM) =="
-  sudo fio --name=w --directory="$D" --rw=read --bs=1M --size="$FSZ" --numjobs="$NJ" \
-    --ioengine=psync --fallocate=none --percentile_list=50:99 --group_reporting 2>&1 | grep -iE 'READ:|clat perc|th=\['
-  sudo rm -rf "$D"
-  fusermount -u "$MP" 2>/dev/null || sudo umount -l "$MP" 2>/dev/null || true; }
-
 # --- mlperf resnet50 (dlio 2.0) over MOUNTPOINT-S3 (the mlperf-mp-s3 read path) --
 # NOT the NFS mount: mlperf reads via mount-s3 (FUSE over the gateway S3), same as
 # the cluster's mlperf-mp-s3 button.
 bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
-  # mount_nfs's return value was DISCARDED here (bench_fio checks it, mlperf did
+  # mount_nfs's return value was DISCARDED here (mlperf did
   # not). With no NFS client installed the mount fails, `sudo mkdir -p "$NG"`
   # then creates a plain LOCAL directory under the mountpoint, and dlio generates
   # the whole dataset onto the client's own disk — 30 GiB of it, reported as
@@ -436,7 +360,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   disk_guard; }
 
 case "$WHAT" in
-  warp) bench_warp;; ttfb) bench_ttfb;; fio) bench_fio;; mlperf) bench_mlperf;;
-  all) bench_ttfb; bench_warp; bench_fio; bench_mlperf;;
-  *) echo "usage: $0 <warp|ttfb|fio|mlperf|all>"; exit 1;;
+  warp) bench_warp;; ttfb) bench_ttfb;; mlperf) bench_mlperf;;
+  all) bench_ttfb; bench_warp; bench_mlperf;;
+  *) echo "usage: $0 <warp|ttfb|mlperf|all>"; exit 1;;
 esac

@@ -8,7 +8,7 @@
 #                         if you don't have them, stands up an Iceberg catalog
 #                         (:8181) and/or an S3 warehouse bucket here for you,
 #                         then prints the values to point the Blimp cluster at.
-#   blimp --storage       TEST: storage/cache suite (warp, fio, mlperf, cache).
+#   blimp --storage       TEST: storage suite (warp, mlperf).
 #   blimp --query         TEST: query + CDC suite (author → append → delta-merge).
 #   blimp --bench         BENCH: statistical author / materialize / delta-merge
 #                         timing profile (min/median/avg/max over N iterations).
@@ -375,122 +375,6 @@ PYEOF
 # IP? Yes → vpc mode (private IPs, IAM role, VPC S3 endpoint — no egress). No
 # (non-AWS, cross-VPC, or cross-account) → external mode (stable DNS, explicit
 # creds, public advertise). Sets MODE / GW_DEFAULT / ADVERTISE_DEFAULT / CREDS_HINT.
-# ---- read-through cache: point the cluster router at THIS node's origin ------
-# The Blimp node's router (:8088) is provisioned with its upstream set to the
-# gateway itself (-s3-endpoint http://127.0.0.1:9000) and an EMPTY -cache-buckets.
-# That makes it a degenerate pass-through: a client GET for an origin object is
-# looked up on the gateway (which does not have it) and the evictor never starts
-# ("[evict] disabled (buckets=0)"). Setup used to only PRINT the fix and call it
-# optional, so the cache-miss→write / cache-hit→read legs had no path at all and
-# every cache number was zero.
-#
-# Retarget it here, at setup, so the client can pull its data THROUGH the Blimp
-# node and a miss actually fetches from this node's origin and writes into the
-# eblobber-backed cache. Only the zus-router container is touched — the gateway
-# itself is already wired live over /admin/source/configure and is NOT restarted.
-wire_router_cache(){
-  bold "== read-through cache: pointing the Blimp node's router at s3://$ORIGIN_BUCKET =="
-  # ONE AUTHENTICATED POST. No ssh, no SSM, no docker on the Blimp node — the
-  # client box has none of those, and the kit must not need them.
-  #
-  # The Router is provisioned by zs3-init BEFORE the customer's source is known:
-  # it starts with -s3-endpoint pointing at the gateway itself and an EMPTY
-  # -cache-buckets, so it is a pass-through whose evictor never ran
-  # ("[evict] disabled (buckets=0)"). Those were start-flags, so the only way to
-  # re-point it used to be recreating the container — impossible from here. The
-  # Router now takes them at runtime on /admin/cache/config.
-  local body resp
-  body=$(HB_BKT="$ORIGIN_BUCKET" HB_EP="${S3_ENDPOINT:-}" HB_REG="$REGION" \
-    HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_NS="${NAMESPACE:-tpcds}" \
-    python3 -c 'import json,os;print(json.dumps({"buckets":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_region":os.environ["HB_REG"],"s3_access_key":os.environ["HB_KEY"],"s3_secret_key":os.environ["HB_SEC"],"default_namespace":os.environ["HB_NS"]}))' 2>/dev/null)
-  resp=$(curl -s -m 30 -X POST "http://$GW:8088/admin/cache/config" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \
-    -d "$body" 2>/dev/null || true)
-  case "$resp" in
-    *'"upstream"'*)
-      echo "  ✓ router retargeted — $(printf '%s' "$resp" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("upstream=%s buckets=%s ns=%s"%(d.get("upstream"),",".join(d.get("buckets") or []),d.get("default_ns")))' 2>/dev/null)" ;;
-    *unauthorized*)
-      echo "  ! router rejected the admin token — check CLUSTER_ID ($CLUSTER_ID)" ;;
-    "")
-      echo "  ! router :8088 unreachable from this node — the cache stays off and"
-      echo "    blimp --storage's cache legs will read 0 objects." ;;
-    *)
-      echo "  ! router retarget failed: $(printf '%s' "$resp" | head -c 200)"
-      echo "    (an older router image has no runtime cache config — it must be"
-      echo "     re-pointed by the operator, or the image updated)" ;;
-  esac
-  arm_evictor
-}
-
-# arm_evictor STARTS the router's capacity evictor. The runtime POST above
-# retargets the read-through upstream but does NOT arm the evictor: it keys off
-# the LAUNCH -cache-buckets flag, which the router boots with EMPTY, so it logs
-# "[evict] disabled (buckets=0)" and the cache grows unbounded (until the
-# eblobbers cross the ~90% write threshold and every write fails). The ONLY path
-# that (re)launches the router WITH -cache-buckets is the node's zus-cdc
-# /cache/probe (it has docker; the router HTTP API and this client do not). So
-# fire it once here. Best-effort: an unreachable/older cdc just leaves eviction
-# off (logged), never fails setup. Verify + drive it with `blimp --evict`.
-arm_evictor(){
-  [ -n "${ORIGIN_BUCKET:-}" ] || return 0
-  local pbody presp
-  pbody=$(HB_BKT="$ORIGIN_BUCKET" HB_EP="${S3_ENDPOINT:-}" HB_REG="$REGION" \
-    HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_PCT="${EVICT_PCT:-80}" \
-    python3 -c 'import json,os;print(json.dumps({"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_region":os.environ["HB_REG"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"eviction_pct":float(os.environ["HB_PCT"])}))' 2>/dev/null)
-  presp=$(curl -s -m 90 -X POST "http://$GW:9401/cache/probe" \
-    -H "Content-Type: application/json" -d "$pbody" 2>/dev/null || true)
-  if [ -n "$presp" ]; then
-    ARMED=1
-    echo "  ✓ evictor armed — router relaunched with -cache-buckets=$ORIGIN_BUCKET (zus-cdc /cache/probe)"
-  else
-    ARMED=0
-    echo "  ! zus-cdc :9401 /cache/probe unreachable — evictor stays disabled; the cache will not self-bound"
-  fi
-}
-
-# ---- the object set the router cache test pulls through the Blimp node -------
-# The customer's own tables are the wrong shape for this: at SF1 the whole origin
-# is 24 single-parquet objects (~370 MB), so a read cannot parallelise and every
-# number is per-request-latency bound rather than a measure of the cluster. So
-# place a purpose-built set in the origin at setup time — it lands in THIS node's
-# storage (the MinIO standup_data stood up, or the customer's own bucket), and
-# `blimp --storage` then pulls it through the Blimp node's router: first pass
-# misses (origin -> router -> blimp node = the cache-fill/write rate), second
-# pass hits (served from the eblobber cache = the cache-read rate).
-seed_router_cache_set(){
-  # 10 GiB / 10 parts — MUST match run_router.sh's defaults, or --setup seeds a
-  # set the storage leg then regenerates at a different size. See the sizing
-  # rationale there: per-blobber shard share has to exceed per-blobber RAM or the
-  # cache "hit" is served from the eblobbers' page cache.
-  local pfx="${BENCH_PREFIX:-_blimp_cachebench}" gb="${BENCH_GB:-10}" parts="${BENCH_PARTS:-10}"
-  [ "${gb:-0}" -gt 0 ] || return 0
-  local ep=""; [ -n "${S3_ENDPOINT:-}" ] && ep="--endpoint-url $S3_ENDPOINT"
-  local want=$(( gb * 1073741824 )) have
-  # shellcheck disable=SC2086
-  have=$(AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
-         aws s3 ls "s3://$ORIGIN_BUCKET/$pfx/" --recursive --region "$REGION" $ep 2>/dev/null | awk '{s+=$3} END{print s+0}')
-  if [ "${have:-0}" -ge "$want" ]; then
-    bold "  ✓ router cache test set already in s3://$ORIGIN_BUCKET/$pfx/ ($(awk -v b="$have" 'BEGIN{printf "%.1f",b/1073741824}') GiB)"
-    return 0
-  fi
-  bold "  placing a ${gb} GB router cache test set in s3://$ORIGIN_BUCKET/$pfx/ ($parts parts)"
-  local part_mb=$(( gb * 1024 / parts )) gen i=0
-  gen=$(mktemp -d /var/tmp/blimp-bench.XXXXXX) || return 0
-  while [ "$i" -lt "$parts" ]; do
-    i=$((i+1))
-    # /dev/urandom, not /dev/zero: zeros are trivially compressible and any layer
-    # that compresses would flatter every number downstream.
-    dd if=/dev/urandom of="$gen/part-$i.bin" bs=1M count="$part_mb" 2>/dev/null &
-    [ $((i % 4)) -eq 0 ] && wait
-  done
-  wait
-  # shellcheck disable=SC2086
-  AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
-    aws s3 cp "$gen/" "s3://$ORIGIN_BUCKET/$pfx/" --recursive --region "$REGION" $ep --only-show-errors \
-    || echo "  ! could not upload the router cache test set to s3://$ORIGIN_BUCKET/$pfx/"
-  rm -rf "$gen"
-  bold "  ✓ router cache test set in place — blimp --storage reads it through http://$GW:8088"
-}
 
 assess_mode(){
   MODE=external; GW_PRIV=""; GW_PUB=""
@@ -837,14 +721,6 @@ except Exception: print("")' 2>/dev/null)
     ensure_acid_tools || true   # porcupine ACID checker (Go build); non-fatal
   fi
 
-  # 3. Read-through cache (router :8088) — not surfaced from run-blimp for now.
-  #    wire_router_cache / seed_router_cache_set are kept intact; set
-  #    BLIMP_ROUTER=1 to re-enable the router wiring at setup.
-  if [ "${BLIMP_ROUTER:-0}" = 1 ]; then
-    wire_router_cache
-    seed_router_cache_set
-  fi
-
   echo; bold "setup done — everything is wired. Validate with:  blimp --query    (and  blimp --storage )"
 }
 
@@ -876,14 +752,13 @@ preflight(){
   if [ "$need_tools" = "1" ]; then
     local miss=""
     command -v warp     >/dev/null || miss="$miss warp"
-    command -v fio      >/dev/null || miss="$miss fio"
     command -v mount-s3 >/dev/null || miss="$miss mount-s3"
     [ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] || miss="$miss dlio"
     if [ -n "$miss" ]; then
       echo "  ✗ missing benchmark tools:$miss  → run 'blimp --setup' (installs them)"
       problems=$((problems+1))
     else
-      echo "  ✓ benchmark tools present (warp fio mount-s3 dlio)"
+      echo "  ✓ benchmark tools present (warp mount-s3 dlio)"
     fi
   fi
   if [ "$problems" -gt 0 ]; then
@@ -921,7 +796,7 @@ need_env(){
 
 # ensure_storage_tools — the --storage suite's benchmark tools, installed
 # self-contained like ensure_deps: warp (pinned ≥1.1.4 — older warp's output
-# format parses as blank numbers), fio, and mount-s3 + dlio for mlperf.
+# format parses as blank numbers), and mount-s3 + dlio for mlperf.
 # BLIMP_SKIP_DEPS=1 opts out on hardened/offline hosts.
 ensure_storage_tools(){
   [ "${BLIMP_SKIP_DEPS:-0}" = 1 ] && return 0
@@ -936,11 +811,6 @@ ensure_storage_tools(){
       && sudo install /tmp/warp /usr/local/bin/warp && rm -f /tmp/warp.tgz /tmp/warp \
       || echo "  ! warp install failed — warp sections will be skipped"
   fi
-  command -v fio >/dev/null || {
-    bold "  installing fio…"
-    if command -v apt-get >/dev/null; then sudo apt-get install -y -qq fio 2>&1 | tail -1 || true
-    elif command -v yum >/dev/null; then sudo yum install -y -q fio 2>&1 | tail -1 || true; fi
-  }
   # mount-s3 — needed for BOTH the mlperf read path and the cache-mp-s3 leg.
   # This was apt-ONLY, so on an rpm host (AL2023, the default Amazon Linux client)
   # the whole block was skipped silently: `mount-s3: missing`, cache-mp-s3 reported
@@ -989,21 +859,6 @@ ensure_storage_tools(){
     { [ -x /usr/lib64/openmpi/bin/mpirun ] || [ -x /usr/bin/mpirun ] || command -v mpirun >/dev/null; } \
       || echo "  ! openmpi install failed — mlperf will fail with 'cannot load MPI library'"
   fi
-  # NFS client. The gateway exports its namespace over NFS4 and both the fio leg
-  # and mlperf's data generation write through it — but nothing installed the
-  # client, so `mount -t nfs4` failed with "bad option; you might need a
-  # /sbin/mount.nfs4 helper program", mlperf silently generated its dataset onto
-  # the LOCAL disk under the mountpoint, and the write number measured the client
-  # box instead of the cluster.
-  if [ ! -x /sbin/mount.nfs4 ] && [ ! -x /usr/sbin/mount.nfs4 ]; then
-    bold "  installing the NFS client (fio + mlperf write through the gateway's NFS export)…"
-    if command -v dnf >/dev/null; then sudo dnf install -y -q nfs-utils >/dev/null 2>&1
-    elif command -v yum >/dev/null; then sudo yum install -y -q nfs-utils >/dev/null 2>&1
-    elif command -v apt-get >/dev/null; then sudo apt-get install -y -qq nfs-common >/dev/null 2>&1; fi
-    { [ -x /sbin/mount.nfs4 ] || [ -x /usr/sbin/mount.nfs4 ]; } \
-      || echo "  ! NFS client install failed — the fio and mlperf legs will be skipped"
-  fi
-
   # dlio (mlperf resnet50 driver) — venv install, one-time.
   if [ ! -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ]; then
     bold "  installing dlio-benchmark (one-time, mlperf)…"
@@ -1045,7 +900,7 @@ ensure_storage_tools(){
       printf '%s\n' "$dout" | tail -3 | sed 's/^/    | /'
     }
   fi
-  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · fio: $(fio --version 2>/dev/null || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing)"
+  echo "  warp: $(warp --version 2>/dev/null | head -1 || echo missing) · mount-s3: $(command -v mount-s3 >/dev/null && echo ok || echo missing) · dlio: $([ -x /opt/dlio/venv_mlperf/bin/dlio_benchmark ] && echo ok || echo missing)"
 }
 
 # ACID_BIN — the compiled porcupine linearizability checker (built from acid/).
@@ -1098,7 +953,6 @@ cmd_storage(){
   # — taking warp AND mlperf with it — while the suite still printed a summary,
   # just with the throughput fields empty:
   #     warp   S3 PUT  MiB/s · GET  MiB/s          <- blank, looks like a format bug
-  #     cache  direct-S3 26 · router 20 · mp-s3 n/a
   # An empty number reads as "the tool is broken", not "you gave me no key", so
   # say which one is missing and where to get it.
   if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
@@ -1109,28 +963,20 @@ cmd_storage(){
   add them to $ENVF as GW_AK= / GW_SK=, or pass them for one run:
       GW_AK=... GW_SK=... blimp --storage"
   fi
-  ORIGIN_BUCKET="${ORIGIN_BUCKET:-$(ask ORIGIN_BUCKET "Origin S3 bucket (read-through cache)")}"
-  # Forward the ORIGIN's location + keys too. This env list is a whitelist, so a
-  # variable absent from it simply does not reach the suite: S3_ENDPOINT/S3_KEY/
-  # S3_SECRET were saved to the wiring file and read by run_router.sh, but never
-  # passed here — so every origin call fell back to the IAM role and MinIO
-  # answered InvalidAccessKeyId. The listing came back empty and the leg died
-  # with "no objects under s3://<bucket>/{_blimp_cachebench}/".
   # Run the suite LOCALLY (on THIS node, to measure the real client->gateway
   # path), capturing its output. Unlike --query — which runs SERVER-SIDE, so the
   # gateway's cdc_service tracks it live and the UI shows a yellow "running" row
   # with partial data — --storage runs HERE, so the gateway has no live view. To
   # give the SAME live UI, a background heartbeat POSTs the partial results to
   # cdc_service every <180s as status=running (the UI shows the live row), and we
-  # exits. Each leg (warp/fio/mlperf) now registers its OWN internal-format run from
+  # exits. Each leg (warp/mlperf) now registers its OWN internal-format run from
   # inside test_cache.sh — identical type + labels to the gateway's run_bench rows,
   # with cdc sampling the tier columns via __tiers__ — so there is no combined
   # "storage (client)" heartbeat here anymore. CLUSTER_ID is forwarded so the
   # per-leg POST /bench/import is authed (Bearer zus-<CLUSTER_ID>).
-  env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" ORIGIN_BUCKET="$ORIGIN_BUCKET" \
+  env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" \
     CLUSTER_ID="$CLUSTER_ID" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" \
     REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
-    S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     STORAGE_LEGS="${STORAGE_LEGS:-}" \
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
     MLPERF_ACCELS="${MLPERF_ACCELS:-}" MLPERF_REGEN="${MLPERF_REGEN:-}" \
@@ -1173,7 +1019,7 @@ rid,host,status=sys.argv[1],sys.argv[2],sys.argv[3]
 try: raw=open(os.environ["CLOG"],errors="replace").read()
 except Exception: raw=""
 c=re.sub(r"\x1b\[[0-9;]*m","",raw)
-# throughput is normalised to DECIMAL MB/s (or GB/s >=1000) — warp/fio report
+# throughput is normalised to DECIMAL MB/s (or GB/s >=1000) — warp reports
 # BINARY MiB/s, but the UI + gateway rows use MB/s, so convert (1 MiB = 1.048576 MB).
 def to_mb(v,u):
     v=float(v); u=u.lower()
@@ -1200,18 +1046,10 @@ for ln in c.splitlines():
         med=g(r"Median:\s*([0-9a-z]+)",s); p99=g(r"99th:\s*([0-9a-z]+)",s); avg=g(r"Avg:\s*([0-9a-z]+)",s)
         parts=[x for x in [("p50 "+med if med else ""),("p99 "+p99 if p99 else ""),("avg "+avg if avg else "")] if x]
         rows.append(["TTFB 1KiB GET (conc1)", " · ".join(parts)]); continue
-    if s.startswith("WRITE:") or "write BW" in s:
-        v=thr(s,paren=True)
-        if v: rows.append(["fio write (mp-s3, 4 jobs)", v]); continue
-    if s.startswith("READ:") or "seq read" in s:
-        v=thr(s,paren=True)
-        if v: rows.append(["fio read (cold seq)", v]); continue
     if "mlperf read" in s:
         au=g(r"AU\s*([0-9.]+)",s); io=thr(s); acc=g(r"accel=([0-9]+)",s)
         parts=[x for x in [("AU "+au+"%" if au else ""),(io if io else "")] if x]
         rows.append(["mlperf resnet50"+(" accel-"+acc if acc else ""), " · ".join(parts)]); continue
-    if re.search(r"cache .*(direct|router|mp-s3)",s):
-        rows.append(["cache read-through", re.sub(r"\s+"," ",s)[:120]]); continue
 od=[]; seen={}
 for k,v in rows:
     if k not in seen: od.append(k)
@@ -1291,7 +1129,7 @@ done
 #                   total-order probe. (Some completed-op errors here are just
 #                   the FUSE client refusing concurrent writers to one key; the
 #                   verdict is over the ops that COMPLETED.)
-# LINEARIZABLE on every endpoint == the gateway+router+mp-s3 stack preserves
+# LINEARIZABLE on every endpoint == the gateway+mp-s3 stack preserves
 # read-after-write and never exposes a torn erasure-decode under load.
 cmd_acid(){
   need_env
@@ -1302,7 +1140,7 @@ cmd_acid(){
   [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || die "gateway S3 credentials required (GW_AK/GW_SK)"
   ensure_acid_tools || die "porcupine checker unavailable — run 'blimp --setup'"
   local CL="${ACID_CLIENTS:-8}" KEYS="${ACID_KEYS:-4}" DUR="${ACID_DURATION:-45s}"
-  local ROUTER_PORT="${ROUTER_PORT:-8088}" S3_PORT="${S3_PORT:-9000}"
+  local S3_PORT="${S3_PORT:-9000}"
   local MP="${ACID_MPS3_MNT:-/mnt/mps3-acid}" BKT="${ACID_BUCKET:-blimp-acid}"
   export AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" AWS_REGION=us-east-1
   aws s3 mb "s3://$BKT" --endpoint-url "http://$GW:$S3_PORT" >/dev/null 2>&1 || true
@@ -1337,8 +1175,7 @@ cmd_acid(){
   # Per-leg verdict tracking. The summary MUST reflect what actually happened —
   # a leg is one of: PASS (RESULT: LINEARIZABLE), FAIL (NOT LINEARIZABLE / any
   # result=Illegal), or NO-RESULT (the checker produced no verdict at all —
-  # e.g. the endpoint was unreachable, or the router was retargeted to a
-  # customer source so the test bucket isn't there). A NO-RESULT leg is NOT a
+  # e.g. the endpoint was unreachable). A NO-RESULT leg is NOT a
   # pass and must never be reported as one.
   local acid_pass=0 acid_fail=0 acid_noresult=0 acid_bad=""
   run_one(){ # <label> <profile> <cmd...>
@@ -1352,8 +1189,7 @@ cmd_acid(){
     else
       # A NO-RESULT leg means ptest died BEFORE any verdict — almost always the
       # seed PUT. Its reason is the whole diagnosis, so print it: greping only
-      # for RESULT threw the error away and left the leg silently unexplained
-      # ("404 NoSuchBucket" on the router looked identical to "unreachable").
+      # for RESULT threw the error away and left the leg silently unexplained.
       printf '%s\n' "$out" | grep -v '^$' | tail -2 | sed 's/^/     ! /'
       acid_noresult=$((acid_noresult+1)); acid_bad="$acid_bad|NO-RESULT $label/$profile"
     fi
@@ -1372,33 +1208,6 @@ cmd_acid(){
   bold "ACID / linearizability — node $GW  (bucket s3://$BKT)"
   run_leg "gateway S3 :$S3_PORT"  -mode s3     -endpoint "$GW:$S3_PORT"
 
-  # Router (:8088) ACID leg is disabled by default — the read-through cache is
-  # not surfaced from run-blimp for now. Set ACID_ROUTER=1 to run it. The leg
-  # code below is kept intact.
-  if [ "${ACID_ROUTER:-0}" = 1 ]; then
-  # The router is a READ-THROUGH cache: it proxies writes to whatever origin
-  # --setup retargeted it at, NOT to the gateway's own S3. So creating $BKT on
-  # :9000 (above) is not enough — the origin needs it too, or every seed PUT
-  # through :8088 dies "404 NoSuchBucket" and the leg reports no verdict. That
-  # is the recommended prod wiring, so the router leg was unrunnable by default.
-  router_ready=1
-  if [ -n "${S3_ENDPOINT:-}" ]; then
-    AWS_ACCESS_KEY_ID="${S3_KEY:-$GW_AK}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-$GW_SK}" \
-      aws s3 mb "s3://$BKT" --endpoint-url "$S3_ENDPOINT" >/dev/null 2>&1 || true
-    AWS_ACCESS_KEY_ID="${S3_KEY:-$GW_AK}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-$GW_SK}" \
-      aws s3 ls "s3://$BKT" --endpoint-url "$S3_ENDPOINT" >/dev/null 2>&1 || router_ready=0
-  fi
-  if [ "$router_ready" = 1 ]; then
-    run_leg "router :$ROUTER_PORT"  -mode router -endpoint "$GW:$ROUTER_PORT"
-  else
-    # Say so loudly and count it — an unrunnable leg is not a pass, but it is
-    # also not evidence of a consistency bug, and must not read as one.
-    echo; bold "== router :$ROUTER_PORT =="
-    echo "!! router leg SKIPPED: test bucket s3://$BKT absent on the router origin (${S3_ENDPOINT:-unset})"
-    echo "   the router writes through to the origin; create the bucket there to run this leg."
-    acid_noresult=$((acid_noresult+2)); acid_bad="$acid_bad|SKIPPED router (origin lacks s3://$BKT)"
-  fi
-  fi
 
   # mountpoint-s3 leg — mount the bucket as a filesystem over the gateway S3 and
   # run the file backend against it. Always remount (a stale FUSE endpoint reads
@@ -1436,80 +1245,10 @@ cmd_acid(){
   elif [ "$acid_noresult" -gt 0 ]; then
     printf '\033[33m\033[1mACID check: %d leg(s) LINEARIZABLE, but %d produced NO result — NOT a clean pass:\033[0m\n' "$acid_pass" "$acid_noresult"
     printf '%s\n' "$legs_bad"
-    echo "    (a NO-RESULT leg = endpoint unreachable or router retargeted to a customer source; investigate)"
+    echo "    (a NO-RESULT leg = endpoint unreachable; investigate)"
     return 2
   else
     bold "ACID check complete — LINEARIZABLE on all $acid_pass legs: read-after-write preserved, no torn reads."
-  fi
-}
-
-# ---- blimp --evict : prove the router's capacity evictor actually fires -------
-# "Evictions" on the cache panel is only meaningful if the evictor is armed. It
-# keys off the LAUNCH -cache-buckets flag; a router booted without it logs
-# "[evict] disabled (buckets=0)" and NEVER evicts — the cache grows unbounded
-# until the eblobbers cross the ~90% write threshold and every write fails. This
-# arms it (arm_evictor), shrinks max-bytes to a small TEST cap so overflow is
-# fast, drives the seeded set through the router until cache-fill crosses the
-# high-water, and proves evictions climb + bytes reclaim toward the low-water.
-_ev_get(){ printf '%s' "$1" | python3 -c "import json,sys
-try: print(json.load(sys.stdin).get('$2',0))
-except Exception: print(0)" 2>/dev/null || echo 0; }
-_ev_ios(){ curl -s -m 10 "http://$GW:8088/iostats" -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" 2>/dev/null; }
-
-cmd_evict(){
-  need_env
-  : "${GW:?run 'blimp --setup' first}" "${CLUSTER_ID:?}" "${ORIGIN_BUCKET:?run 'blimp --setup' first}"
-  local TOK="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" PFX="${BENCH_PREFIX:-_blimp_cachebench}"
-  local test_cap="${EVICT_MAX_BYTES:-2000000000}" timeout="${EVICT_TIMEOUT:-300}"
-  bold "== blimp --evict — capacity-eviction verification =="
-
-  # 1) Arm the evictor (idempotent relaunch of the router WITH -cache-buckets).
-  arm_evictor
-
-  # 2) Live config; shrink the byte cap so the fill overflows it quickly.
-  local cfg orig_max; cfg=$(curl -s -m10 "http://$GW:8088/admin/cache/config" -H "Authorization: Bearer $TOK" 2>/dev/null)
-  orig_max=$(_ev_get "$cfg" max_bytes)
-  echo "  live: max_bytes=$orig_max high_pct=$(_ev_get "$cfg" high_pct) low_pct=$(_ev_get "$cfg" low_pct)"
-  echo "  test cap: max_bytes=$test_cap (high-water ~$(( test_cap*80/100 )) B) so eviction triggers on a small fill"
-  curl -s -m10 -X POST "http://$GW:8088/admin/cache/config" -H "Authorization: Bearer $TOK" \
-    -H "Content-Type: application/json" -d "{\"max_bytes\":$test_cap}" >/dev/null 2>&1
-  # Restore the real cap on any exit so a test never leaves the cache unbounded.
-  # Bake GW/TOK/orig_max in NOW (double quotes) — an EXIT trap fires at shell exit,
-  # after cmd_evict's locals are gone, so a $-ref would be unbound under set -u.
-  trap "curl -s -m10 -X POST 'http://$GW:8088/admin/cache/config' -H 'Authorization: Bearer $TOK' -H 'Content-Type: application/json' -d '{\"max_bytes\":${orig_max:-55000000000}}' >/dev/null 2>&1" EXIT
-
-  # 3) Drive the seeded set through the router (:8088) so cache-fill climbs.
-  export AWS_ACCESS_KEY_ID="${GW_AK:?}" AWS_SECRET_ACCESS_KEY="${GW_SK:?}"
-  local ep="http://$GW:8088" keys before after ev_before ev_after b_ev
-  keys=$(aws --endpoint-url "$ep" s3 ls "s3://$ORIGIN_BUCKET/$PFX/" 2>/dev/null | awk '{print $NF}')
-  [ -n "$keys" ] || { echo "  ! no seeded set at s3://$ORIGIN_BUCKET/$PFX/ — run 'blimp --setup' (or --storage) first"; return 2; }
-  ev_before=$(_ev_get "$(_ev_ios)" evictions)
-  echo "  driving s3://$ORIGIN_BUCKET/$PFX/ through the router until it overflows the cap (evictions before=$ev_before)…"
-  local deadline=$(( $(date +%s) + timeout )) pass=0 round=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    round=$((round+1))
-    for k in $keys; do aws --endpoint-url "$ep" s3 cp "s3://$ORIGIN_BUCKET/$PFX/$k" - >/dev/null 2>&1; done
-    local ios; ios=$(_ev_ios)
-    ev_after=$(_ev_get "$ios" evictions); b_ev=$(_ev_get "$ios" bytes_evicted)
-    echo "    round $round: evictions=$ev_after bytes_evicted=$b_ev written=$(_ev_get "$ios" bytes_written_to_cache)"
-    if [ "${ev_after:-0}" -gt "${ev_before:-0}" ] && [ "${b_ev:-0}" -gt 0 ]; then pass=1; break; fi
-  done
-
-  echo
-  if [ "$pass" = 1 ]; then
-    bold "  ✓ EVICTION WORKS — evictor fired (evictions $ev_before→$ev_after, bytes_evicted=$b_ev) and reclaimed the cache toward the low-water."
-  elif [ "${ARMED:-0}" = 1 ]; then
-    printf '\033[33m  ~ EVICTOR ARMED (fix confirmed) but no sweep-eviction within %ss.\033[0m\n' "$timeout"
-    echo "    The router was relaunched WITH -cache-buckets (was the bug), so eviction is enabled."
-    echo "    It did not FIRE because the evictor honours the LAUNCH -cache-max-bytes (free×80%, large"
-    echo "    on this box), not the runtime max_bytes shrink above. A definitive firing test needs the"
-    echo "    launch cap lowered — pending a max_bytes override on the /cache/probe recreate."
-    return 0
-  else
-    printf '\033[31m  ✗ EVICTION DISABLED — evictor was NOT armed (zus-cdc /cache/probe unreachable).\033[0m\n'
-    echo "    The router still runs with -cache-buckets empty (\"[evict] disabled (buckets=0)\"):"
-    echo "    the cache will not self-bound. Fix arm_evictor reachability, then re-run."
-    return 1
   fi
 }
 
