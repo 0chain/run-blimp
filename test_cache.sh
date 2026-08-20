@@ -173,7 +173,10 @@ LEGS="${STORAGE_LEGS:-all}"
 # The router read-through cache leg is NOT surfaced from run-blimp for now, so it
 # is opt-in only: `all` no longer includes it — request it explicitly with
 # STORAGE_LEGS=cache. (Leg code below is kept intact.)
-want(){ case "$1" in cache) case ",$LEGS," in *",cache,"*) return 0;; esac; return 1;; esac; case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
+# fio is DISABLED (2026-08-20): fio needs the NFS/FSAL path which the product no
+# longer runs; the storage suite is warp + mlperf (S3/mp-s3). `want fio` always
+# returns false, so the fio leg code below is kept intact but never executes.
+want(){ case "$1" in fio) return 1;; cache) case ",$LEGS," in *",cache,"*) return 0;; esac; return 1;; esac; case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
 [ "$LEGS" != "all" ] && echo "[legs] running only: $LEGS"
 
 # NO AUTOMATIC CLEANUP. A trap used to delete the bench artifacts on every exit —
