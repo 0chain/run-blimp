@@ -212,9 +212,8 @@ reads only |MV|+|delta| — not the fact again.
 
 ```bash
 # storage & cache suite (sized for the node; see caps in README)
-WARP_BUDGET_MIB=5120 FIO_JOBS=4 FIO_SIZE=1280M blimp --storage
+WARP_BUDGET_MIB=5120 blimp --storage
 #   warp   S3 PUT 749 MiB/s · GET 1673 MiB/s
-#   fio    NFS write 1137 MiB/s · read 937 MiB/s
 ```
 
 **Cluster stop/start** (raw EC2, no app involvement): private IPs survive so the

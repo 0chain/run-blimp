@@ -67,7 +67,7 @@ blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
 blimp --query         query optimizer + incremental CDC delta-merge
 blimp --storage       storage & read-through cache suite
-blimp --acid          ACID / linearizability check of all three data paths
+blimp --acid          ACID / linearizability check of both data paths
 blimp --bench         author / materialize / delta-merge timing profile
 ```
 
@@ -76,7 +76,7 @@ Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 
 Rough timing: `--setup` takes about 10-15 minutes end to end, `--query` about
 5 minutes, `--storage` about 30 minutes (it drives the fullest benchmark
-suite — warp, fio, mlperf, cache), and `--acid` about 5 minutes.
+suite — warp, mlperf, cache), and `--acid` about 5 minutes.
 
 **Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
 export these (or source a file with `set -a`) and `--setup` runs unattended:
@@ -224,12 +224,12 @@ keys copied). A sales-only append correctly reports `no-delta`, not a bug.
 
 ### B — `./blimp --storage` (storage & cache suite)
 
-Storage = warp S3 PUT/GET + TTFB, fio NFS, mlperf. The suite is
-**self-contained**: it installs its own tools first (warp pinned v1.1.4, fio,
+Storage = warp S3 PUT/GET + TTFB, mlperf. The suite is
+**self-contained**: it installs its own tools first (warp pinned v1.1.4,
 mount-s3, dlio) — `BLIMP_SKIP_DEPS=1` opts out on hardened hosts, and a
 section whose tool still can't install is skipped loudly. Cap sizes on small
 nodes:
-`WARP_BUDGET_MIB=5120 FIO_JOBS=4 FIO_SIZE=1280M MLPERF_NUM_FILES=35 ./blimp --storage`.
+`WARP_BUDGET_MIB=5120 MLPERF_NUM_FILES=35 ./blimp --storage`.
 
 ### C — `./blimp --bench` (timing profile)
 
@@ -292,7 +292,7 @@ under two profiles:
 | Path | What it is |
 |------|------------|
 | **gateway S3 :9000** | the raw S3 API → gosdk → blobbers |
-| **mountpoint-s3** | the gateway bucket mounted as a POSIX filesystem (the fio / mlperf / customer mount path) |
+| **mountpoint-s3** | the gateway bucket mounted as a POSIX filesystem (the mlperf / customer mount path) |
 
 - **single-writer** — one client writes a key while N clients read it. This is
   the read-after-write guarantee an object store actually promises; a stale or
@@ -469,14 +469,11 @@ live query over zus-1784970467881-0.zus.network:9000
 **D. `blimp --storage` numbers** (2/1 cluster, 5 GB warp set):
 ```
 warp   S3 PUT 749 MiB/s · GET 1673 MiB/s   (0 errors)
-fio    NFS write 1137 MiB/s · read 937 MiB/s
 ```
 
-Those are from a 2/1 cluster on larger instances. On a small node (c6in.large,
-2 vCPU) the same suite gave `fio NFS write 75.0MiB/s · read 352MiB/s` — the
-NFS leg is only meaningful when the origin set is large enough to exercise it
-(a single 17 MB object measures nothing and reports it as *slower* than
-direct S3 purely from per-request overhead). Size the set to the cluster.
+Those are from a 2/1 cluster on larger instances. Size the benchmark set to
+the cluster — a single 17 MB object measures nothing and reports throughput
+as *slower* than expected purely from per-request overhead.
 
 **E. `blimp --bench` — MV lifecycle timing profile:**
 
