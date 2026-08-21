@@ -2,36 +2,35 @@
 
 ## Blimp
 
-Blimp is an ACID cache and autonomous materialized view on Iceberg — an efficient per-core cache (2–4 GB/s per Blimp node) that keeps your AI/ML context fresh with CDC delta-merges served queries in 1-2s. One scalable Blimp node runs on any server or cloud you control; point your existing engines and Iceberg catalog at it to simplify your pipeline and lower inference and training cost. → [blimp.software](https://blimp.software)
+Blimp is an ACID cache and autonomous materialized view — an efficient per-core cache engine that keeps your CPU/GPU utilization high and AI/ML context fresh with delta change queries in 1-2s. Launch a scalable Blimp node on any server or cloud instance to optimize your existing pipeline → [blimp.software](https://blimp.software)
 
-`blimp` connects a **Blimp node** to **your** data which stays in your environment; Blimp
-only reads it.
+`run-blimp` connects a **Blimp node** to **your application**, which can use
+it for cache or query engine within your environment.
 
 ```
-   ┌─ your Iceberg node (any cloud) ─┐     ┌─────── Blimp node ───────┐
+   ┌───── your node (any cloud) ─────┐     ┌─────── Blimp node ───────┐
    │  blimp CLI                      │     │  gateway                 │
-   │  Iceberg REST  :8181  ──────────┼────▶│   S3 :9000               │
+   │  REST catalog  :8181  ──────────┼────▶│   S3 :9000               │
    │  your S3 / MinIO data           │ wire│   eblobbers              │
    └───────────────┬─────────────────┘     └───────────┬──────────────┘
                    └────── snapshot_changed webhook ─────┘
-                          (your pipeline, on each Iceberg commit)
+                          (your pipeline, on each commit)
 ```
 
-If your Iceberg node is already networked to the Blimp node (e.g. the same
-private network/account) — **vpc mode** — `--setup` reaches the gateway on
-its private IP using the node's own identity, no keys to type. Otherwise —
+If your node is already networked to the Blimp node (e.g. the same private
+network/account) — **vpc mode** — `--setup` reaches the gateway on its
+private IP using the node's own identity, no keys to type. Otherwise —
 **external mode** — it reaches the gateway over public DNS with explicit S3
 keys. `blimp --setup` detects which and wires it accordingly.
 
 **Both paths are supported and proven by this kit for demo/test setup — pick
-whichever matches where your Iceberg node already lives.** For
-**production**, run the Iceberg node on the same private network as the
-Blimp node (same account/region, ideally the same zone): that path uses
-private IPs with no S3 keys, and every S3 call to the origin stays off the
-public internet. A different network, account, or cloud works too, but adds
-network hops and (outside the same account/region) real data-transfer egress
-cost on every read — fine for a demo or a one-off test, but not the
-recommended production topology.
+whichever matches where your node already lives.** For **production**, run
+that node on the same private network as the Blimp node (same account/
+region, ideally the same zone): that path uses private IPs with no S3 keys,
+and every S3 call to the origin stays off the public internet. A different
+network, account, or cloud works too, but adds network hops and (outside the
+same account/region) real data-transfer egress cost on every read — fine for
+a demo or a one-off test, but not the recommended production topology.
 
 
 ## Install
@@ -156,7 +155,7 @@ Finally it prints the same values for the Blimp node UI (Query Optimizer →
 Production, the manual path) and the `snapshot_changed` webhook for your
 pipeline.
 
-### Step 3 — register your tables (if not already Iceberg)
+### Step 3 — register your tables (optional)
 
 ```
 venv/bin/python3 register_tpcds_tables.py \
@@ -166,7 +165,7 @@ venv/bin/python3 register_tpcds_tables.py \
 
 (`add_files` registration — no data copy.)
 
-### Step 4 — point the Blimp node at the source
+### Step 4 — point the Blimp node at the source (optional)
 
 **Automatic (no SSH):** `--setup` wires the cluster itself over the
 authenticated admin API — `POST http://<gw>:9000/admin/source/configure`
@@ -318,23 +317,6 @@ small gateway can starve it and produce spurious `Illegal` verdicts. (A
 concurrent-read `unexpected EOF` from the `warp` load tool specifically is a warp
 client artifact, not a consistency failure — verified separately with `aws s3
 cp` md5 checks that pass byte-for-byte with the strict ACID verify on and off.)
-
-## Notes
-
-**Blimp node stop/start (self-heal, no touch).** Raw instance stop/start:
-private IPs survive (private-network wiring reconnects untouched); public IPs
-change and the control plane's 60s cron reconciles the DB + every
-`zus-<id>-N` DNS record (gateway **and** blobbers) in ~1–2 min. MVs + wiring
-persist — re-run `--query`: the MV serves without re-author, CDC keeps
-merging.
-
-**Credentials model.**
-- **vpc mode: nothing typed.** Iceberg node + gateway each use their own
-  instance identity; bucket access is a policy naming that identity.
-- **external mode:** S3 keys typed once into `--setup` (`~/.blimp_env`,
-  mode 600); pasted into the Blimp node UI they are stored in a secrets
-  manager — only a reference reaches Blimp node config, never state/logs.
-- Gateway admin API: `Authorization: Bearer zus-<CLUSTER_ID>`.
 
 ---
 
