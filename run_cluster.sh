@@ -41,6 +41,22 @@ else                    EC_CONC=16
 EC_CONC="${WARP_CONC:-$EC_CONC}"
 echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC obj=$OSZ mlperf-accel=$EC_ACCEL rt=$EC_RT pf=$EC_PF"
 
+# FIT the dataset to the on-chain allocation so generation never runs OUT OF DISK.
+# mlperf writes a train set (EC_DATASET_GB) PLUS a ~27% eval set (ntrain 238 /
+# neval 64), so total ≈ EC_DATASET_GB × 1.27. An EC_DATASET_GB that ignores the
+# allocation overruns it mid-generate (e.g. 45 GB train → ~57 GB > a 48 GB alloc).
+# Query the real allocation capacity and cap so train+eval land at ~80% of it.
+# (No cap when the query fails — falls back to the EC default.)
+ALLOC_GB=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage?token=blimp-${CLUSTER_ID:-}" 2>/dev/null \
+  | grep -oE '"capacity_bytes":[0-9]+' | head -1 | grep -oE '[0-9]+' | awk '{printf "%d",$1/1073741824}')
+if [ "${ALLOC_GB:-0}" -gt 0 ]; then
+  FIT=$(( ALLOC_GB * 80 / 127 ))   # total=train×1.27 ≤ 80% of alloc → train ≤ alloc×0.63
+  if [ "$FIT" -gt 0 ] && [ "${EC_DATASET_GB:-0}" -gt "$FIT" ]; then
+    echo "[fit] allocation=${ALLOC_GB}GB -> cap EC_DATASET_GB ${EC_DATASET_GB}->${FIT}GB (train+eval ~80% of alloc; was overrunning the disk)"
+    EC_DATASET_GB=$FIT
+  fi
+fi
+
 W(){ warp "$1" --host="$GW:9000" --access-key="${AK:?set AK}" --secret-key="${SK:?set SK}" --tls=false --no-color "${@:2}"; }
 # clean_bkt — remove a warp/ttfb scratch bucket after use (warp --keep-data leaves it
 # on the allocation otherwise; that's what piled up 50+ GiB of warp* buckets). Uses
