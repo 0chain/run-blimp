@@ -29,6 +29,24 @@ EC="${EC:-2/1}"
 REGION="${REGION:-ap-south-1}"
 export GW GW_AK GW_SK EC REGION
 
+# AUTO-REAP the benchmark scratch buckets on exit (completion, error, or Ctrl-C) —
+# same policy as the cluster's run_bench.sh, so a run never leaves warp/mlperf data
+# filling the allocation disk (the small on-prem allocations fill fast: a 66 GiB
+# mlperf dataset alone pins an 8x12GB cluster at 90%). These are PURE SCRATCH
+# buckets (warp PUT/GET set, 1 KiB TTFB probe, the mlperf dataset) — regenerated
+# next run. Set BENCH_KEEP=1 to keep them (e.g. iterate mlperf accel/rt/pf without
+# the ~17 min regenerate). Only ever removes these known bench buckets — never data.
+reap_bench_buckets(){
+  [ -n "${BENCH_KEEP:-}" ] && { echo "[reap] BENCH_KEEP set — leaving bench scratch buckets"; return 0; }
+  command -v aws >/dev/null 2>&1 || return 0
+  echo "[reap] removing bench scratch buckets (warpbench/warpprobe/ttfb1k/mlperf-bench) to free the allocation disk"
+  for b in warpbench warpprobe ttfb1k mlperf-bench; do
+    AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" AWS_REGION="${REGION:-us-east-1}" \
+      aws s3 rb "s3://$b" --force --endpoint-url "http://$GW:9000" >/dev/null 2>&1 || true
+  done
+}
+trap reap_bench_buckets EXIT
+
 echo ""
 echo "gateway=$GW  EC=$EC ($REGION)"
 echo "----------------------------------------------------------------------"
@@ -117,25 +135,21 @@ LEGS="${STORAGE_LEGS:-all}"
 want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
 [ "$LEGS" != "all" ] && echo "[legs] running only: $LEGS"
 
-# NO AUTOMATIC CLEANUP. A trap used to delete the bench artifacts on every exit —
-# including the mlperf dataset, which costs ~17 minutes to regenerate on a small
-# client. Any rerun of the train leg (a different accel/rt/pf, or a rerun after a
-# crash) therefore paid the full regenerate again, and a run that failed for an
-# unrelated reason destroyed the dataset on its way out. The suite now LEAVES what
-# it wrote; remove it deliberately when you are done:
-#
+# CLEANUP is AUTOMATIC (reap_bench_buckets on EXIT, defined above) — same as the
+# cluster's run_bench.sh, so a run never leaves warp/mlperf data filling the small
+# on-prem allocation. To iterate the mlperf train leg (different accel/rt/pf) without
+# paying the ~17 min dataset regenerate each time, run with BENCH_KEEP=1 to keep the
+# scratch buckets; then remove them deliberately when done:
+#   BENCH_KEEP=1 blimp --storage        # keep warp/mlperf data across runs
 #   AWS_ACCESS_KEY_ID=$GW_AK AWS_SECRET_ACCESS_KEY=$GW_SK AWS_REGION=us-east-1 \
 #     aws s3 rb s3://mlperf-bench --force --endpoint-url http://$GW:9000
-#   for b in ttfb1k warpprobe warpbench; do aws s3 rb s3://$b --force \
-#     --endpoint-url http://$GW:9000; done
-#
-# Watch the allocation while leftovers accumulate. Check with:
+# Watch the allocation with:
 #   curl -s "http://$GW:9000/admin/alloc/usage?token=zus-<cluster-id>"
 
 # 1) warp — registered as ONE internal "warp" run (PUT + GET + TTFB), tiers by cdc
 if want warp; then
   WB="warp_$(date +%s)"; WL=$(mktemp); bl_post "$WB" running warp '[]'; sleep 6
-  run "1/4 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb 2>&1 | tee -a "$WL"
+  run "1/2 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb 2>&1 | tee -a "$WL"
   run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp 2>&1 | tee -a "$WL"
   bl_post "$WB" done warp "$(bl_parse warp "$WL")" "$WL"; rm -f "$WL"
 fi
@@ -150,7 +164,7 @@ fi
 # MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
 if want mlperf; then
   MB="mlperf_$(date +%s)"; ML=$(mktemp); bl_post "$MB" running "mlperf resnet50" '[]'; sleep 6
-  run "3/4 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
+  run "2/2 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
     env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" \
     MLPERF_IFACE=mps3 MLPERF_KEEP=1 CLUSTER_ID="$CLUSTER_ID" REGION="$REGION" \
     MLPERF_NUM_FILES="${MLPERF_NUM_FILES:-}" MLPERF_NUM_EVAL="${MLPERF_NUM_EVAL:-}" \
