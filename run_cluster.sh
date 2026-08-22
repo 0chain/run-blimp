@@ -31,9 +31,11 @@ d="${EC%%/*}"
 if [ "$d" -ge 8 ]; then EC_CONC=64
   EC_DATASET_GB=136; EC_ACCEL=6; EC_RT=24; EC_PF=48
 else                    EC_CONC=16
-  # 68 GiB set = 2x the 32 GiB gateway RAM: the warp GET can NOT be served from
-  # gateway page cache (34 GiB barely exceeded RAM and read cache-favorably).
-  EC_DATASET_GB=68;  EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
+  # 45 GiB set: still > the 32 GiB gateway RAM (so the warp GET / mlperf read can NOT
+  # be served from page cache), but sized to FIT the small 2/1 on-prem allocation
+  # (~64 GiB usable on an 8x12GB cluster). The old 68 GiB overfilled it to 90%+ and
+  # wedged mlperf on the disk-full guard. EC_DATASET_GB override still available.
+  EC_DATASET_GB="${EC_DATASET_GB:-45}"; EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
 # WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster
 # to conc=64 to see if more parallel GET streams lift blobber-served read throughput).
 EC_CONC="${WARP_CONC:-$EC_CONC}"
