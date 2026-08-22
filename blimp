@@ -913,7 +913,14 @@ ACID_BIN="$HERE/acid/ptest"
 # a present, runnable binary is reused.
 ensure_acid_tools(){
   [ "${BLIMP_SKIP_DEPS:-0}" = 1 ] && return 0
-  [ -x "$ACID_BIN" ] && { echo "  porcupine (acid): ok"; return 0; }
+  # Reuse ONLY a binary built for THIS host. A committed/pushed ptest is a wrong-arch
+  # trap: a Mac Mach-O passes `-x` but dies "Exec format error" (bit us — the repo
+  # shipped a Mach-O). Match the binary's format to the OS (ELF on Linux, Mach-O on
+  # Darwin); anything else rebuilds from source below. Falls through to rebuild if
+  # `file` is unavailable.
+  _want=ELF; [ "$(uname -s)" = Darwin ] && _want=Mach-O
+  if [ -x "$ACID_BIN" ] && file "$ACID_BIN" 2>/dev/null | grep -q "$_want"; then echo "  porcupine (acid): ok"; return 0; fi
+  [ -x "$ACID_BIN" ] && echo "  (existing ptest is wrong-arch for this host — rebuilding)"
   bold "== building the porcupine ACID checker (acid/ptest) =="
   local GO; GO=$(command -v go || echo /usr/local/go/bin/go)
   if ! "$GO" version >/dev/null 2>&1; then
