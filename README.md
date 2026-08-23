@@ -185,6 +185,38 @@ reads via its own identity.
 > Blimp node security group doesn't open 8181, serve the catalog on an open port
 > (e.g. `docker run -p 8081:8181 …`) and use that URL.
 
+## Fleet — one S3 URL for all your nodes
+
+When you run more than one Blimp node, they form a **fleet** with a **single
+S3 endpoint** and **one shared key** — you never juggle per-node URLs. Point any
+S3 tool or a `mount-s3` (FUSE) client at it and you see your **entire namespace**,
+no matter which node stores each object; content is deduplicated fleet-wide
+(identical data kept once across all nodes), and the URL is round-robin +
+health-checked, so a node going down moves traffic to a healthy one.
+
+- **Endpoint:** `https://fleet-<account>.blimp.software:9443` (TLS, path-style)
+- **Credentials:** your account's shared fleet S3 key (Access + Secret)
+- **S3 tools:**
+  ```
+  mc alias set fleet https://fleet-<account>.blimp.software:9443 <AK> <SK>
+  aws --endpoint-url https://fleet-<account>.blimp.software:9443 s3 ls
+  ```
+- **FUSE (mp-s3) — same endpoint, same key:**
+  ```
+  mount-s3 --endpoint-url https://fleet-<account>.blimp.software:9443 <bucket> /mnt/fleet
+  ```
+
+Any node resolves the full namespace (content-addressed dedup index +
+cross-node fetch), and a cross-node read that hits a transient break is retried
+**server-side** — the client never sees a truncated stream. Prefer the fleet URL
+over a per-node `blimp-<node>-0.blimp.software:9443` for anything user-facing.
+
+> One connection lands on one node, so a **single** client is bounded by that
+> node's link — run several clients (or several mounts) to aggregate across the
+> fleet. The `run-blimp` test harness does exactly this: it drives `warp`/`mlperf`
+> legs from multiple client boxes at the fleet URL so the round-robin spreads
+> them across nodes.
+
 ## Testing the Blimp node
 
 The `--query`, `--storage`, and `--bench` commands are **testing/validation
