@@ -77,31 +77,48 @@ mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
 
 # --- 1KiB TTFB: PUT conc=EC_CONC keep-data, then conc=1 GET (pure first-byte) ----
 bench_ttfb(){ echo "== 1KiB TTFB (PUT conc=$EC_CONC 10s, GET conc=1 ${TTFB_DUR}s) =="
-  W put --bucket=ttfb1k --obj.size=1KiB --concurrent="$EC_CONC" --duration=10s --keep-data >/dev/null 2>&1
-  W get --bucket=ttfb1k --list-existing --noclear --concurrent=1 --duration="${TTFB_DUR}s" 2>&1 | grep -iE 'TTFB:' | head -1
-  clean_bkt ttfb1k; }
+  local TB="ttfb1k-${WARP_RUN_ID:-$$}" # per-leg bucket (concurrent-safe)
+  W put --bucket="$TB" --obj.size=1KiB --concurrent="$EC_CONC" --duration=10s --keep-data >/dev/null 2>&1
+  W get --bucket="$TB" --list-existing --noclear --concurrent=1 --duration="${TTFB_DUR}s" 2>&1 | grep -iE 'TTFB:' | head -1
+  clean_bkt "$TB"; }
 
 # --- warp PUT + GET, 96MiB objects, conc=EC_CONC (separate, not mixed) ----------
 # run_bench sizes PUT_DUR from a rate probe so the PUT lands the FULL ~EC_DATASET_GB
 # set (> gateway RAM) — a fixed 30s only writes ~24GB and the GET then reads a
 # cache-favorable subset. Match it: probe 8s, set PUT_DUR = budget*1.1/rate (floor DUR).
 bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
+  # Per-RUN scratch buckets so CONCURRENT run-blimp warp legs (multiple
+  # `blimp --storage` against one cluster) don't collide on a shared bucket — a
+  # fixed warpbench/warpprobe had each leg clearing + reading the others' objects.
+  # $$ is this run_cluster.sh PID (unique per leg); WARP_RUN_ID overrides.
+  # S3 bucket names allow only lower-case a-z0-9 and hyphen — WARP_RUN_ID often
+  # carries underscores/dots/uppercase (a leg id, a host, a timestamp), which make
+  # warp fail with "Bucket name contains invalid characters" (silently, pre the
+  # error-surfacing grep above). Sanitize to a bucket-safe token so any run id works.
+  local RID; RID=$(printf '%s' "${WARP_RUN_ID:-$$}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+  [ -z "$RID" ] && RID=$$
+  local WB="warpbench-$RID" WP="warpprobe-$RID"
   # Start clean. warp PUT uses --keep-data (the GET reads back what PUT wrote),
   # so a killed/hung PUT leaves the full ~EC_DATASET_GB set on the blobbers. That
   # both skews the next GET and — on a disk sized for ONE dataset — starves the
   # very next write into disk_full (which mount-s3/warp then hang on). Purge the
   # warp scratch buckets BEFORE writing.
-  clean_bkt warpbench warpprobe
+  clean_bkt "$WB" "$WP"
   echo "== warp probe (8s) to size PUT to ${BUD}MiB set =="
-  local PR; PR=$(W put --bucket=warpprobe --obj.size="$OSZ" --concurrent="$EC_CONC" --duration=8s 2>&1 | grep -oE 'Average: [0-9.]+ [KMGT]?i?B/s' | head -1 | awk '{v=$2+0;u=$3; if(u~/GiB/)v*=1024; else if(u~/KiB/)v/=1024; printf "%d",v}')
+  local PROUT; PROUT=$(W put --bucket="$WP" --obj.size="$OSZ" --concurrent="$EC_CONC" --duration=8s 2>&1)
+  # Surface a failed probe instead of silently rendering it as "probe 0" (a
+  # saturated gateway makes warp emit `warp: <ERROR> …`, which the old
+  # Average-only grep dropped → misleading 0 with no cause in the log).
+  echo "$PROUT" | grep -iE '<ERROR>|fatal|panic|refused|denied' | head -2
+  local PR; PR=$(echo "$PROUT" | grep -oE 'Average: [0-9.]+ [KMGT]?i?B/s' | head -1 | awk '{v=$2+0;u=$3; if(u~/GiB/)v*=1024; else if(u~/KiB/)v/=1024; printf "%d",v}')
   [ -z "$PR" ] || [ "$PR" -le 0 ] && PR=0
   local PDUR="${WARP_PUT_DUR:-$DUR}"; [ "$PR" -gt 0 ] && { PDUR=$(( BUD * 11 / 10 / PR )); [ "$PDUR" -lt "$DUR" ] && PDUR="$DUR"; }
   echo "== warp PUT $OSZ (conc=$EC_CONC ${PDUR}s -> ~${BUD}MiB, probe ${PR}MiB/s) =="
-  W put --bucket=warpbench --obj.size="$OSZ" --concurrent="$EC_CONC" --duration="${PDUR}s" --keep-data 2>&1 | grep -iE 'Average:|Errors:' | head -2
+  W put --bucket="$WB" --obj.size="$OSZ" --concurrent="$EC_CONC" --duration="${PDUR}s" --keep-data 2>&1 | grep -iE 'Average:|Errors:|<ERROR>|fatal|panic|refused|denied' | head -4
   disk_guard
   echo "== warp GET $OSZ (conc=$EC_CONC list-existing ${DUR}s, blobber-served) =="
-  W get --bucket=warpbench --list-existing --noclear --concurrent="$EC_CONC" --duration="${DUR}s" 2>&1 | grep -iE 'Average:|Errors:' | head -2
-  clean_bkt warpbench warpprobe; }
+  W get --bucket="$WB" --list-existing --noclear --concurrent="$EC_CONC" --duration="${DUR}s" 2>&1 | grep -iE 'Average:|Errors:|<ERROR>|fatal|panic|refused|denied' | head -4
+  clean_bkt "$WB" "$WP"; }
 
 # --- mlperf resnet50 (dlio 2.0) over MOUNTPOINT-S3 (the mlperf-mp-s3 read path) --
 # NOT the NFS mount: mlperf reads via mount-s3 (FUSE over the gateway S3), same as
@@ -150,7 +167,11 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     echo "   install it:  sudo dnf install -y openmpi openmpi-devel   (or openmpi-bin libopenmpi-dev)"
     return 0
   fi
-  local BKT="${MLPERF_BUCKET:-mlperf-bench}" MPS3="${MPS3_MNT:-/mnt/mps3}" DLIO=/opt/dlio/venv_mlperf/bin/dlio_benchmark
+  # Per-PROCESS mp-s3 mountpoint so TWO concurrent `blimp --storage` mlperf legs on
+  # ONE client box don't collide: mount-s3 can't mount two sessions at the same
+  # path (2nd fails "Failed to create FUSE session"). $$ (this run_cluster.sh PID)
+  # is unique per concurrent leg; the dataset BUCKET stays shared (read-only reuse).
+  local BKT="${MLPERF_BUCKET:-mlperf-bench}" MPS3="${MPS3_MNT:-/mnt/mps3-$$}" DLIO=/opt/dlio/venv_mlperf/bin/dlio_benchmark
   # MEMORY GUARD, copied from the cluster (zs3-init.go run_bench). dlio's datagen
   # writes through /dev/shm and `mpirun -np ACCEL` spawns ACCEL torch ranks; none
   # of it is memory-bounded, so a run can exhaust RAM and wedge the whole box —
