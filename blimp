@@ -1281,7 +1281,9 @@ cmd_encryption(){
 }
 
 # cmd_immutable — toggle allocation immutability (on-chain update_allocation
-# file_options via the gateway). Reversible: on = forbid all writes, off = allow.
+# file_options via the gateway). Reversible: on = upload-only (forbid the mutating
+# ops update/delete/copy/move/rename; uploads, downloads and shares STILL allowed —
+# file_options=1), off = allow all ops (file_options=63).
 # Set ALLOC_ID to target a specific allocation; newer gateways default to their
 # own allocation when it's omitted.
 cmd_immutable(){
