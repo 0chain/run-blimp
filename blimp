@@ -119,6 +119,63 @@ E
   bold "saved wiring -> $ENVF"
 }
 
+# persist_wiring — rewrite just the GW_AK/GW_SK/CLUSTER_TOKEN lines in $ENVF from
+# the current in-memory values, leaving everything else untouched. Used by
+# heal_wiring after a redeploy rotates them.
+persist_wiring(){
+  [ -n "${ENVF:-}" ] && [ -f "$ENVF" ] || return 0
+  umask 077
+  local tmp="$ENVF.tmp.$$"
+  grep -vE '^(GW_AK|GW_SK|CLUSTER_TOKEN)=' "$ENVF" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  {
+    printf 'CLUSTER_TOKEN=%s\n' "${CLUSTER_TOKEN:-}"
+    printf 'GW_AK=%s\n' "${GW_AK:-}"
+    printf 'GW_SK=%s\n' "${GW_SK:-}"
+  } >> "$tmp"
+  mv "$tmp" "$ENVF"
+}
+
+# heal_wiring — self-heal stale wiring after a cluster REDEPLOY. A redeploy rotates
+# the gateway's ZS3_ADMIN_TOKEN and its S3 keys but leaves the old $ENVF pointing at
+# the destroyed cluster, so --gc/--immutable/--encryption 401 and direct S3 gives
+# InvalidAccessKeyId. Probe the gateway's own credential endpoint with our token;
+# if it is rejected (401/403), recover the LIVE token from the local minioserver
+# container (the installer runs on the gateway box) and re-probe. On success,
+# refresh GW_AK/GW_SK/CLUSTER_TOKEN and persist them so the NEXT run is already
+# correct. No-op when the gateway is unreachable or nothing drifted (e.g. blimp
+# running on a separate box with no local gateway container to read the token from).
+heal_wiring(){
+  [ -n "${GW:-}" ] || return 0
+  local port="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:-blimp-${CLUSTER_ID:-}}" code
+  local body="${TMPDIR:-/tmp}/.blimp_cred.$$"
+  code=$(curl -s -o "$body" -w '%{http_code}' -m 8 \
+    "http://$GW:$port/admin/credentials" -H "Authorization: Bearer $tok" 2>/dev/null)
+  if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && command -v docker >/dev/null 2>&1; then
+    local live_tok
+    live_tok=$(docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | sed -n 's/^ZS3_ADMIN_TOKEN=//p' | head -1)
+    if [ -n "$live_tok" ] && [ "$live_tok" != "$tok" ]; then
+      tok="$live_tok"
+      code=$(curl -s -o "$body" -w '%{http_code}' -m 8 \
+        "http://$GW:$port/admin/credentials" -H "Authorization: Bearer $tok" 2>/dev/null)
+    fi
+  fi
+  if [ "$code" = 200 ]; then
+    local resp ak sk
+    resp=$(cat "$body" 2>/dev/null)
+    ak=$(printf '%s' "$resp" | sed -n 's/.*"s3_access_key":"\([^"]*\)".*/\1/p')
+    sk=$(printf '%s' "$resp" | sed -n 's/.*"s3_secret_key":"\([^"]*\)".*/\1/p')
+    if [ -n "$ak" ] && [ -n "$sk" ] && \
+       { [ "$ak" != "${GW_AK:-}" ] || [ "$sk" != "${GW_SK:-}" ] || [ "$tok" != "${CLUSTER_TOKEN:-}" ]; }; then
+      GW_AK="$ak"; GW_SK="$sk"; CLUSTER_TOKEN="$tok"
+      export GW_AK GW_SK CLUSTER_TOKEN
+      persist_wiring
+      echo "  ✓ wiring self-healed from live gateway (creds/token refreshed in $ENVF)" >&2
+    fi
+  fi
+  rm -f "$body" 2>/dev/null
+}
+
 # ---- the address the Blimp cluster (on AWS) reaches THIS node on -------------
 # Cross-cloud the gateway can't reach a private IP, so advertise the PUBLIC
 # address by default. ADVERTISE_HOST overrides — set it to the private IP for a
@@ -793,6 +850,8 @@ need_env(){
   # gateway/cdc expect — a zus-<id> fallback was silently dropping run-blimp runs
   # from the UI bench list.
   : "${CLUSTER_TOKEN:=blimp-${CLUSTER_ID:-}}"; export CLUSTER_TOKEN
+  # Self-heal stale creds/token left behind by a cluster redeploy (see heal_wiring).
+  heal_wiring
 }
 
 # ensure_storage_tools — the --storage suite's benchmark tools, installed

@@ -18,13 +18,30 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 ask(){ local cur="${!1:-}"; if [ -n "$cur" ]; then printf '%s' "$cur"; return; fi
-  printf '%s' "$2 " >&2; read -r v; printf '%s' "$v"; }
+  # This script is normally exec'd NON-INTERACTIVELY by `blimp --storage`, which
+  # pre-sets GW/GW_AK/GW_SK from ~/.blimp_env. A bare `read` with no value and no
+  # controlling terminal (nohup / `ssh host cmd` / systemd) BLOCKS FOREVER waiting
+  # for input that never arrives — the "storage hangs before mount/train, no
+  # mlperf read emitted" symptom. Test the OPEN of /dev/tty (not `-r`: under nohup
+  # the device node exists but the redirect fails with ENXIO). No tty => return
+  # empty (the ${VAR:?} guard below then aborts cleanly — an `exit` here would only
+  # leave this $() subshell and the parent would sail on with a blank value); a
+  # real terminal => prompt on it.
+  { : < /dev/tty; } 2>/dev/null || { printf '' ; return; }
+  printf '%s' "$2 " >&2; read -r v </dev/tty; printf '%s' "$v"; }
 
 echo "==================== Blimp cluster storage test suite ===================="
 echo "Enter the cluster endpoints (all reachable on the VPC PRIVATE network)."
 GW=$(ask GW            "Gateway PRIVATE IP (serves NFS :2049, S3 :9000):")
 GW_AK=$(ask GW_AK      "Gateway S3 access key:")
 GW_SK=$(ask GW_SK      "Gateway S3 secret key:")
+# Fail fast with the missing name instead of running warp/mlperf against blank
+# wiring (which "measures nothing"). ask() returns empty on a no-tty box rather
+# than blocking; this turns that into a clear abort. blimp --storage pre-sets all
+# three from ~/.blimp_env, so this only fires when the suite is mis-invoked.
+: "${GW:?empty — set GW (blimp --storage passes it from ~/.blimp_env)}"
+: "${GW_AK:?empty — set GW_AK (blimp --storage passes it from ~/.blimp_env)}"
+: "${GW_SK:?empty — set GW_SK (blimp --storage passes it from ~/.blimp_env)}"
 EC="${EC:-2/1}"
 REGION="${REGION:-ap-south-1}"
 export GW GW_AK GW_SK EC REGION

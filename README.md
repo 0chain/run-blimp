@@ -203,7 +203,7 @@ health-checked, so a node going down moves traffic to a healthy one.
   ```
 - **FUSE (mp-s3) — same endpoint, same key:**
   ```
-  mount-s3 --endpoint-url https://fleet-<account>.blimp.software:9443 <bucket> /mnt/fleet
+  mount-s3 --force-path-style --endpoint-url https://fleet-<account>.blimp.software:9443 <bucket> /mnt/fleet
   ```
 
 Any node resolves the full namespace (content-addressed dedup index +
