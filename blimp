@@ -146,31 +146,46 @@ persist_wiring(){
 # running on a separate box with no local gateway container to read the token from).
 heal_wiring(){
   [ -n "${GW:-}" ] || return 0
+  # PREFERRED — read this node's ACTUAL gateway auth straight from the local
+  # minioserver container: the admin token (ZS3_ADMIN_TOKEN) and the S3 keys
+  # (MINIO_ROOT_USER/PASSWORD, which is what the gateway authenticates S3 with).
+  # NOT GET /admin/credentials for the keys: in a MULTI-NODE fleet that can return
+  # the primary/fleet keys, which do NOT match node 2's own MinIO root -> the
+  # InvalidAccessKeyId the regression suite hit on node 2. Co-located installs (the
+  # kit runs ON the gateway box) get correct wiring on every command.
+  if command -v docker >/dev/null 2>&1 && docker inspect minioserver >/dev/null 2>&1; then
+    local ea tok ak sk
+    ea=$(docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)
+    tok=$(printf '%s' "$ea" | sed -n 's/^ZS3_ADMIN_TOKEN=//p' | head -1)
+    ak=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_USER=//p' | head -1)
+    sk=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_PASSWORD=//p' | head -1)
+    [ -n "$tok" ] || tok="${CLUSTER_TOKEN:-blimp-${CLUSTER_ID:-}}"
+    if [ -n "$ak" ] && [ -n "$sk" ] && \
+       { [ "$ak" != "${GW_AK:-}" ] || [ "$sk" != "${GW_SK:-}" ] || [ "$tok" != "${CLUSTER_TOKEN:-}" ]; }; then
+      GW_AK="$ak"; GW_SK="$sk"; CLUSTER_TOKEN="$tok"
+      export GW_AK GW_SK CLUSTER_TOKEN
+      persist_wiring
+      echo "  ✓ wiring self-healed from local gateway container (token + MinIO root creds in $ENVF)" >&2
+    fi
+    return 0
+  fi
+  # FALLBACK — blimp on a SEPARATE box (no local container): best-effort refresh via
+  # the gateway admin API. Detect a stale token (401) and refetch the S3 keys.
   local port="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:-blimp-${CLUSTER_ID:-}}" code
   local body="${TMPDIR:-/tmp}/.blimp_cred.$$"
   code=$(curl -s -o "$body" -w '%{http_code}' -m 8 \
     "http://$GW:$port/admin/credentials" -H "Authorization: Bearer $tok" 2>/dev/null)
-  if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && command -v docker >/dev/null 2>&1; then
-    local live_tok
-    live_tok=$(docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-      | sed -n 's/^ZS3_ADMIN_TOKEN=//p' | head -1)
-    if [ -n "$live_tok" ] && [ "$live_tok" != "$tok" ]; then
-      tok="$live_tok"
-      code=$(curl -s -o "$body" -w '%{http_code}' -m 8 \
-        "http://$GW:$port/admin/credentials" -H "Authorization: Bearer $tok" 2>/dev/null)
-    fi
-  fi
   if [ "$code" = 200 ]; then
     local resp ak sk
     resp=$(cat "$body" 2>/dev/null)
     ak=$(printf '%s' "$resp" | sed -n 's/.*"s3_access_key":"\([^"]*\)".*/\1/p')
     sk=$(printf '%s' "$resp" | sed -n 's/.*"s3_secret_key":"\([^"]*\)".*/\1/p')
     if [ -n "$ak" ] && [ -n "$sk" ] && \
-       { [ "$ak" != "${GW_AK:-}" ] || [ "$sk" != "${GW_SK:-}" ] || [ "$tok" != "${CLUSTER_TOKEN:-}" ]; }; then
-      GW_AK="$ak"; GW_SK="$sk"; CLUSTER_TOKEN="$tok"
-      export GW_AK GW_SK CLUSTER_TOKEN
+       { [ "$ak" != "${GW_AK:-}" ] || [ "$sk" != "${GW_SK:-}" ]; }; then
+      GW_AK="$ak"; GW_SK="$sk"
+      export GW_AK GW_SK
       persist_wiring
-      echo "  ✓ wiring self-healed from live gateway (creds/token refreshed in $ENVF)" >&2
+      echo "  ✓ wiring self-healed from gateway admin API (creds refreshed in $ENVF)" >&2
     fi
   fi
   rm -f "$body" 2>/dev/null
