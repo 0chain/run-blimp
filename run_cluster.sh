@@ -35,7 +35,10 @@ else                    EC_CONC=16
   # be served from page cache), but sized to FIT the small 2/1 on-prem allocation
   # (~64 GiB usable on an 8x12GB cluster). The old 68 GiB overfilled it to 90%+ and
   # wedged mlperf on the disk-full guard. EC_DATASET_GB override still available.
-  EC_DATASET_GB="${EC_DATASET_GB:-45}"; EC_ACCEL=3; EC_RT=12; EC_PF=24; fi
+  # rt-4/pf-8 (2026-08-28, was 12/24): a fleet of N concurrent mlperf runs at rt-12
+  # saturates the single gateway read path (20-57s/GET) and trips mount-s3's CRT
+  # minimum-throughput guard -> EIO. rt-4/pf-8 cuts per-run read concurrency 3x.
+  EC_DATASET_GB="${EC_DATASET_GB:-45}"; EC_ACCEL=3; EC_RT=4; EC_PF=8; fi
 # WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster
 # to conc=64 to see if more parallel GET streams lift blobber-served read throughput).
 EC_CONC="${WARP_CONC:-$EC_CONC}"
