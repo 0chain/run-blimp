@@ -68,7 +68,8 @@ usage(){
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
-                     Add --verify to turn verification ON. OFF by default because
+                     Add --evict to start COLD (evict each MV, re-author from the
+                     recipe library). Add --verify to turn verification ON. OFF by default because
                      that is the PRODUCTION path: the gateway runs NO verification
                      while serving (it is a full source scan per request), so an
                      unflagged run measures what customers actually get. --verify
@@ -1176,7 +1177,9 @@ cmd_query(){
   exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
     NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
-    VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" bash "$HERE/test_query.sh"
+    QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
+    QNRS="${QNRS:-}" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
+    VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
 }
 
 cmd_bench(){
@@ -1206,6 +1209,10 @@ for f in "$@"; do
   case "$f" in
     --verify)       VERIFY=1; export VERIFY ;;
     --force-author) FORCE_AUTHOR=1; export FORCE_AUTHOR ;;
+    # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
+    # before phase 1 so it re-authors from the recipe library. force_author was
+    # removed from the gateway (2026-07-31); this is the only real cold path.
+    --evict)        EVICT=1; export EVICT ;;
     # Positional sub-arg for --encryption / --immutable (on|off|status); consumed
     # by the dispatch below, not a global flag.
     on|off|true|false|1|0|status) : ;;

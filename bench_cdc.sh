@@ -39,7 +39,19 @@ NAMESPACE="${NAMESPACE:-tpcds}"; REGION="${REGION:-ap-south-1}"; CDC_ROWS="${CDC
 # (none)` for EVERY query — 19 identical non-answers that look like 19 failures
 # and are actually one wiring error. Observed on cluster 1785947456705,
 # 2026-08-05. Set SOURCE=customer to drive a wired production source.
-SOURCE="${SOURCE:-internal}"
+# Derive the gateway source from the dataset THIS env points at, never assume
+# the on-cluster SF1 demo: NAMESPACE=tpcds_sf1000 → the sf1000 source (test2's
+# SF1000 legacy source), a tpcds/tpcds_sf1 namespace → internal (the UI's
+# "Run on TPC SF1" tab), anything else → the wired customer source. 2026-09-02:
+# the default "internal" ran the whole suite on SF1 while the seeder appended
+# to the SF1000 catalog — every result was for the wrong dataset.
+if [ -z "${SOURCE:-}" ]; then
+  case "${NAMESPACE:-tpcds}" in
+    tpcds_sf1000|*sf1000*) SOURCE=sf1000 ;;
+    tpcds|tpcds_sf1)       SOURCE=internal ;;
+    *)                     SOURCE=customer ;;
+  esac
+fi
 # QAPI/TOKEN overridable for non-cluster gateways (e.g. the test2 manual stack:
 # QAPI=http://localhost:9100 TOKEN=<ZS3_ADMIN_TOKEN>); defaults keep the
 # run-blimp cluster convention.
@@ -254,13 +266,46 @@ for m in (d if isinstance(d,list) else d.get('mvs',[])):
         print('%s %s'%(m.get('row_count','?'), len(m.get('schema') or []) or '?')); raise SystemExit
 print('')" "$1" 2>/dev/null; }
 
+# ---- phase 0 (opt-in, EVICT=1 / blimp --query --evict): GENUINE cold state ---
+# force_author was REMOVED from the gateway (2026-07-31): a plain query can no
+# longer ask to rebuild an MV it already has, so FORCE_AUTHOR above is a no-op on
+# current images. The only real cold state is an evicted MV (POST /admin/mv/evict,
+# recipe kept). Two-tier answers regenerate from their chart MV the moment the
+# answer is evicted, so evict-and-rematch until the matcher returns nothing.
+evict_query(){ # evict_query <sql> <name>
+  local rounds=0 busy=0 m t ns e ok
+  while :; do
+    m=$(curl -s -m 600 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[3],"label":sys.argv[2]+":match","match_only":True,"skip_verify":True,"skip_passthrough":True}))' "$1" "$2" "$SOURCE")")
+    t=$(echo "$m" | J mv_table); t="${t##*.}"; ns=$(echo "$m" | J mv_namespace)
+    [ -n "$t" ] || break
+    e=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "{\"namespace\":\"${ns:-$MV_NAMESPACE}\",\"table\":\"$t\",\"keep_recipe\":true}")
+    ok=$(echo "$e" | J evicted)
+    echo "   $2: evict ${ns:-$MV_NAMESPACE}.$t evicted=$ok $(echo "$e" | J error)"
+    if [ "$ok" != "True" ]; then
+      # mid-merge / mid-serve (the match probe itself wakes a stale MV's refresh):
+      # wait for the flight to land, then retry — up to ~10 min, like the
+      # internal harness. Retrying instantly just re-hits the same lock.
+      busy=$((busy+1)); [ "$busy" -ge 30 ] && { echo "   WARN $2: $t stayed busy for $busy rounds — NOT evicted, phase 1 serves warm"; break; }
+      sleep 20; continue
+    fi
+    rounds=$((rounds+1))
+    [ "$rounds" -ge 8 ] && { echo "   WARN $2 still matches after $rounds evictions (two-tier answer regenerating from a companion the API cannot reach)"; break; }
+  done
+}
+
 echo "== CDC bench: cluster=$CLUSTER_ID gw=$GW rows/append=$CDC_ROWS suites=[$SUITES] =="
 echo "== delta gate: bucket=$MV_BUCKET endpoint=$MV_S3_ENDPOINT tool=$DELTA_TOOL =="
 
 for ft in $(facts_of); do
   FNAMES=$(names_for_fact "$ft"); [ -n "$FNAMES" ] || continue
   echo "==== fact: $ft (${FNAMES% }) ===="
-  echo ">> phase 1: serve/author all (force_author=${FORCE_AUTHOR:-0})"
+  if [ "${EVICT:-0}" = "1" ]; then
+    echo ">> phase 0: evict (cold state, recipe kept)"
+    for n in $FNAMES; do evict_query "${SQL[$n]}" "$n"; done
+  fi
+  echo ">> phase 1: serve/author all (evict=${EVICT:-0} verify=${VERIFY:-0})"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
