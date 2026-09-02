@@ -1200,6 +1200,9 @@ cmd_bench(){
 # serving, so an unflagged run measures what customers actually get.
 CMD="${1:-}"; shift 2>/dev/null || true
 for f in "$@"; do
+  # --update / --update-log take their own sub-arguments (service lists,
+  # --tag svc=tag, --dry-run, an update id); cmd_update validates them.
+  case "$CMD" in --update|update|--update-log) break ;; esac
   case "$f" in
     --verify)       VERIFY=1; export VERIFY ;;
     --force-author) FORCE_AUTHOR=1; export FORCE_AUTHOR ;;
