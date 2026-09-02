@@ -76,6 +76,14 @@ usage(){
                      check that a delta-merge produced correct rows.
   blimp --bench      Bench: author / materialize / delta-merge timing profile
                      (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
+  blimp --update     Update software ON THE NODE (via its :9401 helper, bearer = CLUSTER_TOKEN):
+                       blimp --update status                 what is running (images, rclone, tools)
+                       blimp --update all                    zs3 gateway, eblobbers, nessie, gotenberg, rclone
+                       blimp --update zs3,rclone             only these
+                       blimp --update zs3 --tag zs3=latest-abc123 --tag rclone=1.73.5
+                       blimp --update all --dry-run          show the plan, change nothing
+                     One update at a time; the node keeps a backup of every compose
+                     file / container it replaces and rolls back a failed recreate.
 
   Wiring is read from / written to ~/.blimp_env  (set BLIMP_ENV to relocate).
 H
@@ -1405,8 +1413,65 @@ cmd_gc(){
   echo "== done: reclaimed $total orphan blob(s) =="
 }
 
+# --update: drive the node's own updater (zs3-init --update) through the
+# zus-cdc helper on :9401. The node does the work (backup, rm→up, alias
+# re-attach, health checks, rollback); this just submits, polls, and tails.
+cmd_update(){
+  need_env
+  : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
+  local tok="${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}" base="http://$GW:${CDC_PORT:-9401}"
+  local what="" dry=0 tags="" a
+  while [ $# -gt 0 ]; do
+    a="$1"; shift
+    case "$a" in
+      --dry-run) dry=1 ;;
+      --tag)     tags="${tags:+$tags,}${1:?--tag needs svc=tag}"; shift ;;
+      --tag=*)   tags="${tags:+$tags,}${a#--tag=}" ;;
+      status|all|zs3*|eblobber*|nessie*|gotenberg*|rclone*) what="$a" ;;
+      *) die "unknown --update argument: $a (see blimp --help)" ;;
+    esac
+  done
+  [ -n "$what" ] || what="status"
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$base/update/status" -H "Authorization: Bearer $tok")" = 403 ]; then
+    die "node helper rejected the token — check CLUSTER_TOKEN in $ENVF"
+  fi
+  if [ "$what" = status ]; then
+    echo "== node $GW: running versions =="
+    curl -s -m 120 "$base/update/status" -H "Authorization: Bearer $tok" \
+      | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+if "error" in d: print("error:", d["error"]); sys.exit(1)
+for c in d.get("components",[]):
+    print("  %-10s %-9s %-28s %s" % (c["name"], c["status"], c["kind"][:28], (c.get("image") or c.get("detail") or "")[:70]))
+print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get("active_update") or "none")'
+    return $?
+  fi
+  local tagjson="{}"
+  [ -n "$tags" ] && tagjson=$(printf '%s' "$tags" | python3 -c 'import sys,json;print(json.dumps(dict(kv.split("=",1) for kv in sys.stdin.read().strip().split(",") if kv)))')
+  local body id r
+  body=$(printf '{"services":"%s","tags":%s,"dry_run":%s}' "$what" "$tagjson" "$([ $dry = 1 ] && echo true || echo false)")
+  r=$(curl -s -m 30 -X POST "$base/update/run" -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' -d "$body")
+  id=$(printf '%s' "$r" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  case "$r" in *'"error"'*) die "node refused: $r" ;; esac
+  [ -n "$id" ] || die "unexpected response: $r"
+  echo "== update $id submitted to $GW: services=$what tags=${tags:-none} dry_run=$dry =="
+  local seen=0 st="running" log n
+  while [ "$st" = running ]; do
+    sleep 5
+    log=$(curl -s -m 20 "$base/update/log?id=$id&token=$tok"); n=$(printf '%s\n' "$log" | grep -c .)
+    [ "$n" -gt "$seen" ] && { printf '%s\n' "$log" | tail -n +"$((seen+1))" | grep -E '\[update\]|\[rclone\]|FAIL|rolled back' | sed 's/^/  /'; seen=$n; }
+    st=$(curl -s -m 20 "$base/update/state?id=$id&token=$tok" | sed -n 's/.*"status": *"\([a-z]*\)".*/\1/p')
+    [ -n "$st" ] || st=running
+  done
+  echo "== update $id: $st ==  (full log: blimp --update-log $id)"
+  [ "$st" = ok ]
+}
+
 case "$CMD" in
   --setup)            cmd_setup ;;
+  --update|update)    cmd_update "$@" ;;
+  --update-log)       need_env; curl -s -m 20 "http://$GW:${CDC_PORT:-9401}/update/log?id=${1:?id}&token=${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}" ;;
   --storage|storage)  cmd_storage ;;
   --acid|acid)        cmd_acid ;;
   --encryption|encryption) cmd_encryption "${1:-}" ;;

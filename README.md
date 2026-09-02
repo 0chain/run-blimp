@@ -69,6 +69,8 @@ blimp --query         query optimizer + incremental CDC delta-merge
 blimp --storage       storage & read-through cache suite
 blimp --acid          ACID / linearizability check of both data paths
 blimp --bench         author / materialize / delta-merge timing profile
+blimp --update        update software on the node: status | all | zs3,eblobber,nessie,gotenberg,rclone
+                      (--tag svc=tag, --dry-run; runs on the node via its :9401 helper, one at a time)
 ```
 
 Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
