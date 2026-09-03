@@ -68,8 +68,14 @@ usage(){
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
-                     --queries "3 7 19"  which TPC-DS queries (default: proven set)
-                                         or a named suite: query-2026-50 | query-2026-30 | query-2026-19
+                     --queries "3 7 19"  which TPC-DS queries (default: --first-10)
+                     --second-40 | --third-30 | --fourth-19 | --all
+                                         run a batch from suites/: --first-10 (the 10
+                                         proven queries) is the DEFAULT; then the rest of
+                                         the release-50, then the remaining 49 split
+                                         30/19; --all = every TPC-DS query 1-99. Flags
+                                         stack, and a batch name also works as a
+                                         --queries token
                      --append-rows N     CDC tick base rows (default 5000)
                      Add --evict to start COLD (evict each MV, re-author from the
                      recipe library). Add --verify to turn verification ON. OFF by default because
@@ -328,6 +334,7 @@ standup_iceberg(){
   sudo chown -R 1000:1000 /opt/blimp/catalog 2>/dev/null || true
   # shellcheck disable=SC2086  # EP_ENV is an intentional word-split flag pair
   $DKR run -d --name iceberg-rest --restart unless-stopped -p 8181:8181 \
+    --add-host host.docker.internal:host-gateway \
     -e CATALOG_WAREHOUSE="$WAREHOUSE" \
     -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
     -e CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog \
@@ -1198,13 +1205,20 @@ cmd_bench(){
   # statistical profile: one-time author_ms + materialize_ms, and per-append
   # delta_merge_ms + materialize_ms (min/median/avg/max). Tune ITERS / AUTHOR_ITERS
   # / CDC_ROWS to size the sweep and the delta.
-  exec env GW="$GW" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" CLUSTER_ID="$CLUSTER_ID" \
+  # One bench_incremental.sh run per query of the selected batch (default
+  # --first-10; --second-40/--third-30/--fourth-19/--all/--queries stack). An
+  # explicit BENCH_QNR=<n> in the env still benches that single query.
+  local q rc=0
+  for q in ${BENCH_QNR:-$QNRS}; do
+  env GW="$GW" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" CLUSTER_ID="$CLUSTER_ID" \
     ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" NAMESPACE="${NAMESPACE:-tpcds}" \
     REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-3}" AUTHOR_ITERS="${AUTHOR_ITERS:-3}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
-    BENCH_QNR="${BENCH_QNR:-88}" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
+    BENCH_QNR="$q" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
     BENCH_FACT="${BENCH_FACT:-}" \
-    CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh"
+    CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh" || rc=$?
+  done
+  return $rc
 }
 
 # Flags may follow the command: `blimp --query --verify`. VERIFY is OFF by default
@@ -1229,6 +1243,9 @@ for f in "$@"; do
     # --queries "3 7 19": the TPC-DS query numbers to run (default: the proven
     # delta-merge set). --append-rows N: base rows for the CDC tick (default 5000).
     --queries)      pending=QNRS ;;
+    --first-10|--second-40|--third-30|--fourth-19)
+                    QNRS="${QNRS:+$QNRS }${f#--}"; export QNRS ;;
+    --all)          QNRS="$(seq -s ' ' 1 99)"; export QNRS ;;
     --queries=*)    QNRS="${f#--queries=}"; export QNRS ;;
     --append-rows)  pending=CDC_ROWS ;;
     --append-rows=*) CDC_ROWS="${f#--append-rows=}"; export CDC_ROWS ;;
@@ -1240,8 +1257,8 @@ for f in "$@"; do
 done
 [ -z "$pending" ] || { echo "flag --${pending,,} needs a value"; exit 2; }
 
-# Named suites: a --queries token that names a file under suites/ (query-2026-50,
-# query-2026-30, query-2026-19) expands to the numbers in that file, so a release
+# Named suites: a --queries token (or --first-10/--second-40/--third-30/--fourth-19)
+# that names a file under suites/ expands to the numbers in that file, so a release
 # list lives in the repo once instead of being retyped on every box.
 resolve_suite_names(){
   local out="" t f
@@ -1252,6 +1269,8 @@ resolve_suite_names(){
   done
   QNRS="$(echo $out)"; export QNRS
 }
+# Default batch for a query run is first-10 (a --queries/batch flag overrides).
+case "$CMD" in --query|query|--bench|bench) [ -n "${QNRS:-}" ] || QNRS=first-10 ;; esac
 [ -z "${QNRS:-}" ] || resolve_suite_names
 
 # cmd_acid — linearizability (ACID) check of the node's three data paths.
