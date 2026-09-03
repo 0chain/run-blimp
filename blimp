@@ -69,6 +69,7 @@ usage(){
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
                      --queries "3 7 19"  which TPC-DS queries (default: proven set)
+                                         or a named suite: query-2026-50 | query-2026-30 | query-2026-19
                      --append-rows N     CDC tick base rows (default 5000)
                      Add --evict to start COLD (evict each MV, re-author from the
                      recipe library). Add --verify to turn verification ON. OFF by default because
@@ -1238,6 +1239,20 @@ for f in "$@"; do
   esac
 done
 [ -z "$pending" ] || { echo "flag --${pending,,} needs a value"; exit 2; }
+
+# Named suites: a --queries token that names a file under suites/ (query-2026-50,
+# query-2026-30, query-2026-19) expands to the numbers in that file, so a release
+# list lives in the repo once instead of being retyped on every box.
+resolve_suite_names(){
+  local out="" t f
+  for t in ${QNRS:-}; do
+    f="$HERE/suites/$t"
+    if [ -f "$f" ]; then out="$out $(grep -v '^#' "$f" | tr '\n' ' ')"
+    else out="$out $t"; fi
+  done
+  QNRS="$(echo $out)"; export QNRS
+}
+[ -z "${QNRS:-}" ] || resolve_suite_names
 
 # cmd_acid — linearizability (ACID) check of the node's three data paths.
 # For each endpoint it runs the porcupine model checker under two profiles:
