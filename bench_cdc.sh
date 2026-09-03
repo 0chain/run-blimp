@@ -162,7 +162,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # VERIFY=1 (blimp --query --verify) turns verification ON for the whole run;
@@ -304,6 +304,7 @@ for ft in $(facts_of); do
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
+    V_MS[$n]=$(echo "$R" | J verify_ms)
     S_MS[$n]=$(echo "$R" | J query_ms);  MVTBL[$n]=$(echo "$R" | J mv_table)
     MV_ROWS[$n]=$(echo "$R" | J mv_rows); MV_COLS[$n]=$(echo "$R" | J mv_cols)
     t="${MVTBL[$n]##*.}"; [ -n "$t" ] && MV_HASH_OLD[$n]=$(mv_etag "$t")
@@ -316,7 +317,10 @@ for ft in $(facts_of); do
       D=$($MV_DIMS_CMD "${MVTBL[$n]##*.}" 2>/dev/null)
       MV_ROWS[$n]="${D%% *}"; MV_COLS[$n]="${D##* }"
     fi
-    echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
+    # author INCLUDES materialize and verify (plan = author - materialize - verify);
+    # cold_serve is the MV read alone now that the serve gate reuses the request's
+    # own proof instead of re-running the original on base.
+    echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} verify=${V_MS[$n]:-0} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
   done
   # ---- THE DELTA GATE, part 1: snapshot every MV's parts BEFORE the append ---
   # Must be before phase 2, not between phase 2 and phase 3: snapshot_changed can
