@@ -171,7 +171,10 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # per request. Verification is a TEST-TIME option here, and a separate background
   # sampler is what catches drift in prod.
   #
-  # arg3=1 marks the AUTHOR phase: verify it when VERIFY=1; every other call
+  # arg3=1 marks the AUTHOR phase: verify it when VERIFY=1 AND the run evicted
+  # (a cold author needs its proof). A warm phase-1 touch of an already-verified
+  # MV re-proved it at 1–5 min per query (two full base scans) for nothing —
+  # the merged MV is what phase 4 verifies (2026-09-03). Every other call
   # is a warm serve / delta-merge → skip_verify. Passing skip_verify on the
   # author too suppressed the single verification the CDC model relies on.
   #
@@ -190,7 +193,7 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":not(sys.argv[3]=="1" and sys.argv[5]=="1"),"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":not(sys.argv[3]=="1" and sys.argv[5]=="1" and sys.argv[7]=="1"),"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE")" "${EVICT:-0}"
 }
 
 # ---- MV content signature + THE DELTA GATE -----------------------------------
@@ -300,7 +303,7 @@ for ft in $(facts_of); do
     echo ">> phase 0: evict (cold state, recipe kept)"
     for n in $FNAMES; do evict_query "${SQL[$n]}" "$n"; done
   fi
-  echo ">> phase 1: serve/author all (evict=${EVICT:-0} verify=${VERIFY:-0})"
+  echo ">> phase 1: serve/author all (evict=${EVICT:-0} verify=${VERIFY:-0}; phase-1 proofs only on a cold author, phase 4 verifies the merged MV)"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
