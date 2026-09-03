@@ -1507,6 +1507,11 @@ d=json.load(sys.stdin)
 if "error" in d: print("error:", d["error"]); sys.exit(1)
 for c in d.get("components",[]):
     print("  %-10s %-9s %-28s %s" % (c["name"], c["status"], c["kind"][:28], (c.get("image") or c.get("detail") or "")[:70]))
+st=d.get("storage") or []
+if st:
+    print("  storage (what each data path is mounted on):")
+    for m in st:
+        print("    %-22s %-9s %-9s %s %s" % (m.get("path",""), m.get("fstype",""), m.get("class",""), (m.get("devices") or m.get("source","")), ("["+m["note"]+"]") if m.get("note") else ""))
 print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get("active_update") or "none")'
     return $?
   fi
