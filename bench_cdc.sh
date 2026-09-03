@@ -39,19 +39,10 @@ NAMESPACE="${NAMESPACE:-tpcds}"; REGION="${REGION:-ap-south-1}"; CDC_ROWS="${CDC
 # (none)` for EVERY query — 19 identical non-answers that look like 19 failures
 # and are actually one wiring error. Observed on cluster 1785947456705,
 # 2026-08-05. Set SOURCE=customer to drive a wired production source.
-# Derive the gateway source from the dataset THIS env points at, never assume
-# the on-cluster SF1 demo: NAMESPACE=tpcds_sf1000 → the sf1000 source (test2's
-# SF1000 legacy source), a tpcds/tpcds_sf1 namespace → internal (the UI's
-# "Run on TPC SF1" tab), anything else → the wired customer source. 2026-09-02:
-# the default "internal" ran the whole suite on SF1 while the seeder appended
-# to the SF1000 catalog — every result was for the wrong dataset.
-if [ -z "${SOURCE:-}" ]; then
-  case "${NAMESPACE:-tpcds}" in
-    tpcds_sf1000|*sf1000*) SOURCE=sf1000 ;;
-    tpcds|tpcds_sf1)       SOURCE=internal ;;
-    *)                     SOURCE=customer ;;
-  esac
-fi
+# One source per node: the external Iceberg/S3 dataset wired by `blimp --setup`
+# (the gateway calls it "customer"). There is no on-node demo dataset any more,
+# so a namespace never selects a different source.
+SOURCE="${SOURCE:-customer}"
 # QAPI/TOKEN overridable for non-cluster gateways (e.g. the test2 manual stack:
 # QAPI=http://localhost:9100 TOKEN=<ZS3_ADMIN_TOKEN>); defaults keep the
 # run-blimp cluster convention.

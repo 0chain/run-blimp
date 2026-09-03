@@ -120,7 +120,7 @@ NAMESPACE=$NAMESPACE
 # catalog as "customer"; without persisting it the suite fell back to a
 # namespace heuristic and drove the built-in sf1000 source instead (test2
 # node, 2026-09-03). Blank = let bench_cdc derive it.
-SOURCE=${SOURCE:-}
+SOURCE=${SOURCE:-customer}
 # WHERE the origin bucket actually lives. Without these three, --storage's cache
 # legs sent every origin GET/PUT to real AWS S3 in \$REGION — which is wrong for
 # any non-AWS origin, and flatly broken for the MinIO source standup_data puts on
