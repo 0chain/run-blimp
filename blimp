@@ -116,6 +116,11 @@ ICEBERG_URL_LOCAL=${ICEBERG_URL_LOCAL:-}
 WAREHOUSE=$WAREHOUSE
 ORIGIN_BUCKET=$ORIGIN_BUCKET
 NAMESPACE=$NAMESPACE
+# SOURCE: which gateway source the suites drive. --setup wires an external
+# catalog as "customer"; without persisting it the suite fell back to a
+# namespace heuristic and drove the built-in sf1000 source instead (test2
+# node, 2026-09-03). Blank = let bench_cdc derive it.
+SOURCE=${SOURCE:-}
 # WHERE the origin bucket actually lives. Without these three, --storage's cache
 # legs sent every origin GET/PUT to real AWS S3 in \$REGION — which is wrong for
 # any non-AWS origin, and flatly broken for the MinIO source standup_data puts on
@@ -730,6 +735,7 @@ cmd_setup(){
       -d "$HOOK_BODY" || true)
     case "$HOOK_RESP" in
       *'"status": "ok"'*|*'"status":"ok"'*)
+        SOURCE=customer; export SOURCE; save_env
         bold "  ✓ cluster wired: source=customer ns=$NAMESPACE bucket=$ORIGIN_BUCKET (live, no restart)"
         echo "    (read-through cache retarget is optional — see hookup_cluster_source.sh)";;
       *)
