@@ -68,6 +68,8 @@ usage(){
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
+                     --queries "3 7 19"  which TPC-DS queries (default: proven set)
+                     --append-rows N     CDC tick base rows (default 5000)
                      Add --evict to start COLD (evict each MV, re-author from the
                      recipe library). Add --verify to turn verification ON. OFF by default because
                      that is the PRODUCTION path: the gateway runs NO verification
@@ -1177,7 +1179,7 @@ cmd_query(){
   exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
     NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
-    QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
+    QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
     QNRS="${QNRS:-}" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
     VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
 }
@@ -1202,10 +1204,14 @@ cmd_bench(){
 # because that is the PRODUCTION path — the gateway does no verification while
 # serving, so an unflagged run measures what customers actually get.
 CMD="${1:-}"; shift 2>/dev/null || true
+pending=""   # name of the variable the NEXT argument fills (--queries "3 7 19")
 for f in "$@"; do
   # --update / --update-log take their own sub-arguments (service lists,
   # --tag svc=tag, --dry-run, an update id); cmd_update validates them.
   case "$CMD" in --update|update|--update-log) break ;; esac
+  if [ -n "$pending" ]; then
+    printf -v "$pending" '%s' "$f"; export "$pending"; pending=""; continue
+  fi
   case "$f" in
     --verify)       VERIFY=1; export VERIFY ;;
     --force-author) FORCE_AUTHOR=1; export FORCE_AUTHOR ;;
@@ -1213,12 +1219,19 @@ for f in "$@"; do
     # before phase 1 so it re-authors from the recipe library. force_author was
     # removed from the gateway (2026-07-31); this is the only real cold path.
     --evict)        EVICT=1; export EVICT ;;
+    # --queries "3 7 19": the TPC-DS query numbers to run (default: the proven
+    # delta-merge set). --append-rows N: base rows for the CDC tick (default 5000).
+    --queries)      pending=QNRS ;;
+    --queries=*)    QNRS="${f#--queries=}"; export QNRS ;;
+    --append-rows)  pending=CDC_ROWS ;;
+    --append-rows=*) CDC_ROWS="${f#--append-rows=}"; export CDC_ROWS ;;
     # Positional sub-arg for --encryption / --immutable (on|off|status); consumed
     # by the dispatch below, not a global flag.
     on|off|true|false|1|0|status) : ;;
     *)              echo "unknown flag: $f"; exit 2 ;;
   esac
 done
+[ -z "$pending" ] || { echo "flag --${pending,,} needs a value"; exit 2; }
 
 # cmd_acid — linearizability (ACID) check of the node's three data paths.
 # For each endpoint it runs the porcupine model checker under two profiles:

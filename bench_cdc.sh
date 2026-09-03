@@ -55,7 +55,11 @@ fi
 # QAPI/TOKEN overridable for non-cluster gateways (e.g. the test2 manual stack:
 # QAPI=http://localhost:9100 TOKEN=<ZS3_ADMIN_TOKEN>); defaults keep the
 # run-blimp cluster convention.
-QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-zus-$CLUSTER_ID}"; HERE="$(cd "$(dirname "$0")" && pwd)"
+# Admin bearer: the wiring'"'"'s CLUSTER_TOKEN (blimp-<id> on Blimp/on-prem nodes, zus-<id>
+# on legacy clusters). Defaulting straight to zus-<id> made every admin call 401
+# on an on-prem node — 30 query/run + 6 snapshot_changed rejected, every field "?"
+# (test2 node 1788402989672, 2026-09-03).
+QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-${CLUSTER_TOKEN:-zus-$CLUSTER_ID}}"; HERE="$(cd "$(dirname "$0")" && pwd)"
 PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
 J(){ python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('$1',''))
