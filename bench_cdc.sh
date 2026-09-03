@@ -354,7 +354,12 @@ for ft in $(facts_of); do
   #
   # CDC_APPEND_TABLES still forces the old flat per-table behaviour if set.
   APPEND_TABLES="${CDC_APPEND_TABLES:-}"
-  NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns"
+  # CDC_EXTRA_TABLES: the non-sales tables the tick also appends (flat CDC_ROWS
+  # each) — the internal SF1000 certification wave was 9 tables: six facts plus
+  # inventory, customer and item, which is what exercises the inventory merges
+  # and the dim-change rebuild lane. Set CDC_EXTRA_TABLES="" for facts only.
+  EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer item}"
+  NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns $EXTRA_TABLES"
   SEED_CREDS_AK="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}"; SEED_CREDS_SK="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}"
   # Capture instead of `| tail -1`: the pipe threw away both the traceback AND
   # the seeder's exit status, so an append that failed for EVERY fact printed one
@@ -362,10 +367,11 @@ for ft in $(facts_of); do
   # no-delta — indistinguishable from "this shape has no delta". Two real bugs
   # (parquet field IDs, then all-null decimal stats) hid behind that for hours.
   if [ -z "$APPEND_TABLES" ]; then
-    echo ">> phase 2: CDC tick (base=$CDC_ROWS rows, ratios=${CDC_RATIOS:-4:2:1}, returns=${CDC_RETURNS_RATIO:-0.1}) + snapshot_changed"
+    echo ">> phase 2: CDC tick (base=$CDC_ROWS rows, ratios=${CDC_RATIOS:-4:2:1}, returns=${CDC_RETURNS_RATIO:-0.1}, extra=[${EXTRA_TABLES:-none}]) + snapshot_changed"
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
       "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
       --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" \
+      ${EXTRA_TABLES:+--extra-tables "$EXTRA_TABLES"} \
       ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} \
       --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
       ${CDC_YEARS:+--years "$CDC_YEARS"} \

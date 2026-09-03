@@ -55,6 +55,7 @@ store_returns branch, which built sr_* columns and add_files'd them into
 web_returns — every wr_* column NULL, i.e. a 100%-dead delta.
 """
 import argparse, random, decimal, os
+DRY_RUN = False   # --dry-run: build + conform every delta, write nothing
 # NOTE: pyarrow/pyiceberg are imported INSIDE the catalog-facing functions, never
 # at module scope. The generator and its regression tests must run on a plain
 # python3 with neither installed — that is what keeps the delta-shape guarantees
@@ -655,7 +656,8 @@ def conform_to_table_schema(tbl, table, n, strict=True):
 
 def _pa_schema(columns):
     import pyarrow as pa
-    m = {"i": pa.int32(), "l": pa.int64(), "d": pa.decimal128(7, 2)}
+    m = {"i": pa.int32(), "l": pa.int64(), "d": pa.decimal128(7, 2),
+         "s": pa.string(), "t": pa.date32()}
     return pa.schema([(n, m[k]) for n, k in columns])
 
 
@@ -668,7 +670,9 @@ def _columns_of(t, fact):
     out = []
     for f in t.schema().fields:
         s = str(f.field_type)
-        out.append((f.name, "l" if s == "long" else ("d" if s.startswith("decimal") else "i")))
+        kind = ("l" if s == "long" else "d" if s.startswith("decimal")
+                else "s" if s == "string" else "t" if s == "date" else "i")
+        out.append((f.name, kind))
     return out
 
 
@@ -722,6 +726,9 @@ def _write_and_add(fs, t, data, n, label, strict=True):
     # int32-backed parquet ("Unexpected physical type FIXED_LEN_BYTE_ARRAY ...
     # expected INT32", pyiceberg 0.9).
     stat_cols = [f.name for f in data.schema if not pa.types.is_decimal(f.type)]
+    if DRY_RUN:
+        print(f"{label}: DRY RUN — built {n} rows, {data.num_columns} cols, 0 nulls; nothing written")
+        return None
     with fs.open(key.replace("s3://", "", 1), "wb") as f:
         pq.write_table(data, f, store_decimal_as_integer=True,
                        write_statistics=stat_cols)
@@ -792,7 +799,7 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
     # append reads a stale max and reissues these exact ticket/order numbers, and
     # nothing downstream would ever tell you — the duplicate-key delta merges to a
     # plausible-looking wrong number.
-    if keycol and verbose:
+    if keycol and verbose and not DRY_RUN:
         _, mx2 = catalog_bounds(cat, namespace, fact, keycol)
         if mx2 is None or mx2 < kb + n - 1:
             print(f"   WARN: {fact}.{keycol} manifest max is now {mx2}, expected "
@@ -815,6 +822,81 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
     _write_and_add(fs, rt, rdata, rw,
                    f"{namespace}.{rfact} (referential to {fact})", strict=strict)
     return rw
+
+
+def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random):
+    """Generate EVERY column of a NON-sales table (inventory, customer, item, ...)
+    from its live schema. No per-table row template: the internal 9-table wave
+    (bench/sf1/sf1000_append_test.py) hand-wrote 4-10 columns per table and let
+    the gateway null-fill the rest; here every physical column is synthesized so
+    the strict null guard holds for these tables too.
+
+      own surrogate key (c_customer_sk on customer) -> key_base+i, never reused
+      foreign _sk                                  -> uniform over the catalog range
+      string                                       -> '<col>:<key>' (unique per row)
+      date / decimal / int / long                  -> in-range noise"""
+    import datetime
+    names = [c[0] for c in columns]
+    out = {}
+
+    def hi(dimtbl):
+        return dim_hi.get(dimtbl) or FALLBACK_DIM_HI.get(dimtbl) or 1000
+
+    d0 = datetime.date(1998, 1, 1)
+    for name, kind in columns:
+        d = dim_for(name)
+        if d is not None and d[0] == table:
+            out[name] = [key_base + i for i in range(n)]            # own PK
+        elif d is not None and d[0] == "date_dim":
+            out[name] = [rnd.randint(date_lo, date_hi) for _ in range(n)]
+        elif d is not None and d[0] == "time_dim":
+            out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
+        elif d is not None:
+            h = hi(d[0]); out[name] = [rnd.randint(1, h) for _ in range(n)]
+        elif kind == "s":
+            out[name] = [f"{name}:{key_base + i}" for i in range(n)]
+        elif kind == "t":
+            out[name] = [d0 + datetime.timedelta(days=rnd.randint(0, 1800)) for _ in range(n)]
+        elif kind == "d":
+            out[name] = [_q(rnd.uniform(1, 1000)) for _ in range(n)]
+        elif kind == "l":
+            out[name] = [rnd.randint(1, 10**9) for _ in range(n)]
+        else:
+            out[name] = [rnd.randint(1, 1000) for _ in range(n)]
+    missing = [c for c in names if c not in out]
+    assert not missing, f"{table}: generator left {missing} unset"
+    return out
+
+
+def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache,
+                 strict=True, verbose=True):
+    """Append `n` fully-populated rows to any non-sales table that EXISTS in the
+    catalog (dimensions and inventory). The table's own surrogate key continues
+    from the catalog max so successive ticks never collide."""
+    import pyarrow as pa
+    try:
+        t = cat.load_table((namespace, table))
+    except Exception as e:
+        raise SystemExit(f"FATAL: {namespace}.{table}: not in the catalog ({e}); "
+                         "extra tables are appended, never created")
+    columns = _columns_of(t, table)
+    need = [d for d in dims_needed([c[0] for c in columns])
+            if d != table and d not in dim_hi_cache]
+    if need:
+        dim_hi_cache.update(load_dim_hi(cat, namespace, need, verbose=verbose))
+    kb = 1
+    keycol = next((c for c, _ in columns if (dim_for(c) or ("",))[0] == table), None)
+    if keycol:
+        _, mx = catalog_bounds(cat, namespace, table, keycol)
+        kb = (mx or 0) + 1
+        if verbose:
+            print(f"   {table}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
+    cols = gen_table_cols(table, columns, n, date_lo=date_lo, date_hi=date_hi,
+                          dim_hi=dim_hi_cache, key_base=kb)
+    data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
+    _write_and_add(fs, t, data, n, f"{namespace}.{table}", strict=strict)
+    # the facts appended after this may now reference the new keys
+    dim_hi_cache.pop(table, None)
 
 
 def _slice_col(columns):
@@ -853,6 +935,18 @@ def main():
              "keyed on (item_sk, ticket/order number). Default 0.1 matches TPC-DS. "
              "Set 0 for sales only — but note every sales x returns query (q24, q64, "
              "...) then has a provably empty delta.")
+    ap.add_argument("--extra-tables",default="",
+        help="with --tick: space/comma-separated NON-sales tables to append as well "
+             "(e.g. 'inventory customer item' — the internal 9-table wave). Every "
+             "physical column is generated from the live schema; the table's own "
+             "surrogate key continues from the catalog max. Appended BEFORE the "
+             "facts so the tick's sales rows can reference the new keys.")
+    ap.add_argument("--extra-rows",type=int,default=0,
+        help="rows per extra table (default: same as --rows, the flat count the "
+             "internal wave used)")
+    ap.add_argument("--dry-run",action="store_true",
+        help="build + schema-conform every delta, write NOTHING (validates the "
+             "generator against the live catalog)")
     ap.add_argument("--no-strict",action="store_true",
         help="downgrade the null-fill guard from fatal to a warning (debug only)")
     ap.add_argument("--no-geo",action="store_true",
@@ -862,6 +956,7 @@ def main():
              "delta: measured on SF1000, a random pair passes with p=8.46e-05, so "
              "a 5,000-row store_returns delta expects 0.42 eligible rows.")
     a=ap.parse_args()
+    global DRY_RUN; DRY_RUN=a.dry_run
     try:
         years=[int(y) for y in a.years.split(",") if y.strip()]
         date_lo,date_hi=date_sk_bounds(years)
@@ -901,8 +996,14 @@ def main():
         if a.mode!="append":
             raise SystemExit("--tick is append-only (upsert rewrites files; use --table)")
         plan=plan_tick(a.rows,parse_ratios(a.ratios),a.returns_ratio)
+        extras=[x for x in a.extra_tables.replace(","," ").split() if x]
+        xn=a.extra_rows or a.rows
         print("== CDC tick plan (base=%d rows, returns_ratio=%.3f) =="%(a.rows,a.returns_ratio))
+        for x in extras: print(f"   {x}: +{xn}")
         for sf,sn,rf,rn in plan: print(f"   {sf}: +{sn}    {rf}: +{rn}")
+        for x in extras:
+            append_table(cat,fs,a.namespace,x,xn,date_lo=date_lo,date_hi=date_hi,
+                         dim_hi_cache=dim_hi_cache,strict=strict)
         geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
         for sf,sn,rf,rn in plan:
             append_fact(cat,fs,a.namespace,sf,sn,date_lo=date_lo,date_hi=date_hi,
