@@ -303,6 +303,40 @@ for ft in $(facts_of); do
     echo ">> phase 0: evict (cold state, recipe kept)"
     for n in $FNAMES; do evict_query "${SQL[$n]}" "$n"; done
   fi
+  # drain_authors waits until the gateway reports no in-flight requests AND no
+  # detached authors. Called after EVERY phase-1 query, not just before the
+  # tick: the gateway builds ONE MV at a time, so starting the next query while
+  # an author runs only queues it behind the same slot — and it was how 18 of 49
+  # builds were still running when the tick fired, whose row-hash verify then
+  # mismatched against the grown source (node 1788402989672, 2026-09-04).
+  # AUTHOR_DRAIN_SEC=0 disables the wait entirely.
+  drain_authors() {
+    local maxs="${AUTHOR_DRAIN_SEC:-5400}" what="${1:-authors}"
+    [ "$maxs" -gt 0 ] 2>/dev/null || return 0
+    local t0 quiet act now el
+    t0=$(date +%s); quiet=0
+    while :; do
+      act=$(curl -s -m 15 -H "Authorization: Bearer $TOKEN" "$QAPI/admin/query/active" 2>/dev/null \
+            | "$PY3" -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(len(d.get("active") or []) + int(d.get("authors_in_flight") or 0))
+except Exception: print(-1)' 2>/dev/null)
+      [ -z "$act" ] && act=-1
+      now=$(date +%s); el=$((now-t0))
+      if [ "$act" = "0" ]; then
+        quiet=$((quiet+1)); [ "$quiet" -ge 2 ] && return 0
+      else
+        quiet=0
+      fi
+      if [ "$el" -ge "$maxs" ]; then
+        echo "   WARN: $what still busy ($act) after ${el}s — continuing anyway"
+        return 0
+      fi
+      sleep 10
+    done
+  }
+
   echo ">> phase 1: serve/author all (evict=${EVICT:-0} verify=${VERIFY:-0}; phase-1 proofs only on a cold author, phase 4 verifies the merged MV)"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:author" 1)
@@ -324,8 +358,13 @@ for ft in $(facts_of); do
     # cold_serve is the MV read alone now that the serve gate reuses the request's
     # own proof instead of re-running the original on base.
     echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} verify=${V_MS[$n]:-0} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
+    # Let this query's author finish before touching the next one: the gateway
+    # builds one MV at a time, so racing ahead only queues them on the same slot.
+    drain_authors "$n's author"
   done
   # ---- DRAIN THE DETACHED AUTHORS BEFORE ANYTHING TOUCHES THE SOURCE --------
+  # (drain_authors is defined above and also runs after EVERY phase-1 query;
+  # this is the backstop for a refresh or a companion build started late.)
   # With the base fallback suppressed (ZS3_MV_BASE_ON_DETACH=0) a first touch
   # returns the moment the serve budget expires, so this loop finishes long
   # before the authors it started have built anything: 14 queries done, 6 MVs
@@ -334,39 +373,8 @@ for ft in $(facts_of); do
   # verify compares the MV against the post-append source, mismatches, and a
   # correct MV is dropped. Wait for the authors to go quiet first.
   # AUTHOR_DRAIN_SEC=0 skips the wait; default 90 min, polled every 20s.
-  DRAIN_MAX="${AUTHOR_DRAIN_SEC:-5400}"
-  if [ "$DRAIN_MAX" -gt 0 ] 2>/dev/null; then
-    # Counts in-flight REQUESTS **plus** DETACHED AUTHORS: with the base
-    # fallback suppressed every request returns at the budget while its author
-    # keeps building, so the request list alone reads quiet immediately and the
-    # tick lands mid-build (q59 lost a correct MV to exactly that on node
-    # 1788402989672, 2026-09-04). Needs a gateway that reports
-    # authors_in_flight; an older one returns only "active" and the sum still
-    # works, just less precisely.
-    echo ">> draining detached authors before the tick (max ${DRAIN_MAX}s)"
-    drain_t0=$(date +%s); quiet=0
-    while :; do
-      act=$(curl -s -m 15 -H "Authorization: Bearer $TOKEN" "$QAPI/admin/query/active" 2>/dev/null \
-            | "$PY3" -c 'import json,sys
-try:
-    d=json.load(sys.stdin)
-    print(len(d.get("active") or []) + int(d.get("authors_in_flight") or 0))
-except Exception: print(-1)' 2>/dev/null)
-      [ -z "$act" ] && act=-1
-      now=$(date +%s); el=$((now-drain_t0))
-      if [ "$act" = "0" ]; then
-        quiet=$((quiet+1))
-        [ "$quiet" -ge 2 ] && { echo "   authors quiet after ${el}s"; break; }
-      else
-        quiet=0
-      fi
-      if [ "$el" -ge "$DRAIN_MAX" ]; then
-        echo "   WARN: authors still active ($act) after ${el}s — ticking anyway"
-        break
-      fi
-      sleep 20
-    done
-  fi
+  echo ">> draining detached authors before the tick"
+  drain_authors "authors"
   # ---- THE DELTA GATE, part 1: snapshot every MV's parts BEFORE the append ---
   # Must be before phase 2, not between phase 2 and phase 3: snapshot_changed can
   # trigger the webhook's ACTIVE refresh (webhook_router.go
