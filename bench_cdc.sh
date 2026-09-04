@@ -336,12 +336,21 @@ for ft in $(facts_of); do
   # AUTHOR_DRAIN_SEC=0 skips the wait; default 90 min, polled every 20s.
   DRAIN_MAX="${AUTHOR_DRAIN_SEC:-5400}"
   if [ "$DRAIN_MAX" -gt 0 ] 2>/dev/null; then
+    # Counts in-flight REQUESTS **plus** DETACHED AUTHORS: with the base
+    # fallback suppressed every request returns at the budget while its author
+    # keeps building, so the request list alone reads quiet immediately and the
+    # tick lands mid-build (q59 lost a correct MV to exactly that on node
+    # 1788402989672, 2026-09-04). Needs a gateway that reports
+    # authors_in_flight; an older one returns only "active" and the sum still
+    # works, just less precisely.
     echo ">> draining detached authors before the tick (max ${DRAIN_MAX}s)"
     drain_t0=$(date +%s); quiet=0
     while :; do
       act=$(curl -s -m 15 -H "Authorization: Bearer $TOKEN" "$QAPI/admin/query/active" 2>/dev/null \
             | "$PY3" -c 'import json,sys
-try: print(len(json.load(sys.stdin).get("active") or []))
+try:
+    d=json.load(sys.stdin)
+    print(len(d.get("active") or []) + int(d.get("authors_in_flight") or 0))
 except Exception: print(-1)' 2>/dev/null)
       [ -z "$act" ] && act=-1
       now=$(date +%s); el=$((now-drain_t0))
