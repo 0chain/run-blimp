@@ -325,6 +325,39 @@ for ft in $(facts_of); do
     # own proof instead of re-running the original on base.
     echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} verify=${V_MS[$n]:-0} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
   done
+  # ---- DRAIN THE DETACHED AUTHORS BEFORE ANYTHING TOUCHES THE SOURCE --------
+  # With the base fallback suppressed (ZS3_MV_BASE_ON_DETACH=0) a first touch
+  # returns the moment the serve budget expires, so this loop finishes long
+  # before the authors it started have built anything: 14 queries done, 6 MVs
+  # banked, the rest still queued on the single CTAS slot (node 1788402989672,
+  # 2026-09-04). Ticking then would append INTO those builds — the row-hash
+  # verify compares the MV against the post-append source, mismatches, and a
+  # correct MV is dropped. Wait for the authors to go quiet first.
+  # AUTHOR_DRAIN_SEC=0 skips the wait; default 90 min, polled every 20s.
+  DRAIN_MAX="${AUTHOR_DRAIN_SEC:-5400}"
+  if [ "$DRAIN_MAX" -gt 0 ] 2>/dev/null; then
+    echo ">> draining detached authors before the tick (max ${DRAIN_MAX}s)"
+    drain_t0=$(date +%s); quiet=0
+    while :; do
+      act=$(curl -s -m 15 -H "Authorization: Bearer $TOKEN" "$QAPI/admin/query/active" 2>/dev/null \
+            | "$PY3" -c 'import json,sys
+try: print(len(json.load(sys.stdin).get("active") or []))
+except Exception: print(-1)' 2>/dev/null)
+      [ -z "$act" ] && act=-1
+      now=$(date +%s); el=$((now-drain_t0))
+      if [ "$act" = "0" ]; then
+        quiet=$((quiet+1))
+        [ "$quiet" -ge 2 ] && { echo "   authors quiet after ${el}s"; break; }
+      else
+        quiet=0
+      fi
+      if [ "$el" -ge "$DRAIN_MAX" ]; then
+        echo "   WARN: authors still active ($act) after ${el}s — ticking anyway"
+        break
+      fi
+      sleep 20
+    done
+  fi
   # ---- THE DELTA GATE, part 1: snapshot every MV's parts BEFORE the append ---
   # Must be before phase 2, not between phase 2 and phase 3: snapshot_changed can
   # trigger the webhook's ACTIVE refresh (webhook_router.go
