@@ -566,3 +566,23 @@ class TestGeoCorrelation(unittest.TestCase):
         S.apply_geo_correlation(cols, "store_sales", self.GEO, rnd=random.Random(2))
         for c, v in keep.items():
             self.assertEqual(cols[c], v, f"{c} must keep its independent draw")
+
+
+class StringDomainsTest(unittest.TestCase):
+    """Appended dimension rows must not invent categories: categorical string
+    columns draw from the live domain, id-like ones stay unique per row."""
+
+    def test_categorical_strings_come_from_the_domain(self):
+        import random
+        cols = [("i_item_sk", "l"), ("i_item_id", "s"), ("i_category", "s"), ("i_current_price", "d")]
+        out = S.gen_table_cols("item", cols, 40, date_lo=1, date_hi=2, dim_hi={}, key_base=1000,
+                             rnd=random.Random(1), str_domains={"i_category": ["Books", "Music", "Shoes"]})
+        self.assertTrue(set(out["i_category"]) <= {"Books", "Music", "Shoes"})
+        self.assertEqual(len(set(out["i_item_id"])), 40)
+        self.assertEqual(out["i_item_sk"], list(range(1000, 1040)))
+
+    def test_without_domains_strings_are_unique_per_row(self):
+        import random
+        cols = [("i_item_sk", "l"), ("i_category", "s")]
+        out = S.gen_table_cols("item", cols, 5, date_lo=1, date_hi=2, dim_hi={}, key_base=1, rnd=random.Random(1))
+        self.assertEqual(out["i_category"][0], "i_category:1")

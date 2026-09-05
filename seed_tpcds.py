@@ -824,7 +824,53 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
     return rw
 
 
-def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random):
+def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose=True):
+    """column -> list of existing values, for every STRING column whose sampled
+    distinct count is at most `max_ratio` of the sampled rows (a categorical
+    attribute: i_category, ca_state, s_gmt_offset, p_channel_dmail ...).
+
+    WHY: appended dimension rows used to get '<col>:<key>' in EVERY string column,
+    unique per row. Each 5,000-row item append therefore added 5,000 brand-new
+    categories, brands and classes: after a day of ticks the node's item table
+    held 662,000 rows with 120,010 distinct i_category (the real domain is 10).
+    That changes what the benchmark queries mean (categories no query names) and
+    prices every grain over a dimension attribute at the fact size — q61's
+    [ca_gmt_offset d_moy d_year i_category s_gmt_offset] branch was refused at an
+    estimated 1.44B groups (node 1788402989672, 2026-09-05). Categorical columns
+    now draw from the live domain; id-like columns (near-unique in the sample)
+    keep the unique-per-row value. Returns {} when the table cannot be sampled."""
+    import pyarrow.compute as pc
+    scols = [c for c, k in columns if k == "s"]
+    if t is None or not scols:
+        return {}
+    try:
+        arr = t.scan(selected_fields=tuple(scols), limit=sample_rows).to_arrow()
+    except Exception as e:
+        if verbose:
+            print(f"   WARN: string-domain sample unavailable ({e}); appended strings stay unique per row")
+        return {}
+    out = {}
+    n = arr.num_rows
+    if n <= 0:
+        return out
+    for c in scols:
+        try:
+            col = arr.column(c).drop_null()
+            vals = pc.unique(col).to_pylist()
+        except Exception:
+            continue
+        if not vals:
+            continue
+        if len(vals) <= max(1, int(n * max_ratio)):
+            out[c] = vals
+    if verbose and out:
+        print("   string domains from the live table (categorical): "
+              + ", ".join(f"{c}={len(v)}" for c, v in sorted(out.items())))
+    return out
+
+
+def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random,
+                   str_domains=None):
     """Generate EVERY column of a NON-sales table (inventory, customer, item, ...)
     from its live schema. No per-table row template: the internal 9-table wave
     (bench/sf1/sf1000_append_test.py) hand-wrote 4-10 columns per table and let
@@ -833,7 +879,8 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
 
       own surrogate key (c_customer_sk on customer) -> key_base+i, never reused
       foreign _sk                                  -> uniform over the catalog range
-      string                                       -> '<col>:<key>' (unique per row)
+      string, categorical (see load_string_domains) -> drawn from the live domain
+      string, id-like                               -> '<col>:<key>' (unique per row)
       date / decimal / int / long                  -> in-range noise"""
     import datetime
     names = [c[0] for c in columns]
@@ -853,6 +900,9 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
             out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
         elif d is not None:
             h = hi(d[0]); out[name] = [rnd.randint(1, h) for _ in range(n)]
+        elif kind == "s" and str_domains and str_domains.get(name):
+            dom = str_domains[name]
+            out[name] = [rnd.choice(dom) for _ in range(n)]
         elif kind == "s":
             out[name] = [f"{name}:{key_base + i}" for i in range(n)]
         elif kind == "t":
@@ -892,7 +942,8 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
         if verbose:
             print(f"   {table}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
     cols = gen_table_cols(table, columns, n, date_lo=date_lo, date_hi=date_hi,
-                          dim_hi=dim_hi_cache, key_base=kb)
+                          dim_hi=dim_hi_cache, key_base=kb,
+                          str_domains=load_string_domains(t, columns, verbose=verbose))
     data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
     _write_and_add(fs, t, data, n, f"{namespace}.{table}", strict=strict)
     # the facts appended after this may now reference the new keys
