@@ -54,7 +54,7 @@ Plus: web_returns was not a recognised --table at all. It fell through to the
 store_returns branch, which built sr_* columns and add_files'd them into
 web_returns — every wr_* column NULL, i.e. a 100%-dead delta.
 """
-import argparse, random, decimal, os
+import argparse, random, decimal, os, json
 DRY_RUN = False   # --dry-run: build + conform every delta, write nothing
 # NOTE: pyarrow/pyiceberg are imported INSIDE the catalog-facing functions, never
 # at module scope. The generator and its regression tests must run on a plain
@@ -218,6 +218,30 @@ FALLBACK_DIM_HI = {
     "web_page": 3000, "web_site": 54, "reason": 65,
 }
 
+# Key pools from query_pools.py (--key-pools): {"date_sk": [...], "dims": {dim: [...]}}.
+# When a dimension (or the date) has a pool, appended fact rows draw from it so
+# the tick HITS the target query's filters instead of folding to 0 rows.
+KEY_POOLS = {"date_sk": [], "dims": {}}
+
+def load_key_pools(path):
+    global KEY_POOLS
+    with open(path) as f:
+        d = json.load(f)
+    KEY_POOLS = {"date_sk": list(d.get("date_sk") or []), "dims": {k: list(v) for k, v in (d.get("dims") or {}).items() if v}}
+    print("   key pools: %d date(s), %s" % (len(KEY_POOLS["date_sk"]), {k: len(v) for k, v in KEY_POOLS["dims"].items()}))
+
+def pool_pick(dimtbl, n, lo, hi, rnd):
+    """n keys for dimtbl: from its pool when one exists, else uniform in [lo, hi]."""
+    pool = KEY_POOLS["dims"].get(dimtbl)
+    if pool:
+        return [rnd.choice(pool) for _ in range(n)]
+    return [rnd.randint(lo, hi) for _ in range(n)]
+
+def pool_dates(n, date_lo, date_hi, rnd):
+    if KEY_POOLS["date_sk"]:
+        return [rnd.choice(KEY_POOLS["date_sk"]) for _ in range(n)]
+    return [rnd.randint(date_lo, date_hi) for _ in range(n)]
+
 def dim_for(col):
     """(dimension_table, key_column) a fact column references, or None."""
     if not col.endswith("_sk"):
@@ -261,7 +285,7 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
 
     # --- keys -------------------------------------------------------------
     # One primary date per row drives every other date on that row.
-    sold = [rnd.randint(date_lo, date_hi) for _ in range(n)]
+    sold = pool_dates(n, date_lo, date_hi, rnd)
     for name, kind in columns:
         d = dim_for(name)
         if d is None:
@@ -275,7 +299,7 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
             out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
         else:
             h = hi(dimtbl)
-            out[name] = [rnd.randint(1, h) for _ in range(n)]
+            out[name] = pool_pick(dimtbl, n, 1, h, rnd)
 
     keycol = FACT_KEY_COL.get(fact)
     if keycol and keycol in names:
@@ -457,7 +481,7 @@ def gen_store_sales_cols(n, date_lo, date_hi, store_pool, ticket_base=TICKET_BAS
     cols = gen_fact_cols("store_sales", FACT_COLUMNS["store_sales"], n,
                          date_lo=date_lo, date_hi=date_hi,
                          dim_hi=dim_hi or {}, key_base=ticket_base, rnd=rnd)
-    if store_pool:
+    if store_pool and not KEY_POOLS["dims"].get("store"):
         cols["ss_store_sk"] = list(store_pool)
     return cols
 
@@ -895,11 +919,11 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
         if d is not None and d[0] == table:
             out[name] = [key_base + i for i in range(n)]            # own PK
         elif d is not None and d[0] == "date_dim":
-            out[name] = [rnd.randint(date_lo, date_hi) for _ in range(n)]
+            out[name] = pool_dates(n, date_lo, date_hi, rnd)
         elif d is not None and d[0] == "time_dim":
             out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
         elif d is not None:
-            h = hi(d[0]); out[name] = [rnd.randint(1, h) for _ in range(n)]
+            h = hi(d[0]); out[name] = pool_pick(d[0], n, 1, h, rnd)
         elif kind == "s" and str_domains and str_domains.get(name):
             dom = str_domains[name]
             out[name] = [rnd.choice(dom) for _ in range(n)]
@@ -973,6 +997,7 @@ def main():
         help="comma-separated d_year values the delta's date_sk must span. The delta is "
              "invisible to any MV whose body filters a year outside this set — q4 filters "
              "d_year IN (2001,2002) and got a 0-row merge from the old 2000-only default.")
+    ap.add_argument("--key-pools",default="",help="JSON from query_pools.py: draw appended keys/dates from the target query's pools")
     ap.add_argument("--tick",action="store_true",
         help="append ONE realistic CDC tick across all six facts in proportion "
              "(see --ratios) instead of a flat --rows into a single --table. That "
@@ -1007,6 +1032,8 @@ def main():
              "delta: measured on SF1000, a random pair passes with p=8.46e-05, so "
              "a 5,000-row store_returns delta expects 0.42 eligible rows.")
     a=ap.parse_args()
+    if a.key_pools:
+        load_key_pools(a.key_pools)
     global DRY_RUN; DRY_RUN=a.dry_run
     try:
         years=[int(y) for y in a.years.split(",") if y.strip()]

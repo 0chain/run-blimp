@@ -429,9 +429,26 @@ except Exception: print(-1)' 2>/dev/null)
   # (parquet field IDs, then all-null decimal stats) hid behind that for hours.
   if [ -z "$APPEND_TABLES" ]; then
     echo ">> phase 2: CDC tick (base=$CDC_ROWS rows, ratios=${CDC_RATIOS:-4:2:1}, returns=${CDC_RETURNS_RATIO:-0.1}, extra=[${EXTRA_TABLES:-none}]) + snapshot_changed"
+    # QUERY-AWARE TICK (default on; CDC_TARGET_POOLS=0 restores uniform draws):
+    # derive key/date pools from this run's queries' dimension predicates
+    # (query_pools.py, customer catalog via DuckDB) so the appended rows land
+    # inside the filters and the delta term has rows to merge — a uniform draw
+    # folded q18/q60 to 0 rows every tick (2026-09-06).
+    POOLS_ARG=""
+    if [ "${CDC_TARGET_POOLS:-1}" != "0" ]; then
+      pf=""; for su in $SUITES; do for nr in ${su#*:}; do [ -f "$Q_DIR/q$nr.sql" ] && pf="$pf --sql-file $Q_DIR/q$nr.sql"; done; done
+      if [ -n "$pf" ] && python3 -c "import duckdb" 2>/dev/null; then
+        if python3 "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
+             ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} --out /tmp/cdc_pools.json 2>/tmp/cdc_pools.log; then
+          POOLS_ARG="--key-pools /tmp/cdc_pools.json"; sed "s/^/   pools: /" /tmp/cdc_pools.log | tail -6
+        else
+          echo "   pools: derivation failed (uniform draws) — $(tail -1 /tmp/cdc_pools.log)"
+        fi
+      fi
+    fi
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
       "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
-      --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" \
+      --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG \
       ${EXTRA_TABLES:+--extra-tables "$EXTRA_TABLES"} \
       ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} \
       --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
