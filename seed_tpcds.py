@@ -536,7 +536,7 @@ def parse_ratios(s):
 # ===========================================================================
 # Catalog-facing code below (needs pyiceberg / pyarrow).
 # ===========================================================================
-def catalog_bounds(cat, namespace, table, col):
+def catalog_bounds(cat, namespace, table, col, min_rows=0):
     """(min, max) of `col` read from ICEBERG MANIFEST STATISTICS — no data scan.
 
     Measured on test2 SF1000 (2026-08-04): 0.01-0.22s per table even for the
@@ -550,6 +550,11 @@ def catalog_bounds(cat, namespace, table, col):
         lo = hi = None
         for task in t.scan().plan_files():
             df = task.file
+            # min_rows: ignore small files (earlier bench ticks; one 5,000-row
+            # seed file spans d_date_sk 2415022..2488070 on the node) when the
+            # caller wants the BASE data's bounds, e.g. the dataset's "now".
+            if min_rows and (df.record_count or 0) < min_rows:
+                continue
             b = (df.lower_bounds or {}).get(f.field_id)
             if b is not None:
                 v = from_bytes(f.field_type, b)
@@ -1136,7 +1141,7 @@ def main():
     if a.stream_days and a.stream_days>0:
         now=None
         for f_,dcol in FACT_DATE_COL.items():
-            _,hi=catalog_bounds(cat,a.namespace,f_,dcol)
+            _,hi=catalog_bounds(cat,a.namespace,f_,dcol,min_rows=100000)
             if hi is not None: now=hi if now is None else max(now,hi)
         if now is None:
             raise SystemExit("--stream-days: no sold-date bounds in the catalog for the sales facts")
