@@ -785,6 +785,57 @@ def apply_geo_correlation(cols, fact, geo, rnd=random):
     return n
 
 
+# CROSS-FACT correlation (2026-09-06). q29 joins store_sales ⋈ store_returns ⋈
+# catalog_sales on the SAME customer and item — a customer who bought in the
+# store, returned it, then bought it from the catalog. Facts appended
+# independently never produce such a triple, so q29's delta terms fold to 0
+# rows every tick (40s of proving emptiness). Every tick now records the
+# (customer, item) pairs of the RETURNED sales and re-issues a share of them
+# (CDC_CROSS_FACT, default 0.5) as the bill customer/item of the sales facts
+# appended after it. CDC_CROSS_FACT=0 restores independent draws.
+CROSS_PAIRS = []
+CROSS_FRACTION = float(os.environ.get("CDC_CROSS_FACT", "0.5") or 0)
+
+
+def _dim_col(names, dim, prefer=()):
+    """First column among `names` pointing at dimension `dim`; a `prefer`
+    substring (e.g. "bill_customer", "refunded_customer") wins when present."""
+    hits = [c for c in names if (dim_for(c) or (None,))[0] == dim]
+    for p in prefer:
+        for c in hits:
+            if p in c:
+                return c
+    return hits[0] if hits else None
+
+
+def apply_cross_fact(cols, fact, rnd=random):
+    """Overwrite a share of (customer, item) with pairs recorded from earlier
+    returns in this tick. Only sales facts; nothing to do without pairs."""
+    if not CROSS_PAIRS or CROSS_FRACTION <= 0 or fact not in SALES_FACTS:
+        return 0
+    ccol = _dim_col(list(cols), "customer", prefer=("bill_customer", "customer_sk"))
+    icol = _dim_col(list(cols), "item")
+    if not ccol or not icol:
+        return 0
+    n = len(cols[icol])
+    m = int(n * min(1.0, CROSS_FRACTION))
+    for i in rnd.sample(range(n), m):
+        c, it = rnd.choice(CROSS_PAIRS)
+        cols[ccol][i] = c
+        cols[icol][i] = it
+    return m
+
+
+def record_cross_pairs(rcols):
+    ccol = _dim_col(list(rcols), "customer", prefer=("refunded_customer", "customer_sk"))
+    icol = _dim_col(list(rcols), "item")
+    if not ccol or not icol:
+        return 0
+    pairs = [(c, i) for c, i in zip(rcols[ccol], rcols[icol]) if c is not None and i is not None]
+    CROSS_PAIRS.extend(pairs)
+    return len(pairs)
+
+
 def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                 store_pool=None, returns_rows=0, strict=True, verbose=True,
                 geo=None):
@@ -812,6 +863,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                          dim_hi=dim_hi_cache, key_base=kb)
     if apply_geo_correlation(cols, fact, geo) and verbose:
         print(f"   {fact}: customer/address/store drawn as zip-consistent triples")
+    if (xm := apply_cross_fact(cols, fact)) and verbose:
+        print(f"   {fact}: {xm} rows re-issue (customer, item) pairs returned earlier this tick (cross-fact)")
     if store_pool is not None:
         sc = _slice_col(columns)
         if sc:
@@ -842,6 +895,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                                     date_lo=date_lo, date_hi=date_hi,
                                     dim_hi=dim_hi_cache)
     rw = len(next(iter(rcols.values())))
+    if (xp := record_cross_pairs(rcols)) and verbose:
+        print(f"   {rfact}: {xp} (customer, item) pairs recorded for the cross-fact draw")
     rdata = pa.table({c: rcols[c] for c, _ in rcolumns}, schema=_pa_schema(rcolumns))
     _write_and_add(fs, rt, rdata, rw,
                    f"{namespace}.{rfact} (referential to {fact})", strict=strict)
