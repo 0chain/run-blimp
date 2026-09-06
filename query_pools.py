@@ -130,7 +130,9 @@ def where_conjuncts(sql):
         k = 0
         while k < len(parts):
             p = parts[k]
-            if re.search(r"(?i)\bbetween\s+[^\s]+\s*$", p) and k + 1 < len(parts):
+            # a BETWEEN whose lower bound has no AND yet (the split ate it):
+            # `d_date BETWEEN cast('1999-02-22' AS date)` + `(cast(…) + INTERVAL '30 days')`
+            if re.search(r"(?i)\bbetween\b", p) and not re.search(r"(?i)\bbetween\b.*\band\b", p) and k + 1 < len(parts):
                 parts[k] = p + " AND " + parts[k + 1]
                 del parts[k + 1]
             k += 1
