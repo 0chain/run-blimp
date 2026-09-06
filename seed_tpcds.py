@@ -179,6 +179,10 @@ DEFAULT_RATIOS = {"store_sales": 1.0, "catalog_sales": 0.5, "web_sales": 0.25}
 DEFAULT_RETURNS_RATIO = 0.1
 
 # The synthetic surrogate key each fact numbers its rows by.
+# The sold-date column of each sales fact: the dataset's "now" for --stream-days.
+FACT_DATE_COL = {"store_sales": "ss_sold_date_sk", "catalog_sales": "cs_sold_date_sk",
+                 "web_sales": "ws_sold_date_sk"}
+
 FACT_KEY_COL = {"store_sales": "ss_ticket_number", "catalog_sales": "cs_order_number",
                 "web_sales": "ws_order_number", "store_returns": "sr_ticket_number",
                 "catalog_returns": "cr_order_number", "web_returns": "wr_order_number"}
@@ -1048,6 +1052,13 @@ def main():
              "data files, so the snapshot has REMOVED files and the gateway must "
              "full-rematerialize.")
     ap.add_argument("--upsert-store-sk",type=int,default=7,help="slice replaced in upsert mode")
+    ap.add_argument("--stream-days",type=int,default=int(os.environ.get("CDC_STREAM_DAYS","0") or 0),
+        help="REALISTIC-STREAM mode: appended fact rows are dated in the last N days of the "
+             "dataset's own 'now' (the sales facts' max sold date from catalog bounds), the "
+             "date pool from --key-pools is ignored, returns still reference the appended sales "
+             "and keys stay monotone. 0 (default) keeps the query-aware backfill: dates drawn "
+             "from --years / the target query's own predicates, which lands rows in old "
+             "periods for old random keys — the case that forces partner-fact reads on merge.")
     ap.add_argument("--years",default="2000,2001,2002",
         help="comma-separated d_year values the delta's date_sk must span. The delta is "
              "invisible to any MV whose body filters a year outside this set — q4 filters "
@@ -1122,6 +1133,16 @@ def main():
     fs=s3fs.S3FileSystem(client_kwargs=fs_kwargs)
     dim_hi_cache={}
     strict=not a.no_strict
+    if a.stream_days and a.stream_days>0:
+        now=None
+        for f_,dcol in FACT_DATE_COL.items():
+            _,hi=catalog_bounds(cat,a.namespace,f_,dcol)
+            if hi is not None: now=hi if now is None else max(now,hi)
+        if now is None:
+            raise SystemExit("--stream-days: no sold-date bounds in the catalog for the sales facts")
+        date_lo,date_hi=now-a.stream_days+1,now
+        KEY_POOLS["date_sk"]=[]
+        print(f"== STREAM mode: dataset now = d_date_sk {now}; appended rows dated {date_lo}..{date_hi} (last {a.stream_days} days); date pool ignored ==")
     print(f"== delta date span: d_date_sk {date_lo}..{date_hi} (years {years}) ==")
 
     # ---------------- one realistic tick across all six facts ---------------
