@@ -64,8 +64,22 @@ W(){ warp "$1" --host="$GW:9000" --access-key="${AK:?set AK}" --secret-key="${SK
 # clean_bkt — remove a warp/ttfb scratch bucket after use (warp --keep-data leaves it
 # on the allocation otherwise; that's what piled up 50+ GiB of warp* buckets). Uses
 # the gateway S3 endpoint via awscli.
+# NEVER `rb` a bucket that does not exist. On a gateway with bucket federation on
+# (MINIO_DOMAIN + MINIO_ETCD_ENDPOINTS — every cluster gateway), a FAILED
+# DeleteBucket used to "restore" the etcd entry it had just deleted, registering a
+# bucket that never existed. ListBuckets is served from those records, so the ghost
+# stayed listed while every per-bucket op 404'd. Since clean_bkt is called BEFORE
+# the warp phases, it minted a phantom for the exact two names warp was about to
+# create — warp's CreateBucket then hit BucketAlreadyOwnedByYou and the whole run
+# died ("you already own it", then "bucket … does not exist" on the GET). Internal
+# warp was unaffected only because run_bench.sh cleans up with `mc rb`.
+# Fixed gateway-side too (zs3 DeleteBucket -> BucketNotFound); this head-bucket
+# guard keeps the suite correct against gateways that predate that fix.
 clean_bkt(){ export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=us-east-1
-  for b in "$@"; do aws s3 rb "s3://$b" --force --endpoint-url "http://$GW:9000" >/dev/null 2>&1; done; }
+  for b in "$@"; do
+    aws s3api head-bucket --bucket "$b" --endpoint-url "http://$GW:9000" >/dev/null 2>&1 || continue
+    aws s3 rb "s3://$b" --force --endpoint-url "http://$GW:9000" >/dev/null 2>&1
+  done; }
 disk_guard(){ mountpoint -q "$MNT" || return 0; local p; p=$(df --output=pcent "$MNT" 2>/dev/null|tail -1|tr -dc 0-9)
   echo "  [$MNT ${p:-?}% used]"; [ "${p:-0}" -ge 90 ] && { echo "!! ${p}% >=90% — abort (disk-fill guard)"; exit 1; }; }
 mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
