@@ -282,7 +282,7 @@ evict_query(){ # evict_query <sql> <name>
     t=$(echo "$m" | J mv_table); t="${t##*.}"; ns=$(echo "$m" | J mv_namespace)
     [ -n "$t" ] || break
     e=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-      -d "{\"namespace\":\"${ns:-$MV_NAMESPACE}\",\"table\":\"$t\",\"keep_recipe\":true}")
+      -d "{\"namespace\":\"${ns:-$MV_NAMESPACE}\",\"table\":\"$t\",\"keep_recipe\":true,\"force\":true}")
     ok=$(echo "$e" | J evicted)
     echo "   $2: evict ${ns:-$MV_NAMESPACE}.$t evicted=$ok $(echo "$e" | J error)"
     if [ "$ok" != "True" ]; then
@@ -416,10 +416,25 @@ except Exception: print(-1)' 2>/dev/null)
   # CDC_APPEND_TABLES still forces the old flat per-table behaviour if set.
   APPEND_TABLES="${CDC_APPEND_TABLES:-}"
   # CDC_EXTRA_TABLES: the non-sales tables the tick also appends (flat CDC_ROWS
-  # each) — the internal SF1000 certification wave was 9 tables: six facts plus
-  # inventory, customer and item, which is what exercises the inventory merges
-  # and the dim-change rebuild lane. Set CDC_EXTRA_TABLES="" for facts only.
-  EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer item}"
+  # each). The internal SF1000 certification wave was 9 tables: six facts plus
+  # inventory, customer and item, which exercises the inventory merges and the
+  # dim-change rebuild lane. Set CDC_EXTRA_TABLES="" for facts only.
+  #
+  # ALL DIMENSIONS NOW APPEND (2026-09-09). The 9-table set left date_dim,
+  # customer_address, store, promotion and warehouse never appended on any run,
+  # so the dim-delta and RI-prune paths for them were exercised by no test at
+  # all — not a bug, but a hole: a query whose only mutable dimension is one of
+  # those five had its merge lane entirely unproven. Measured on node
+  # 1788402989672 (2026-09-09): those five tables had no data file newer than
+  # 2026-07-28 while the other nine appended that morning.
+  #
+  # NOTE the RI ordering this relies on: seed_tpcds.py issues a dimension's own
+  # surrogate key as max(existing)+1 ("never reused") and appends dims BEFORE
+  # the facts that reference them, so a fresh dim row is unreachable from
+  # pre-append facts. That is the exact premise the RI-prune gate asserts when
+  # it drops an insert-only dim delta as zero-contribution; appending these
+  # five does not weaken it.
+  EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer item date_dim customer_address store promotion warehouse}"
   NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns $EXTRA_TABLES"
   SEED_CREDS_AK="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}"; SEED_CREDS_SK="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}"
   # Capture instead of `| tail -1`: the pipe threw away both the traceback AND
