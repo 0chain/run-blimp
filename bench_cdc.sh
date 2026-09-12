@@ -434,7 +434,17 @@ except Exception: print(-1)' 2>/dev/null)
   # pre-append facts. That is the exact premise the RI-prune gate asserts when
   # it drops an insert-only dim delta as zero-contribution; appending these
   # five does not weaken it.
-  EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer item date_dim customer_address store promotion warehouse}"
+  # ALL 24 TABLES (2026-09-12). The 2026-09-09 note above says "ALL DIMENSIONS
+  # NOW APPEND" but the list it shipped was eight, so ten tables still never
+  # appended on any run: time_dim, household_demographics, customer_demographics,
+  # web_page, web_site, catalog_page, call_center, ship_mode, reason, income_band.
+  # Every query whose only mutable dimension is one of those had its merge lane
+  # unproven — q88 joins time_dim AND household_demographics and could only ever
+  # see a delta through `store`. The full non-fact set is listed here, so 6 facts
+  # + 18 others = the whole 24-table schema appends each tick. The RI ordering the
+  # prune gate relies on is unchanged: seed_tpcds.py issues each dimension's own
+  # surrogate key as max(existing)+1 and appends dimensions BEFORE the facts.
+  EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer customer_address customer_demographics date_dim household_demographics item income_band promotion reason ship_mode store time_dim warehouse web_page web_site call_center catalog_page}"
   NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns $EXTRA_TABLES"
   SEED_CREDS_AK="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}"; SEED_CREDS_SK="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}"
   # Capture instead of `| tail -1`: the pipe threw away both the traceback AND
