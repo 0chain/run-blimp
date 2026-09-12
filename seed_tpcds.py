@@ -672,7 +672,38 @@ def conform_to_table_schema(tbl, table, n, strict=True):
         if field.name in have:
             arr = have[field.name]
             if not arr.type.equals(field.type):
-                arr = arr.cast(field.type)
+                # CLAMP A DECIMAL INTO THE TARGET PRECISION BEFORE CASTING.
+                #
+                # The row generator emits every decimal as decimal(7,2) (see the
+                # kinds map), but the real Iceberg schema has narrower decimals —
+                # ca_gmt_offset / s_gmt_offset / w_gmt_offset are decimal(5,2),
+                # max 999.99. A (7,2) value above that made arr.cast() raise
+                # "Decimal value does not fit in precision 5", which killed the
+                # CDC tick outright: "CDC TICK FAILED (exit 1) — no rows added",
+                # so EVERY merge measurement was skipped (2026-09-11).
+                #
+                # Generic: derived from the target type, no column names.
+                if pa.types.is_decimal(field.type) and pa.types.is_decimal(arr.type):
+                    import decimal as _dec
+                    lim = _dec.Decimal(10) ** (field.type.precision - field.type.scale)
+                    q = _dec.Decimal(1).scaleb(-field.type.scale)
+                    def _fit(v):
+                        if v is None:
+                            return None
+                        v = _dec.Decimal(v)
+                        if v >= lim:
+                            v = lim - q
+                        elif v <= -lim:
+                            v = -lim + q
+                        return v.quantize(q, rounding=_dec.ROUND_DOWN)
+                    arr = pa.array([_fit(v) for v in arr.to_pylist()], type=field.type)
+                else:
+                    try:
+                        arr = arr.cast(field.type)
+                    except Exception as e:
+                        raise SystemExit(
+                            "FATAL: cannot cast column %s of %s from %s to %s: %s"
+                            % (field.name, table.name(), arr.type, field.type, e))
             cols.append(arr)
         else:
             filled.append(field.name)
