@@ -74,7 +74,7 @@ echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC obj=$OSZ mlperf-accel=$EC_ACCEL r
 # allocation overruns it mid-generate (e.g. 45 GB train → ~57 GB > a 48 GB alloc).
 # Query the real allocation capacity and cap so train+eval land at ~80% of it.
 # (No cap when the query fails — falls back to the EC default.)
-ALLOC_GB=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage?token=blimp-${CLUSTER_ID:-}" 2>/dev/null \
+ALLOC_GB=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage?token=${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}" 2>/dev/null \
   | grep -oE '"capacity_bytes":[0-9]+' | head -1 | grep -oE '[0-9]+' | awk '{printf "%d",$1/1073741824}')
 if [ "${ALLOC_GB:-0}" -gt 0 ]; then
   FIT=$(( ALLOC_GB * 80 / 127 ))   # total=train×1.27 ≤ 80% of alloc → train ≤ alloc×0.63

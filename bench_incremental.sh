@@ -20,7 +20,7 @@ Q_DIR="${Q_DIR:-$HOME/tpcds_queries}"
 # request to the CLUSTER gateway with a cluster token, so against a manual stack
 # (test2: localhost:9100 + a harness token) all three refresh cycles returned
 # delta_merge_ms=? in 33ms — the bench looked like it ran and measured nothing.
-QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-zus-$CLUSTER_ID}"; HERE="$(cd "$(dirname "$0")" && pwd)"
+QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}}"; HERE="$(cd "$(dirname "$0")" && pwd)"
 PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
 now(){ date +%s.%N; }; el(){ awk -v a="$1" -v z="$2" 'BEGIN{printf "%.1f",(z-a)*1000}'; }
 J(){ python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }

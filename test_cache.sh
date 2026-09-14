@@ -76,7 +76,7 @@ run(){ echo; echo ">>> $1"; shift; "$@"; }
 # gateway's own run_bench warp/mlperf rows). cdc auto-fills the tier columns by
 # running run_bench's __tiers__ sampler between the running and done imports. Token
 # = zus-<CLUSTER_ID>; best-effort (skips silently if wiring/py absent).
-BL_TOK="${CLUSTER_TOKEN:-zus-${CLUSTER_ID:-}}"
+BL_TOK="${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}"
 bl_post(){ # <bid> <status> <type> <metrics_json> [logfile]
   [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] && command -v python3 >/dev/null 2>&1 || return 0
   BL_ID="$1" BL_ST="$2" BL_TY="$3" BL_M="$4" BL_LOG="${5:-}" BL_GW="$GW" BL_CID="$CLUSTER_ID" BL_TOK="$BL_TOK" python3 - <<'PY' 2>/dev/null || true

@@ -123,10 +123,12 @@ save_env(){
 REGION=$REGION
 CLUSTER_REGION=${CLUSTER_REGION:-$REGION}
 CLUSTER_ID=$CLUSTER_ID
-# Admin bearer token the cluster expects. Default (empty) -> zus-<CLUSTER_ID> for
-# AWS cloud clusters; on-prem enterprise clusters use blimp-<CLUSTER_ID>, so set
-# CLUSTER_TOKEN=blimp-<id> for those. Round-trips through this wiring file.
-CLUSTER_TOKEN=${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}
+# Bearer the cluster's gateway validates: the account's FLEET token. Filled from
+# the node's copy (/opt/0chain/zs3server/environment/admin_token) when the CLI
+# runs on the gateway box, else paste it from the panel (Settings -> API token).
+# Never derived from the cluster id: "blimp-<id>"/"zus-<id>" are guessable and
+# no gateway accepts them any more (2026-09-14).
+CLUSTER_TOKEN=${CLUSTER_TOKEN:-}
 GW=$GW
 GATEWAY=$GW
 ICEBERG_URL=$ICEBERG_URL
@@ -217,10 +219,9 @@ heal_wiring(){
     # which failed `blimp --query` at /admin/source/snapshot_changed. Read the
     # file first and fall back to the env for pre-fleet nodes that have none.
     tok=$(cat /opt/0chain/zs3server/environment/admin_token 2>/dev/null | tr -d '\r\n')
-    [ -n "$tok" ] || tok=$(printf '%s' "$ea" | sed -n 's/^ZS3_ADMIN_TOKEN=//p' | head -1)
     ak=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_USER=//p' | head -1)
     sk=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_PASSWORD=//p' | head -1)
-    [ -n "$tok" ] || tok="${CLUSTER_TOKEN:-blimp-${CLUSTER_ID:-}}"
+    [ -n "$tok" ] || tok="${CLUSTER_TOKEN:-}"
     if [ -n "$ak" ] && [ -n "$sk" ] && \
        { [ "$ak" != "${GW_AK:-}" ] || [ "$sk" != "${GW_SK:-}" ] || [ "$tok" != "${CLUSTER_TOKEN:-}" ]; }; then
       GW_AK="$ak"; GW_SK="$sk"; CLUSTER_TOKEN="$tok"
@@ -232,7 +233,7 @@ heal_wiring(){
   fi
   # FALLBACK — blimp on a SEPARATE box (no local container): best-effort refresh via
   # the gateway admin API. Detect a stale token (401) and refetch the S3 keys.
-  local port="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:-blimp-${CLUSTER_ID:-}}" code
+  local port="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" code
   local body="${TMPDIR:-/tmp}/.blimp_cred.$$"
   code=$(curl -s -o "$body" -w '%{http_code}' -m 8 \
     "http://$GW:$port/admin/credentials" -H "Authorization: Bearer $tok" 2>/dev/null)
@@ -342,7 +343,7 @@ pick(){ # <var> <prompt> <default-number> <label1> <label2> ...
 fleet_creds(){
   [ -n "${GW:-}" ] || return 1
   local resp; resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" 2>/dev/null) || return 1
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" 2>/dev/null) || return 1
   eval "$(printf '%s' "$resp" | "${BLIMP_PY:-python3}" -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(0)
@@ -425,7 +426,7 @@ choose_source_location(){
        bold "  source → $S3_ENDPOINT/$ORIGIN_BUCKET (fleet keys, fetched from the gateway)" ;;
     2) SOURCE_TARGET=external
        ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (blank = generate one here)")
-       [ -n "$ORIGIN_BUCKET" ] && S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint URL of that bucket (MinIO/Ceph/R2/any cloud, e.g. http://minio:9000; blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
+       [ -n "$ORIGIN_BUCKET" ] && S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint URL of that bucket (MinIO/Ceph/R2/any cloud, e.g. http://minio:9000; blank = your cloud's S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
        # INCOMPATIBLE PAIR. The gateway's Nessie can only write table metadata
        # into a warehouse IT has configured — here s3://tpcds-mv, on the FLEET
        # endpoint. With the data on some other S3, metadata and data end up on
@@ -554,8 +555,8 @@ standup_iceberg(){
 # unsampleable → the MV author refuses. So when a data bucket is known we put the
 # warehouse at s3://<data-bucket>/wh; only with no data bucket do we mint one.
 standup_bucket(){
-  command -v aws >/dev/null || die "awscli not installed — needed to create an S3 bucket. Install it, or pass an existing s3:// warehouse."
-  aws sts get-caller-identity >/dev/null 2>&1 || die "AWS creds not working — run 'aws configure' (or set AWS_PROFILE), or pass an existing s3:// warehouse."
+  command -v aws >/dev/null || die "awscli not installed — the S3 client this kit uses for any S3-compatible endpoint. Install it, or pass an existing s3:// warehouse."
+  aws sts get-caller-identity >/dev/null 2>&1 || die "S3 credentials not working — run 'aws configure' (or set AWS_PROFILE), or pass an existing s3:// warehouse."
   local bkt="${ORIGIN_BUCKET:-blimp-wh-${CLUSTER_ID:-$(this_host | tr -d '.')}}"
   bold "creating/using S3 warehouse bucket s3://$bkt in $REGION"
   if [ "$REGION" = us-east-1 ]; then
@@ -579,7 +580,7 @@ standup_bucket(){
 grant_bucket_access(){
   local bkt="${1:?bucket}"
   command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1 || {
-    bold "  (skip bucket-policy grant — no AWS creds here; ensure the bucket owner grants the gateway role + catalog user s3:Get/Put/List)"; return 0; }
+    bold "  (skip bucket-policy grant — no cloud credentials here; ensure the bucket owner grants the gateway role + catalog user s3:Get/Put/List)"; return 0; }
   local acct; acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
   # gateway instance role ARN (same account) — discover from the running gateway
   local role_arn=""
@@ -772,7 +773,7 @@ ensure_deps(){
     command -v aws >/dev/null || sudo "$PKG" install -y -q awscli 2>&1 | tail -1 || true
   else
     command -v docker >/dev/null || echo "  ! docker not found (needed to stand up the catalog) — install it or pass an existing Iceberg URL"
-    command -v aws    >/dev/null || echo "  ! aws CLI not found (needed to create/grant the S3 bucket) — install it or pass an existing warehouse"
+    command -v aws    >/dev/null || echo "  ! aws CLI not found (the S3 client this kit uses for any S3-compatible endpoint) — install it or pass an existing warehouse"
   fi
   # python venv with the Iceberg libs (register_tpcds_tables.py / seed_tpcds.py)
   BLIMP_PY="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"
@@ -797,7 +798,7 @@ cmd_setup(){
   echo
   # "Region" only means something for a bucket on AWS; MinIO / Ceph / R2 / the
   # node's own fleet layer accept any value and the node itself runs us-east-1.
-  REGION=$(ask REGION "S3 region (AWS buckets only; any value for MinIO/other S3)" "us-east-1")
+  REGION=$(ask REGION "S3 region (cloud buckets only; any value for MinIO/other S3)" "us-east-1")
   # REGION is overloaded: it is the Blimp CLUSTER's AWS region here, but
   # standup_data.sh REASSIGNS it to the ORIGIN's S3 region (us-east-1 for the
   # MinIO source it stands up on this box). Every EC2/SSM lookup for the gateway
@@ -823,7 +824,8 @@ cmd_setup(){
   # the gateway already runs, and the fleet cache layer as the source — with the
   # bring-your-own paths kept as explicit choices.
   choose_catalog
-  echo; bold "Dataset (source) location"
+  # No header here: choose_source_location's own pick() already prints
+  # "Dataset (source) location", so this printed it twice.
   choose_source_location
   echo
   choose_dataset
@@ -1001,7 +1003,7 @@ cmd_setup(){
       HB_EP="$HOOK_EP" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
       python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
     HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
-      -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" -H "Content-Type: application/json" \
       -d "$HOOK_BODY" || true)
     case "$HOOK_RESP" in
       *'"status": "ok"'*|*'"status":"ok"'*)
@@ -1023,7 +1025,7 @@ $cred_lines
 
   Then push data changes and refresh MVs incrementally with:
     curl -X POST http://$GW:9000/admin/source/snapshot_changed \\
-      -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \\
+      -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" -H "Content-Type: application/json" \\
       -d '{"namespace":"$NAMESPACE","table":"<table>","trigger":"customer"}'
 
   Make sure the cluster gateway can reach this node on :8181 (security group / firewall).
@@ -1048,7 +1050,7 @@ OUT
   # than this endpoint (404/unreachable) just leaves them unset, same as
   # before, with warp/mlperf/cache-mp-s3 skipped.
   if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
-    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" 2>/dev/null)
+    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" 2>/dev/null)
     fetched_ak=$(printf '%s' "$resp" | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin)
@@ -1146,14 +1148,13 @@ need_env(){
   # shellcheck disable=SC1090
   . "$ENVF"
   GW="${GW:-${GATEWAY:-}}"; export GW GATEWAY="$GW"
-  # On-prem/blimp-net clusters authenticate with blimp-<id> (the gateway's
-  # ZS3_ADMIN_TOKEN). Default CLUSTER_TOKEN to that when the wiring didn't set it,
-  # so bench-run registration (/bench/import) and admin calls use the token the
-  # gateway/cdc expect — a zus-<id> fallback was silently dropping run-blimp runs
-  # from the UI bench list.
-  : "${CLUSTER_TOKEN:=blimp-${CLUSTER_ID:-}}"; export CLUSTER_TOKEN
+  # The gateway validates the account's FLEET token only (2026-09-14). The
+  # wiring carries it (heal_wiring reads the node's copy when the CLI runs on
+  # the box); nothing is derived from the cluster id any more.
+  export CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
   # Self-heal stale creds/token left behind by a cluster redeploy (see heal_wiring).
   heal_wiring
+  [ -n "${CLUSTER_TOKEN:-}" ] || die "CLUSTER_TOKEN is empty: the gateway accepts only the account fleet token. On the gateway box it is read from /opt/0chain/zs3server/environment/admin_token; elsewhere set CLUSTER_TOKEN=<fleet token from the panel (Settings -> API token)> in $ENVF"
 }
 
 # ensure_storage_tools — the --storage suite's benchmark tools, installed
@@ -1380,7 +1381,7 @@ storage_import(){
   [ -n "${CLUSTER_ID:-}" ] || { [ -z "$quiet" ] && echo "  (skipping UI registration — no CLUSTER_ID in wiring)"; return 0; }
   [ -n "${GW:-}" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
+  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
   local payload
   payload=$(CLOG="$log" python3 - "$id" "$(hostname 2>/dev/null || echo client)" "$status" <<'PY' 2>/dev/null
 import json,os,re,sys
@@ -1468,7 +1469,7 @@ print(json.dumps(b))')
   bold "ingesting the source into the cluster warehouse (zus-cdc /prod/ingest)"
   local out
   out=$(curl -s -m "${INGEST_TIMEOUT:-1800}" -X POST "$base" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}" \
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" \
     -H "Content-Type: application/json" -d "$body" 2>/dev/null)
   case "$out" in
     *'"ingested"'*) printf '%s' "$out" | "${BLIMP_PY:-python3}" -c 'import json,sys
@@ -1642,11 +1643,11 @@ cmd_acid(){
   # this only affects the live process for the duration of the run.
   acid_pin(){ # <true|false>
     curl -s -m 15 -o /dev/null -X POST "http://$GW:$S3_PORT/admin/acid" \
-      -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-${CLUSTER_ID:-}}" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" -H "Content-Type: application/json" \
       -d "{\"enabled\":$1}" 2>/dev/null || true
   }
   ACID_WAS=$(curl -s -m 15 "http://$GW:$S3_PORT/admin/acid" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-${CLUSTER_ID:-}}" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
   [ -n "$ACID_WAS" ] || ACID_WAS=false
   bold "== arming ACID for the test (was: $ACID_WAS) =="
   acid_pin true
@@ -1741,7 +1742,7 @@ cmd_encryption(){
   need_env   # source the wiring (GW / CLUSTER_ID / CLUSTER_TOKEN); without this
              # $CLUSTER_ID is unbound under `set -u` and every call aborts.
   local a="${1:-status}" S3_PORT="${S3_PORT:-9000}" en
-  local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
+  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
   case "$a" in
     on|true|1)   en=true ;;
     off|false|0) en=false ;;
@@ -1764,7 +1765,7 @@ cmd_immutable(){
   need_env   # source the wiring (GW / CLUSTER_ID / CLUSTER_TOKEN); without this
              # $CLUSTER_ID is unbound under `set -u` and every call aborts.
   local a="${1:-}" S3_PORT="${S3_PORT:-9000}" im
-  local tok="${CLUSTER_TOKEN:-zus-$CLUSTER_ID}"
+  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
   case "$a" in
     on|true|1)   im=true ;;
     off|false|0) im=false ;;
@@ -1783,7 +1784,7 @@ cmd_immutable(){
 cmd_gc(){
   need_env
   : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
-  local S3_PORT="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}"
+  local S3_PORT="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
   local url="http://$GW:$S3_PORT/admin/fleet/orphan-sweep"
   if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$GW:$S3_PORT/minio/health/live" 2>/dev/null)" != 200 ]; then
     die "gateway $GW:$S3_PORT unreachable — check GW= in $ENVF and the security group"
@@ -1811,7 +1812,7 @@ cmd_gc(){
 cmd_update(){
   need_env
   : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
-  local tok="${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}" base="http://$GW:${CDC_PORT:-9401}"
+  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" base="http://$GW:${CDC_PORT:-9401}"
   local what="" dry=0 tags="" a
   while [ $# -gt 0 ]; do
     a="$1"; shift
@@ -1868,7 +1869,7 @@ print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get
 case "$CMD" in
   --setup)            cmd_setup ;;
   --update|update)    cmd_update "$@" ;;
-  --update-log)       need_env; curl -s -m 20 "http://$GW:${CDC_PORT:-9401}/update/log?id=${1:?id}&token=${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}" ;;
+  --update-log)       need_env; curl -s -m 20 "http://$GW:${CDC_PORT:-9401}/update/log?id=${1:?id}&token=${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" ;;
   --storage|storage)  cmd_storage ;;
   --acid|acid)        cmd_acid ;;
   --encryption|encryption) cmd_encryption "${1:-}" ;;

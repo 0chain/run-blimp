@@ -320,7 +320,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--library", default=os.path.join(HERE, "tpcds.json"))
     ap.add_argument("--gateway", default="", help="e.g. http://localhost:9000")
-    ap.add_argument("--token", default=os.environ.get("ZS3_ADMIN_TOKEN", ""))
+    ap.add_argument("--token", default=os.environ.get("CLUSTER_TOKEN", ""))
     ap.add_argument("--labels", default="", help="comma-separated subset, e.g. q9,q44")
     ap.add_argument("--check", action="store_true", help="audit only; contact no cluster")
     ap.add_argument("--source", default="customer")
@@ -354,7 +354,7 @@ def main():
         return
 
     if not a.token:
-        sys.exit("--token or ZS3_ADMIN_TOKEN required to load")
+        sys.exit("--token or CLUSTER_TOKEN (the account fleet token) required to load")
 
     loaded = failed = 0
     for r in recipes:
