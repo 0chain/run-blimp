@@ -265,5 +265,21 @@ refs=$("${BLIMP_PY:-python3}" "$HERE/query_tables.py" --sql-file "$QT_TMP/a.sql"
 if [ "$refs" = "store_returns date_dim store customer t1 t2 t3" ]; then ok "refs: $refs"; else bad "refs wrong: '$refs'"; fi
 rm -rf "$QT_TMP"
 
+# ================================================ public gw default =========
+# The external-mode gateway default must be the CURRENT public pattern. The
+# legacy zus-<id>-0.zus.network was hardcoded here and no longer resolves at
+# all, so a client that could not discover the gateway was handed a dead name.
+case_ "public gateway default"
+g=$(pub_gw_default 1789320141035)
+case "$g" in
+  blimp-1789320141035-0.blimp.software) ok "prefers blimp-<id>-0.blimp.software ($g)" ;;
+  *) bad "public default is not the current pattern: $g" ;;
+esac
+g2=$(pub_gw_default 9999999999999)   # resolves nowhere → still the current pattern
+case "$g2" in
+  blimp-*) ok "unresolvable id keeps the current pattern ($g2)" ;;
+  *) bad "unresolvable id fell back to a dead legacy name: $g2" ;;
+esac
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]
