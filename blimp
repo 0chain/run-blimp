@@ -519,6 +519,7 @@ standup_iceberg(){
     -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION="$REGION" \
     -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT="$ep" \
     -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS=true \
+    -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REQUEST_SIGNING_ENABLED=false \
     -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key \
     -e nessie.catalog.secrets.access-key.name="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" \
     -e nessie.catalog.secrets.access-key.secret="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \

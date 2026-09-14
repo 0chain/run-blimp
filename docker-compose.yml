@@ -1,64 +1,89 @@
 # Blimp prod-source kit — one `docker compose up` on ANY Docker host gives you
 # both halves the client node needs, with zero host prep:
 #
-#   • iceberg-rest : your Iceberg REST catalog (:8181) over an S3 warehouse —
-#                    the endpoint you point the Blimp cluster at (Production tab).
-#   • blimp        : the CLI image (python+pyiceberg, aws, duckdb, the kit) —
-#                    connects the cluster to your data and validates it.
+#   • nessie : an Iceberg REST catalog (:8181) over an S3 warehouse — the
+#              endpoint you point the Blimp node at (Production tab).
+#   • blimp  : the CLI image (python+pyiceberg, aws, duckdb, the kit) —
+#              connects the node to your data and validates it.
 #
-# Zero-touch usage on an EC2 node in the cluster's VPC (IAM instance role, no keys):
+# This is OPTIONAL and it is choice A2. `blimp --setup` defaults to the Blimp
+# node's OWN Nessie (A1) — nothing to run here at all — and can stand this same
+# container up for you on demand. Bring it up yourself only when you want the
+# catalog to outlive a --setup run, or to manage it with the rest of your stack.
 #
-#   export CLUSTER_ID=1784970467881 WAREHOUSE=s3://my-bucket/wh AWS_REGION=ap-south-1
-#   docker compose up -d iceberg-rest         # catalog comes up on :8181
-#   docker compose run --rm blimp --setup     # connect + save wiring (once)
-#   docker compose run --rm blimp --query     # author → CDC delta-merge
-#   docker compose run --rm blimp --storage   # storage & cache suite
+# It is NESSIE, the same catalog the Blimp node runs. It used to be
+# tabulario/iceberg-rest, which speaks a different dialect (routes at the root
+# instead of under a branch prefix, and `warehouse` as an s3:// PATH instead of
+# a server-configured NAME) — so a kit standing up one catalog while the node
+# ran another meant every consumer had to branch on which it was talking to.
 #
-# Cross-cloud / cross-account? set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY too.
+#   export CLUSTER_ID=1789395562780 ORIGIN_BUCKET=my-bucket
+#   export S3_ENDPOINT=http://minio:9000 S3_KEY=… S3_SECRET=…   # any S3-compatible store
+#   docker compose up -d nessie              # catalog comes up on :8181
+#   docker compose run --rm blimp --setup    # connect + save wiring (once)
+#   docker compose run --rm blimp --query    # author → CDC delta-merge
+#   docker compose run --rm blimp --storage  # storage suite
+#
+# On a bucket your host reaches with its own cloud identity, leave S3_KEY/
+# S3_SECRET unset.
 services:
-  iceberg-rest:
-    image: tabulario/iceberg-rest:latest
-    container_name: iceberg-rest
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: blimp-nessie
     ports:
-      - "8181:8181"                     # <-- point Blimp's "Iceberg REST URL" here
+      - "8181:19120"                    # <-- point Blimp's "Iceberg REST URL" here
+                                        #     (…:8181/iceberg, branch prefix "main")
     environment:
-      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
-      # WAL + busy_timeout: without these, concurrent CDC appends collide with the
-      # gateway drift-poller's catalog reads on SQLite's single global lock and
-      # fail with CommitStateUnknownException (SQLITE_BUSY). WAL lets readers run
-      # while a writer commits; busy_timeout makes a blocked writer wait, not fail.
-      CATALOG_URI: jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL&transaction_mode=IMMEDIATE
-      CATALOG_CLIENTS: "1"
-      CATALOG_JDBC_USER: user
-      CATALOG_JDBC_PASSWORD: password
-      CATALOG_WAREHOUSE: ${WAREHOUSE}                 # e.g. s3://my-bucket/iceberg_wh
-      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      AWS_REGION: ${AWS_REGION:-ap-south-1}
-      # Blank in vpc/same-account mode → the catalog uses the node's IAM role.
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      # For MinIO / S3-compatible stores, also set:
-      #   CATALOG_S3_ENDPOINT: http://minio:9000
-      #   CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # Durable version store on a volume, so the catalog survives a restart.
+      NESSIE_VERSION_STORE_TYPE: ROCKSDB
+      NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /data/nessie
+      # A Nessie warehouse is a NAME the server already knows, not a path: clients
+      # ask for `?warehouse=src` and Nessie resolves it to the location below.
+      # Asking for `?warehouse=s3://…` is answered with 500 "not known".
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: ${ICEBERG_WAREHOUSE:-src}
+      NESSIE_CATALOG_WAREHOUSES_SRC_LOCATION: s3://${ORIGIN_BUCKET:?set ORIGIN_BUCKET}/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: ${REGION:-us-east-1}
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: ${S3_ENDPOINT:-}
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      # NO remote request signing. With it on, LoadTable vends s3.signer.* to every
+      # client and DuckDB (the Blimp node's query engine) follows that instead of
+      # its own S3 secret — every manifest read then comes back 403 and the delta
+      # merge falls back to a slow path. Each client carries its own keys.
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REQUEST_SIGNING_ENABLED: "false"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      nessie.catalog.secrets.access-key.name: ${S3_KEY:-}
+      nessie.catalog.secrets.access-key.secret: ${S3_SECRET:-}
+      QUARKUS_HTTP_PORT: "19120"
+      QUARKUS_MANAGEMENT_ENABLED: "false"
     volumes:
-      - ./catalog:/catalog             # sqlite db — MUST be writable (dir + file)
+      - ./catalog:/data/nessie          # version store — MUST be writable
     restart: unless-stopped
 
   blimp:
     build: .
     image: 0chaindev/blimp-kit:latest
-    # host networking so the CLI reaches the cluster gateway's PRIVATE IP and the
-    # EC2 instance metadata service (169.254.169.254) for the IAM-role creds —
-    # that's what makes vpc mode truly key-free.
+    # Host networking so the CLI reaches the Blimp node's PRIVATE address and,
+    # on a cloud instance, the metadata service that supplies role credentials —
+    # that is what makes the key-free path work.
     network_mode: host
     environment:
       CLUSTER_ID: ${CLUSTER_ID:-}
-      REGION: ${AWS_REGION:-ap-south-1}
+      REGION: ${REGION:-us-east-1}
       WAREHOUSE: ${WAREHOUSE:-}
       ORIGIN_BUCKET: ${ORIGIN_BUCKET:-}
       NAMESPACE: ${NAMESPACE:-tpcds}
-      # The catalog above is reachable on the host at :8181.
-      ICEBERG_URL: ${ICEBERG_URL:-http://localhost:8181}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_KEY: ${S3_KEY:-}
+      S3_SECRET: ${S3_SECRET:-}
+      # Set these two to drive --setup unattended with THIS compose catalog
+      # (A = 3, an existing REST URL). Leave them unset to be asked, or to take
+      # the default A = 1, the Blimp node's own Nessie — in which case the
+      # `nessie` service above is not needed at all.
+      #   CATALOG_CHOICE: "3"
+      #   ICEBERG_URL: http://localhost:8181/iceberg
+      CATALOG_CHOICE: ${CATALOG_CHOICE:-}
+      ICEBERG_URL: ${ICEBERG_URL:-}
+      ICEBERG_PREFIX: ${ICEBERG_PREFIX:-main}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     volumes:

@@ -1,8 +1,17 @@
 # WALKTHROUGH — exact commands + real output, start to finish
 
-A complete, reproducible transcript of connecting a **fresh Ubuntu 24.04 EC2
-node** to Blimp cluster `1784970467881` and validating it. Every command below
-was actually run this session; every output block is the real output.
+A complete, reproducible transcript of connecting a **fresh Ubuntu 24.04 cloud
+VM** to Blimp cluster `1784970467881` and validating it. Every command below
+was actually run that session; every output block is the real output.
+
+> **Historical transcript (captured before the A/B/C setup options).** It is
+> kept because every line is real output from a live run, but the current
+> `--setup` differs: it asks the three catalog / source / dataset questions
+> shown in Step 2, the local catalog it stands up is **Nessie** (not
+> `tabulario/iceberg-rest`), the default source is the node's own fleet cache
+> layer, and the admin bearer is the node's live token rather than
+> `zus-<cluster-id>`. Follow Step 2 for what a run looks like today.
+
 
 Facts used throughout (yours will differ):
 

@@ -39,9 +39,18 @@ RUN pip install --no-cache-dir "pyiceberg[s3fs]" pyarrow boto3 duckdb
 
 # --- the kit
 WORKDIR /kit
+# EVERY file a command reaches for at runtime, or the image is subtly broken:
+# query_tables.py (--sql derives tables/fact), mv_delta_rows.py (the delta
+# verdict that gates merge_ms), query_pools.py (query-aware CDC tick),
+# suites/ (the DEFAULT --query batch is the named suite "first-10"), and
+# tfrecord2idx (dlio shells out to it during mlperf datagen).
+# run_router.sh was listed here and does not exist in the repo — a COPY of a
+# missing path fails the build, so `docker build .` had been broken outright.
 COPY blimp register_tpcds_tables.py seed_tpcds.py standup_data.sh \
+     query_tables.py mv_delta_rows.py query_pools.py tfrecord2idx \
      test_query.sh bench_cdc.sh bench_incremental.sh test_cache.sh \
-     run_cluster.sh run_router.sh /kit/
+     run_cluster.sh /kit/
+COPY suites/ /kit/suites/
 # acid checker: source (for reference) + the prebuilt binary from the builder
 # stage, so `blimp --acid` runs without a Go toolchain in this image.
 COPY acid/ /kit/acid/

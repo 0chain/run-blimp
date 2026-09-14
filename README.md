@@ -75,9 +75,9 @@ blimp --update        update software on the node: status | all | zs3,eblobber,n
 Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 **Running a command with no wiring offers to run `--setup` for you first.**
 
-Rough timing: `--setup` takes about 10-15 minutes end to end, `--query` about
-5 minutes, `--storage` about 30 minutes (it drives the fullest benchmark
-suite — warp, mlperf, cache), and `--acid` about 5 minutes.
+Rough timing: `--setup` about 10-15 minutes end to end (longer at SF100+),
+`--query` about 5 minutes per query, `--storage` about 30 minutes for all three
+legs, `--acid` about 5 minutes.
 
 **Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
 export these (or source a file with `set -a`) and `--setup` runs unattended:
@@ -283,22 +283,32 @@ pipeline.
 
 ### Step 3 — register your tables (optional)
 
+`--setup` already registers the test dataset it generates. Do this only for
+**your own** parquet that is not in the catalog yet — it is `add_files`
+registration, so no data is copied:
+
 ```
-venv/bin/python3 register_tpcds_tables.py \
-  --catalog http://localhost:8181 --warehouse s3://my-bucket/wh \
-  --source-bucket my-bucket --region ap-south-1 --namespace myns
+~/.blimp_venv/bin/python3 register_tpcds_tables.py \
+  --catalog http://localhost:8181/iceberg --prefix main --warehouse src \
+  --source-bucket my-bucket --namespace myns \
+  --s3-endpoint http://minio.internal:9000 --s3-key … --s3-secret …
 ```
 
-(`add_files` registration — no data copy.)
+Against **Nessie** (both catalog options the kit stands up, and the Blimp
+node's own) `--warehouse` is the server-configured **name** (`src`, or `mv` on
+the node) and `--prefix` is the branch, normally `main`. Against a plain REST
+catalog drop `--prefix` and pass the warehouse as an `s3://…` path. Omit
+`--s3-*` when the host reaches the bucket with its own identity.
 
 ### Step 4 — point the Blimp node at the source (optional)
 
-**Automatic (no SSH):** `--setup` wires the cluster itself over the
-authenticated admin API — `POST http://<gw>:9000/admin/source/configure`
-(`Authorization: Bearer zus-<CLUSTER_ID>`). The gateway applies the source in
+**Automatic (no SSH):** `--setup` wires the node itself over the authenticated
+admin API — `POST http://<gw>:9000/admin/source/configure`, with the node's
+live admin token as the bearer (read from the node when the kit runs on it,
+else `CLUSTER_TOKEN` from `~/.blimp_env`). The gateway applies the source in
 its live env (effective on the next query, **no restart**) and persists it
-across reboots. Requires a gateway image ≥ 2026-07-27; on older images the
-call fails gracefully and `--setup` prints the manual steps.
+across reboots. On an older gateway image the call fails gracefully and
+`--setup` prints the manual steps.
 
 Manual fallback (older gateway image, or the admin-API call failed): paste
 `--setup`'s printed values into the Blimp node UI (Production tab).
@@ -307,9 +317,11 @@ An S3 endpoint you own (B = 2) **requires** `S3_KEY`/`S3_SECRET`; `--setup`
 sends them in the `/admin/source/configure` body. For the fleet cache layer,
 or a bucket the node reaches with its own identity, leave them unset.
 
-> Firewall: the gateway must reach this node on the catalog port. If the
-> Blimp node security group doesn't open 8181, serve the catalog on an open port
-> (e.g. `docker run -p 8081:8181 …`) and use that URL.
+> Firewall: this only applies when the catalog runs **here** (A = 2 or 3) — the
+> gateway must reach it on the catalog port. If 8181 is closed between the two,
+> publish it on an open port (`ICEBERG_PORT=8081 blimp --setup`) and use that
+> URL. With the default A = 1 the catalog is the node's own, so there is
+> nothing to open.
 
 ## Fleet — one S3 URL for all your nodes
 
@@ -339,9 +351,17 @@ over a per-node `blimp-<node>-0.blimp.software:9443` for anything user-facing.
 
 > One connection lands on one node, so a **single** client is bounded by that
 > node's link — run several clients (or several mounts) to aggregate across the
-> fleet. The `run-blimp` test harness does exactly this: it drives `warp`/`mlperf`
-> legs from multiple client boxes at the fleet URL so the round-robin spreads
-> them across nodes.
+> fleet. `blimp --storage` deliberately does **not** do this: it drives the one
+> node in `~/.blimp_env` (`GW`) so the numbers describe that node's storage. To
+> measure the fleet, run the suite from several clients at the fleet URL.
+
+> **Dedup and benchmarks.** Because identical content is stored once fleet-wide,
+> the *second* node to write the same bytes keeps only the name — reads there are
+> served from the node that holds them. That is correct for storage and wrong for
+> a storage benchmark, which would then be measuring the link between nodes. The
+> mlperf leg prints a `cross-node` count for exactly this reason, and the bench
+> upload asks the gateway to keep a local copy (`x-amz-meta-zus-dedup: off`) so
+> the measurement stays on the node under test.
 
 ## Testing the Blimp node
 
@@ -447,10 +467,12 @@ so a client-run result sits next to the ones started from the UI.
 
 ### C — `./blimp --bench` (timing profile)
 
-Bench = min/median/avg/max author / materialize / delta-merge profile
-(`ITERS AUTHOR_ITERS CDC_ROWS`, all defaulting to 3/3/50000; `BENCH_QNR=64`
-benches a different TPC-DS query from `$Q_DIR/q<N>.sql` instead of the built-in
-q1; `BENCH_FACT=catalog_sales` appends referentially for join-CTE queries).
+Bench = min/median/avg/max author / materialize / delta-merge profile, one run
+per query of the selected batch (`ITERS AUTHOR_ITERS CDC_ROWS` default 3/3/50000;
+the batch defaults to the same `--first-10` as `--query` and takes the same
+`--queries` / batch flags; `BENCH_QNR=64` benches exactly one query from
+`$Q_DIR/q<N>.sql`; `BENCH_FACT=catalog_sales` appends referentially for
+join-CTE queries).
 
 Check the `n=` on each summary line before quoting it — an append that
 re-materializes instead of merging contributes no `delta_merge_ms`, so `n` can
@@ -483,12 +505,13 @@ never returns a stale copy or a torn mix of the old and new bytes.
 > configuration, and any torn read it reports says nothing about the ACID path:
 >
 > ```bash
+> set -a; . ~/.blimp_env; set +a          # GW + CLUSTER_TOKEN (the node's live admin token)
 > curl -X POST http://$GW:9000/admin/acid \
->   -H "Authorization: Bearer zus-$CLUSTER_ID" \
+>   -H "Authorization: Bearer $CLUSTER_TOKEN" \
 >   -H 'Content-Type: application/json' -d '{"enabled":true}'
 > # ... run the test ...
 > curl -X POST http://$GW:9000/admin/acid \
->   -H "Authorization: Bearer zus-$CLUSTER_ID" \
+>   -H "Authorization: Bearer $CLUSTER_TOKEN" \
 >   -H 'Content-Type: application/json' -d '{"enabled":false}'
 > ```
 >
@@ -536,10 +559,11 @@ cp` md5 checks that pass byte-for-byte with the strict ACID verify on and off.)
 
 ## Reference
 
-- **[WALKTHROUGH.md](WALKTHROUGH.md)** — the same flow as a full transcript: every
-  command and its real output, start to finish, on a fresh node.
-- **[TESTING.md](TESTING.md)** — testing the kit itself (`./test_kit.sh`), not
-  the Blimp node.
+- **[WALKTHROUGH.md](WALKTHROUGH.md)** — a full transcript, every command and its
+  real output, on a fresh node. Captured before the A/B/C setup options: the
+  shape is right, the catalog and the default source have changed (see Step 2).
+- **[TESTING.md](TESTING.md)** — testing the kit itself: `./test_kit.sh`,
+  `./test_setup_options.sh`, `python3 test_seed_tpcds.py`. All offline.
 - Product docs: [docs.zus.network/zus-docs/webapps/blimp](https://docs.zus.network/zus-docs/webapps/blimp)
   — the optimizer, incremental MVs (CDC), and the Prod-Query & MV API.
 
@@ -550,6 +574,15 @@ cp` md5 checks that pass byte-for-byte with the strict ACID verify on and off.)
 A fresh Ubuntu 24.04 cloud VM on the cluster's private network, cluster
 `1784970467881`. Every line below is the actual command and its actual
 output from a live run.
+
+> **Historical transcript (captured before the A/B/C setup options).** It is
+> kept because every line is real output from a live run, but the current
+> `--setup` differs: it asks the three catalog / source / dataset questions
+> shown in Step 2, the local catalog it stands up is **Nessie** (not
+> `tabulario/iceberg-rest`), the default source is the node's own fleet cache
+> layer, and the admin bearer is the node's live token rather than
+> `zus-<cluster-id>`. Follow Step 2 for what a run looks like today.
+
 
 **1. Confirm the node's identity (no keys anywhere).**
 ```
