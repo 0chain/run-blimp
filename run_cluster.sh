@@ -415,7 +415,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # its banner, so the suite looked like it had simply produced no numbers. Show
   # the metrics on success; show the tail of the real failure otherwise.
   local tout trc xn0 xn
-  xn0=$(date -u +%Y-%m-%dT%H:%M:%S)   # cross-node read count window (see below)
+  xn0=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # cross-node window; the Z is required (docker parses a naked ts as host-local time)
   tout=$(MEMRUN "$MLPERF_MEM_CAP" $L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \
     ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
     ++workload.workflow.train=True ++workload.workflow.evaluation=False ++workload.workflow.generate_data=False \
