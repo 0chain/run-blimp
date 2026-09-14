@@ -64,8 +64,8 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 ```
 blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
-blimp --query         query optimizer + incremental CDC delta-merge
-blimp --storage       storage & read-through cache suite
+blimp --query         prove authoring + CDC delta-merge (your SQL with --sql)
+blimp --storage       storage suite: TTFB, warp PUT/GET, MLPerf resnet50
 blimp --acid          ACID / linearizability check of both data paths
 blimp --bench         author / materialize / delta-merge timing profile
 blimp --update        update software on the node: status | all | zs3,eblobber,nessie,gotenberg,rclone
@@ -352,42 +352,98 @@ not part of production operation (production is your pipeline + the
 
 ### A — `./blimp --query` (prove authoring + CDC)
 
-Defaults to **q9 q88 q14 q64 q4** on `store_sales`: ① serve/author each →
-② append rows to all five facts + fire the webhook → ③ re-run and report how
-each MV refreshed. CDC is **lazy**: the webhook only marks the MV stale — the
-*next query* pays the merge and reports `merge_ms` inline (read from the
-phase-3 query response, with `/admin/mv/wave/report` as fallback):
+**What it does.** Four phases against the source `--setup` wired, per query:
+
+| phase | what happens | what you get |
+|---|---|---|
+| 0 (with `--evict`) | drop each query's MV, keep its recipe | a genuinely cold start |
+| 1 | run the query → the node authors an MV from your source | `author_ms`, `materialize_ms`, `verify_ms`, `cold_serve` |
+| 2 | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
+| 3 | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
+| 4 (with `--verify`) | re-check the merged MV against the source | `verify_status` |
 
 ```
-q64  store_sales  merge_ms=8856  mode=incremental
-q4   store_sales  author_ms=45048  no MV — served from base
+blimp --query                                  # the default batch, 10 queries
+blimp --query --queries "3 7 19"               # pick TPC-DS queries
+blimp --query --sql ./my_query.sql             # YOUR SQL (any dataset)
+blimp --query --sql ./queries/                 # a directory of .sql files
+blimp --query --sql q.sql --tick-cmd './my_streamer.sh'   # YOUR appender in phase 2
+blimp --query --evict --verify                 # cold start + correctness check
+blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
 ```
 
-There is **no PASS/FAIL verdict**. The suite reports what each query did and
-you judge it: `mode=incremental` is the delta-merge fast path, `no-delta` is a
-full re-author, and "no MV" means the query fell back to scanning base. Nothing
-here asserts a threshold, because the interesting outcomes (a query that authors
-no MV, a merge that silently measured unchanged data) are not binary.
+With `--sql` nothing about the dataset is assumed: the tables a query reads are
+parsed out of its `FROM`/`JOIN` clauses, checked against the catalog listing,
+and the **fact** is the referenced table with the most rows (the node's own
+rule) — so `snapshot_changed` fires for exactly the tables your query touches.
+With `--tick-cmd` your own streamer does the phase-2 append (it runs with
+`NAMESPACE`, `ICEBERG_URL`, `WAREHOUSE`, `S3_ENDPOINT` and the S3 keys in its
+environment); without it the built-in TPC-DS seeder appends, which only works
+on the test dataset.
 
-Add `--verify` to check the merged rows are *correct* rather than merely fast —
-off by default because the gateway runs no verification while serving, so an
-unflagged run measures the production path.
+**Reading the result.** One row per query, e.g.:
 
-Wider: `SUITES="store_sales:3 19 43 52 55;store_returns:1" ./blimp --query`
+```
+query  fact           mv_rows x cols  author_ms  merge_ms      mode  incr_ms  delta_rows  delta_verdict
+q1     store_returns      177924x5         4270     19216  incremental     329          50  merged
+```
 
-Join-CTE queries (q64-class, `SUITES="catalog_sales:64"`) only see a delta
-when the append touches **both** sides of the join — the seeder therefore
-appends `catalog_sales` **referentially** (matching `catalog_returns` rows,
-keys copied). A sales-only append correctly reports `no-delta`, not a bug.
+`merge_ms` only counts when `delta_verdict` is `merged` — `UNCHANGED` or
+`EMPTY` mean the append produced no delta for that MV and the number measured
+nothing. `mode=incremental` is the delta-merge fast path; `no-delta` is a full
+re-author; "no MV — served from base" means the query authored nothing and
+scanned the source. There is **no PASS/FAIL verdict**: those outcomes are
+judgements, not thresholds. Every phase also appears as a run on the node
+panel's **Query** tab.
+
+`--verify` is off by default because the node runs no verification while
+serving, so an unflagged run measures the production path.
+
+Multi-fact batches still work: `SUITES="store_sales:3 19 43;store_returns:1"`.
+Join-CTE queries (q64-class) only see a delta when the append touches **both**
+sides of the join — the seeder therefore appends referentially — so a
+sales-only append correctly reports `no-delta`, not a bug.
 
 ### B — `./blimp --storage` (storage & cache suite)
 
-Storage = warp S3 PUT/GET + TTFB, mlperf. The suite is
-**self-contained**: it installs its own tools first (warp pinned v1.1.4,
-mount-s3, dlio) — `BLIMP_SKIP_DEPS=1` opts out on hardened hosts, and a
-section whose tool still can't install is skipped loudly. Cap sizes on small
-nodes:
-`WARP_BUDGET_MIB=5120 MLPERF_NUM_FILES=35 ./blimp --storage`.
+**What it does.** Drives the node's S3 endpoint from this client and reports
+what the storage path actually delivers. Three legs:
+
+| leg | workload | what you get |
+|---|---|---|
+| `ttfb` | 1 KiB objects, PUT then single-stream GET | first-byte latency (median / 99th) |
+| `warp` | 96 MiB objects, PUT then GET, sized to exceed the node's RAM | sustained PUT and GET MiB/s, error count |
+| `mlperf` | MLPerf Storage resnet50 (dlio) reading through mountpoint-s3 | accelerator utilisation (AU %), samples/s, MB/s |
+
+```
+blimp --storage                          # all three legs (~30 min)
+STORAGE_LEGS=mlperf blimp --storage      # one leg
+STORAGE_LEGS=warp,ttfb blimp --storage   # several
+WARP_BUDGET_MIB=5120 MLPERF_NUM_FILES=35 blimp --storage    # cap sizes on a small node
+MLPERF_ACCELS=2 blimp --storage          # more accelerators (more read concurrency)
+BENCH_KEEP=1 blimp --storage             # keep the scratch buckets for a re-run
+```
+
+Self-contained: it installs its own tools (warp pinned v1.1.4, mount-s3, dlio
++ an MPI runtime) before running, `BLIMP_SKIP_DEPS=1` opts out, and a leg whose
+tool still cannot install is skipped loudly rather than reported as zero.
+
+**Reading the result.** The tail of the run prints one summary:
+
+```
+  warp    S3 PUT 593 MiB/s · GET 938 MiB/s
+  TTFB    median 3ms, 99th 6ms
+  mlperf  read AU 97.16% · 4062 samples/s · 557 MB/s
+  mlperf  cross-node: 0 — all reads served by this node's blobbers
+```
+
+AU is the MLPerf verdict — it is the fraction of time the accelerator had data
+to work on, so ≥90% means storage kept up. The **cross-node** line matters on a
+multi-node fleet: identical content is stored once, so a node that did not
+write the dataset reads it from the node that did, and a non-zero count means
+the number above measured the link between nodes rather than this node's own
+storage. Each leg also registers itself on the node panel's **Benchmarks** tab,
+so a client-run result sits next to the ones started from the UI.
 
 ### C — `./blimp --bench` (timing profile)
 
