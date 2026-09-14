@@ -131,25 +131,77 @@ blimp.software → Create a Blimp node. Note the **node id**.
 ### Step 2 — `./blimp --setup` on your Iceberg node
 
 Fully **interactive** — every value is prompted with a default (Enter accepts);
-any env var already set skips its prompt (that's the zero-touch/CI path):
+any env var already set skips its prompt (that's the zero-touch/CI path).
+**The whole session, taking every default except the cluster id:**
 
 ```
-S3 region (AWS buckets only; any value for MinIO/other S3) [us-east-1]:
-Blimp cluster id (from blimp.software): 1784970467881
+$ blimp --setup
+
+== blimp --setup — connect a Blimp node to this node's data ==
+  ✓ deps ready (python: ~/.blimp_venv/bin/python3)
+S3 region (cloud buckets only; any value for MinIO/other S3) [us-east-1]:
+Blimp cluster id (from blimp.software): 1789395562780
+
+network assessment → private gateway 10.10.12.249 reachable: yes (private path, nothing to type)
+Blimp gateway address [10.10.12.249]:
+Iceberg namespace [tpcds]:
+
+Iceberg catalog
+   1) use this cluster's gateway Nessie catalog (default, nothing to install)
+   2) stand up an Iceberg REST catalog on THIS box (:8181)
+   3) point at an Iceberg REST catalog I already have
+  choice [1]:
+  using the gateway Nessie catalog — http://10.10.12.249:19122/iceberg (branch main)
+  Nessie warehouse name [mv]:
+    warehouse "mv" -> s3://tpcds-mv (table metadata lands there)
+
+Dataset (source) location
+   1) the fleet cache layer — https://fleet-8429413131.blimp.software:9443 (default)
+   2) another S3 endpoint (your own bucket / MinIO / other cloud)
+  choice [1]:
+  Bucket on the fleet endpoint [blimp-src]:
+  source → https://fleet-8429413131.blimp.software:9443/blimp-src (fleet keys, fetched from the gateway)
+
+Build a TPC-DS test dataset at that location?
+   1) yes (default)
+   2) no — I will bring my own data
+  choice [1]:
+
+Scale factor
+   1) SF1    ~1 GB   (default — minutes)
+   2) SF10   ~10 GB  (tens of minutes)
+   3) SF100  ~100 GB (hours)
+   4) SF1000 ~1 TB   (many hours; needs a big box + disk)
+  choice [1]:
+  will generate TPC-DS SF1 and register it into the catalog
+  Warehouse (Nessie: a warehouse NAME; otherwise s3://bucket/prefix) [mv]:
 ```
 
-It then runs the **network assessment**: can this client reach the node's
-gateway on its private address? Yes → private path, nothing to type. No →
-the node's public endpoint (`blimp-<id>-0.blimp.software`):
+That is the last prompt. Everything after it runs unattended: generate,
+upload, register, save `~/.blimp_env`, wire the node, install the test tools.
+
+**Bringing your own catalog and bucket** replaces three of those answers:
 
 ```
-network assessment → private gateway 10.10.12.249 reachable: yes
-  gateway → 10.10.12.249 · advertise this node as → 10.10.12.168
+Iceberg catalog
+  choice [1]: 3
+  Iceberg REST URL: http://catalog.internal:8181
+  REST prefix (Nessie branch; blank for a plain REST catalog):
+
+Dataset (source) location
+  choice [1]: 2
+  Data bucket (blank = generate one here): my-lake
+  S3 endpoint URL of that bucket (MinIO/Ceph/R2/any cloud, e.g. http://minio:9000;
+    blank = your cloud's S3 in us-east-1) [https://s3.us-east-1.amazonaws.com]: http://minio.internal:9000
+
+Build a TPC-DS test dataset at that location?
+  choice [1]: 2
+  Warehouse (Nessie: a warehouse NAME; otherwise s3://bucket/prefix) [s3://my-lake/wh]:
 ```
 
 The prompts, in order (Enter takes the default; a pre-set env var skips the prompt):
 
-1. `S3 region [us-east-1]` — only meaningful for buckets on AWS; any value otherwise
+1. `S3 region [us-east-1]` — only meaningful for a cloud bucket; any value otherwise
 2. `Blimp cluster id (from blimp.software)` — required
 3. `Blimp gateway address [<derived from the cluster id>]` — then the network
    assessment picks the private or the public path to it
@@ -162,7 +214,7 @@ The prompts, in order (Enter takes the default; a pre-set env var skips the prom
    `Bucket on the fleet endpoint [blimp-src]` (fleet URL + keys are fetched from
    the gateway, nothing to type); `2) another S3 endpoint` → data bucket
    (blank = generate one here) and its S3 endpoint URL (MinIO, Ceph, R2, any
-   cloud's S3; blank = AWS S3 in your region).
+   cloud's S3; blank = your cloud's S3 in the region above).
    Picking 2 with option A1 is refused and demoted to a local catalog (see the
    note under the env block).
 7. **C. Build a TPC-DS test dataset at that location?** — `1) yes (default)` →
@@ -199,9 +251,9 @@ Guardrails `--setup` enforces (each is a real failure mode):
    NAME (`mv`), never an `s3://` path.
 4. **Dataset (B) + test set (C)** — generate TPC-DS at the chosen scale, upload
    it to the fleet cache layer (or your S3), register the tables into A.
-5. **Bucket grant** — only when the bucket is on AWS in the same account (a
-   bucket policy for the gateway role); every other endpoint is reached with
-   the keys you gave, nothing to grant.
+5. **Bucket grant** — only when the bucket is in the same cloud account as the
+   node (a bucket policy for the gateway's role); every other endpoint is
+   reached with the keys you gave, nothing to grant.
 6. **Saves the wiring** to `~/.blimp_env` (mode 600) for every later command.
 7. **Wires the Blimp node over its admin API** — no SSH, no restart:
 

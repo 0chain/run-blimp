@@ -7,7 +7,7 @@ rather than an error, which is the class a run log cannot show you:
 - the fact table `--bench` appends to is derived from the query, so a run can't
   silently measure a query whose source never changed
 - a non-blank `S3_ENDPOINT` always produces `--endpoint-url`; without it origin
-  calls quietly go to AWS and the cache leg reports "no objects"
+  calls quietly go to the public cloud endpoint and the cache leg reports "no objects"
 - the cache set is sized so the per-blobber shard share exceeds per-blobber RAM
   (below that the "hit" is served from blobber page cache and nothing
   client-side reveals it)
