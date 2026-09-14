@@ -425,7 +425,7 @@ choose_source_location(){
        bold "  source → $S3_ENDPOINT/$ORIGIN_BUCKET (fleet keys, fetched from the gateway)" ;;
     2) SOURCE_TARGET=external
        ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (blank = generate one here)")
-       [ -n "$ORIGIN_BUCKET" ] && S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint (blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
+       [ -n "$ORIGIN_BUCKET" ] && S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint URL of that bucket (MinIO/Ceph/R2/any cloud, e.g. http://minio:9000; blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
        # INCOMPATIBLE PAIR. The gateway's Nessie can only write table metadata
        # into a warehouse IT has configured — here s3://tpcds-mv, on the FLEET
        # endpoint. With the data on some other S3, metadata and data end up on
@@ -687,8 +687,8 @@ assess_mode(){
     esac
   fi
   if [ -z "$GW_PRIV" ]; then
-    bold "  ! gateway private IP not discoverable (this client's IAM may lack ec2:DescribeInstances)."
-    bold "    Assuming EXTERNAL mode. If this node IS in the cluster's VPC, re-run with"
+    bold "  ! gateway private address not discoverable (no cloud API access from here, or not a cloud node)."
+    bold "    Using the public endpoint. If this client IS on the node's private network, re-run with"
     bold "    GW=<gateway-private-ip> so the catalog is advertised on a reachable address."
   fi
   # authoritative probe: reach the gateway PRIVATE IP (covers same-VPC AND peered)
@@ -716,7 +716,9 @@ assess_mode(){
       CREDS_HINT="explicit S3 keys (external / cross-account)"
     fi
   fi
-  bold "network assessment → MODE=$MODE (gateway private ${GW_PRIV:-unknown} reachable: $([ "$MODE" = vpc ] && echo yes || echo no)$([ "$MODE" != vpc ] && [ "$SAME_ACCT" = 1 ] && echo ', same account — cross-region')"
+  # "vpc"/"external" stay as the internal mode ids (every gate keys on them); the
+  # user reads it as "can I reach the gateway on its private address or not".
+  bold "network assessment → private gateway ${GW_PRIV:-unknown} reachable: $([ "$MODE" = vpc ] && echo 'yes (private path, nothing to type)' || echo 'no (public endpoint)')$([ "$MODE" != vpc ] && [ "$SAME_ACCT" = 1 ] && echo ' — same cloud account, cross-region')"
   echo "  gateway → $GW_DEFAULT · advertise this node as → ${ADVERTISE_DEFAULT:-<set ADVERTISE_HOST>} · S3 creds → $CREDS_HINT"
 }
 
@@ -793,7 +795,9 @@ cmd_setup(){
   bold "== blimp --setup — connect a Blimp cluster to this node's data =="
   ensure_deps
   echo
-  REGION=$(ask REGION "AWS region" "ap-south-1")
+  # "Region" only means something for a bucket on AWS; MinIO / Ceph / R2 / the
+  # node's own fleet layer accept any value and the node itself runs us-east-1.
+  REGION=$(ask REGION "S3 region (AWS buckets only; any value for MinIO/other S3)" "us-east-1")
   # REGION is overloaded: it is the Blimp CLUSTER's AWS region here, but
   # standup_data.sh REASSIGNS it to the ORIGIN's S3 region (us-east-1 for the
   # MinIO source it stands up on this box). Every EC2/SSM lookup for the gateway

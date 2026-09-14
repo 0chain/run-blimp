@@ -2,7 +2,7 @@
 
 ## Blimp
 
-Blimp is an ACID cache and autonomous materialized view — an efficient per-core cache engine that keeps your CPU/GPU utilization high and AI/ML context fresh with delta change queries in 1-2s. Launch a scalable Blimp node on any server or cloud instance to optimize your existing pipeline → [blimp.software](https://blimp.software)
+Blimp is an ACID cache and autonomous materialized view — an efficient per-core cache engine that keeps your CPU/GPU utilization high and AI/ML context fresh with delta change queries in 1-2s. Launch a scalable Blimp node on any server, cloud instance, container or function runtime to optimize your existing pipeline → [blimp.software](https://blimp.software)
 
 `run-blimp` connects a **Blimp node** to **your application**, which can use
 it for cache or query engine within your environment.
@@ -17,20 +17,19 @@ it for cache or query engine within your environment.
                           (your pipeline, on each commit)
 ```
 
-If your node is already networked to the Blimp node (e.g. the same private
-network/account) — **vpc mode** — `--setup` reaches the gateway on its
-private IP using the node's own identity, no keys to type. Otherwise —
-**external mode** — it reaches the gateway over public DNS with explicit S3
-keys. `blimp --setup` detects which and wires it accordingly.
+The kit runs anywhere with a shell and network access to the Blimp node: a
+bare-metal server, a VM, a container, a CI runner or a function runtime — and
+on the Blimp node itself (the default on-prem layout, where it is installed
+by the deploy). `--setup` probes how it can reach the node's gateway: on the
+same private network it uses the private address and the node's own identity
+(nothing to type); otherwise it uses the public endpoint. Where the DATA lives
+is a separate choice (B below): the node's own fleet cache layer needs no keys
+at all; another S3-compatible endpoint (MinIO, Ceph, R2, any cloud's S3) takes
+its endpoint URL and keys.
 
-**Both paths are supported and proven by this kit for demo/test setup — pick
-whichever matches where your node already lives.** For **production**, run
-that node on the same private network as the Blimp node (same account/
-region, ideally the same zone): that path uses private IPs with no S3 keys,
-and every S3 call to the origin stays off the public internet. A different
-network, account, or cloud works too, but adds network hops and (outside the
-same account/region) real data-transfer egress cost on every read — fine for
-a demo or a one-off test, but not the recommended production topology.
+For **production**, keep the client on the same private network as the Blimp
+node so origin reads never leave it; a different network or cloud works but
+adds hops and, across providers, egress cost on every read.
 
 
 ## Install
@@ -57,7 +56,7 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 > docker run --rm --network host -e CLUSTER_ID=… -e WAREHOUSE=s3://… blimp-kit --setup
 > ```
 > `--network host` lets it use the node's own identity and reach the gateway
-> private IP (that's what makes vpc mode key-free). See `docker-compose.yml`
+> on its private address (that is what makes the key-free path work). See `docker-compose.yml`
 > to bring up the catalog + CLI together.
 
 ## Quick start — the `blimp` command, beginning to end
@@ -85,7 +84,7 @@ export these (or source a file with `set -a`) and `--setup` runs unattended:
 
 ```
 REGION CLUSTER_ID ICEBERG_URL WAREHOUSE ORIGIN_BUCKET NAMESPACE \
-S3_KEY S3_SECRET        # external mode only; blank/unset in vpc mode
+S3_KEY S3_SECRET        # only for an S3 endpoint you own (B = 2); the fleet option needs none
 GW GW_AK GW_SK          # optional — auto-derived from CLUSTER_ID when unset
 CATALOG_CHOICE=1|2|3    # A. Iceberg catalog: 1 = the node's own Nessie (default, nothing to
                         #    install; warehouse NAME via ICEBERG_WAREHOUSE, default "mv"),
@@ -135,23 +134,47 @@ Fully **interactive** — every value is prompted with a default (Enter accepts)
 any env var already set skips its prompt (that's the zero-touch/CI path):
 
 ```
-S3 region [ap-south-1]:
+S3 region (AWS buckets only; any value for MinIO/other S3) [us-east-1]:
 Blimp cluster id (from blimp.software): 1784970467881
 ```
 
-It then runs the **network assessment**: probes the gateway's *private* IP.
-Reachable → **vpc mode** (no keys typed). Not reachable (other network/
-account/cloud) → **external mode** (public DNS `zus-<id>-0.zus.network`,
-explicit S3 keys):
+It then runs the **network assessment**: can this client reach the node's
+gateway on its private address? Yes → private path, nothing to type. No →
+the node's public endpoint (`blimp-<id>-0.blimp.software`):
 
 ```
-network assessment → MODE=vpc (gateway private 10.10.12.249 reachable: yes)
-  gateway → 10.10.12.249 · advertise this node as → 10.10.12.168 · S3 creds → blank (IAM role)
+network assessment → private gateway 10.10.12.249 reachable: yes
+  gateway → 10.10.12.249 · advertise this node as → 10.10.12.168
 ```
 
-Remaining prompts: gateway (auto-filled), namespace, existing Iceberg REST URL
-(blank = stand one up here via docker), S3 endpoint, **data bucket**,
-warehouse (defaults to `s3://<data-bucket>/wh`), S3 keys (blank in vpc mode).
+The prompts, in order (Enter takes the default; a pre-set env var skips the prompt):
+
+1. `S3 region [us-east-1]` — only meaningful for buckets on AWS; any value otherwise
+2. `Blimp cluster id (from blimp.software)` — required
+3. `Blimp gateway address [<derived from the cluster id>]` — then the network
+   assessment picks the private or the public path to it
+4. `Iceberg namespace [tpcds]`
+5. **A. Iceberg catalog** — `1) use this cluster's gateway Nessie (default)`,
+   `2) stand up a Nessie on THIS box (:8181)`, `3) point at a catalog I already have`.
+   Option 1 asks `Nessie warehouse name [mv]` and probes it; option 3 asks the
+   REST URL and its prefix (blank for a plain REST catalog).
+6. **B. Dataset (source) location** — `1) the fleet cache layer (default)` →
+   `Bucket on the fleet endpoint [blimp-src]` (fleet URL + keys are fetched from
+   the gateway, nothing to type); `2) another S3 endpoint` → data bucket
+   (blank = generate one here) and its S3 endpoint URL (MinIO, Ceph, R2, any
+   cloud's S3; blank = AWS S3 in your region).
+   Picking 2 with option A1 is refused and demoted to a local catalog (see the
+   note under the env block).
+7. **C. Build a TPC-DS test dataset at that location?** — `1) yes (default)` →
+   `Scale factor 1 / 10 / 100 / 1000`; `2) no, I bring my own data`.
+8. `Warehouse` — prefilled with the Nessie warehouse NAME (A1/A2) or
+   `s3://<data-bucket>/wh` (A3)
+9. S3 access key / secret — asked only for an S3 endpoint you own that the node
+   cannot reach with its own identity; the fleet option needs none
+
+With C = yes it then generates the 24 tables (duckdb `dsdgen`), uploads them to
+the location from B, and registers them into the catalog from A. Nothing else
+is asked.
 
 Guardrails `--setup` enforces (each is a real failure mode):
 
@@ -160,34 +183,47 @@ Guardrails `--setup` enforces (each is a real failure mode):
    ("grain not sampleable"). Divergence warns and offers to fix.
 2. **Bucket access grant** (vpc/same-account): applies a bucket policy for the
    gateway's own identity + your account — no silent 403 at author time.
-3. **Blank keys are the correct vpc answer** — real keys are only ever typed
-   in external mode.
+3. **Blank keys are the normal answer** — keys are only typed for an S3
+   endpoint you own that the node cannot reach with its own identity.
 
 **What `--setup` does, in order:**
 
 1. **Deps bootstrap** — installs docker / python venv + pyiceberg / aws CLI /
    unzip if missing (`BLIMP_SKIP_DEPS=1` to manage yourself).
-2. **Network assessment** — probes the gateway's private IP → picks vpc mode
-   (no keys) or external mode (public DNS, explicit keys).
-3. **Catalog** — reuses your Iceberg REST URL, or stands one up here via
-   `docker run` (iceberg-rest on :8181 over your warehouse).
-4. **Bucket grant** (vpc/same-account) — applies the bucket policy so the
-   gateway role can read; skipped in external mode (bring your own grant).
-5. **Saves the wiring** to `~/.blimp_env` (mode 600) for every later command.
-6. **Wires the Blimp node over its admin API** — no SSH, no restart:
+2. **Network assessment** — probes the gateway's private address → private
+   path (nothing to type) or the public endpoint.
+3. **Catalog (A)** — the gateway's own Nessie (nothing to run), a Nessie stood
+   up here with the same recipe as the node's (`docker run`, :8181), or a REST
+   catalog you already have. Both Nessie options are one catalog type, so
+   there is one dialect to reason about; a Nessie warehouse is a server-side
+   NAME (`mv`), never an `s3://` path.
+4. **Dataset (B) + test set (C)** — generate TPC-DS at the chosen scale, upload
+   it to the fleet cache layer (or your S3), register the tables into A.
+5. **Bucket grant** — only when the bucket is on AWS in the same account (a
+   bucket policy for the gateway role); every other endpoint is reached with
+   the keys you gave, nothing to grant.
+6. **Saves the wiring** to `~/.blimp_env` (mode 600) for every later command.
+7. **Wires the Blimp node over its admin API** — no SSH, no restart:
 
    ```
    POST http://<gateway>:9000/admin/source/configure
-   Authorization: Bearer zus-<CLUSTER_ID>
-   {"source":"customer","iceberg_url":"http://<node>:8181","warehouse":"s3://…/wh",
-    "namespace":"…","bucket":"…","s3_key":"…","s3_secret":"…","s3_region":"…"}
+   Authorization: Bearer <the node's live admin token>
+   {"source":"customer","iceberg_url":"<catalog as the GATEWAY reaches it>|<warehouse>",
+    "namespace":"…","bucket":"…","s3_endpoint":"…","s3_key":"…","s3_secret":"…","s3_region":"…"}
    ```
 
-   The gateway applies this to its **live** source config (`ZS3_SRC_CUSTOMER_*`)
-   — the very next query reads your data — and persists it so restarts keep the
-   wiring. Keys travel over the authenticated admin API and are stored root-only
-   on the gateway volume. On success `--setup` prints
-   `✓ cluster wired: source=customer … (live, no restart)`.
+   Two addresses for one catalog: with option A1 you reach the gateway's Nessie
+   on the host port (`http://<gateway>:19122/iceberg`), but the gateway runs in
+   a container where that is loopback to itself, so `--setup` sends the
+   gateway its own catalog address (`ZS3_ICEBERG_REST_URL`, read from the
+   co-located container) and keeps the host address for the registrar and
+   seeder. The bearer is the node's live admin token (the datalake-minted fleet
+   token, kept fresh in `/opt/0chain/zs3server/environment/admin_token`), not
+   `blimp-<id>`. The gateway applies the config live — the very next query
+   reads your data — and persists it across restarts. On success `--setup`
+   prints `✓ cluster wired: source=customer … (live, no restart)`.
+8. **Finishing** — fetches the gateway's S3 keys into `~/.blimp_env` and
+   installs the benchmark tools (`warp`, `mount-s3`, `dlio`, the ACID checker).
 
 Finally it prints the same values for the Blimp node UI (Query Optimizer →
 Production, the manual path) and the `snapshot_changed` webhook for your
@@ -215,9 +251,9 @@ call fails gracefully and `--setup` prints the manual steps.
 Manual fallback (older gateway image, or the admin-API call failed): paste
 `--setup`'s printed values into the Blimp node UI (Production tab).
 
-External mode **requires** `S3_KEY`/`S3_SECRET`; `--setup` sends them in the
-`/admin/source/configure` body. In vpc mode leave them unset — the gateway
-reads via its own identity.
+An S3 endpoint you own (B = 2) **requires** `S3_KEY`/`S3_SECRET`; `--setup`
+sends them in the `/admin/source/configure` body. For the fleet cache layer,
+or a bucket the node reaches with its own identity, leave them unset.
 
 > Firewall: the gateway must reach this node on the catalog port. If the
 > Blimp node security group doesn't open 8181, serve the catalog on an open port
