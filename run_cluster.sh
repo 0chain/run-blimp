@@ -29,7 +29,7 @@ OSZ="${WARP_OBJ_SIZE:-96MiB}"
 #          mlperf resnet50 accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain=136*7
 d="${EC%%/*}"
 if [ "$d" -ge 8 ]; then EC_CONC=64
-  EC_DATASET_GB=136; EC_ACCEL=6; EC_RT=24; EC_PF=48
+  EC_DATASET_GB=136; EC_ACCEL="${MLPERF_ACCEL:-6}"; EC_RT=24; EC_PF=48
 else                    EC_CONC=16
   # 45 GiB set: still > the 32 GiB gateway RAM (so the warp GET / mlperf read can NOT
   # be served from page cache), but sized to FIT the small 2/1 on-prem allocation
@@ -38,7 +38,31 @@ else                    EC_CONC=16
   # rt-4/pf-2 (2026-08-28, was 12/24): a fleet of N concurrent mlperf runs at rt-12
   # saturates the single gateway read path (20-57s/GET) and trips mount-s3's CRT
   # minimum-throughput guard -> EIO. rt-4/pf-2 cuts per-run read concurrency 3x.
-  EC_DATASET_GB="${EC_DATASET_GB:-45}"; EC_ACCEL=3; EC_RT=4; EC_PF=2; fi
+  # ACCEL DEFAULTS TO 1. It used to derive 3 here and then get guarded back down
+  # to 1 on any client < 16 vCPU or any gateway < .4xlarge — which is the common
+  # case — so the run printed a confusing "accel 1 instead of 3" and the EC-derived
+  # 3 never actually applied. State the default that is really used; MLPERF_ACCEL
+  # still overrides it upward for a big client + big gateway.
+  # DATASET SIZE MUST MATCH THE UI's FORMULA. The panel's bench (zus-cdc
+  # run_bench.sh) uses EC_DATASET_GB = MULT(17) x data-shards, floor 34 — on a
+  # 2/1 cluster that is 34 GB train, ~46 GB with the ~27% eval set. This script
+  # used a flat 45 GB -> ~50.5 GB, and on a 62 GB box that is the difference
+  # between a working set that FITS in cache and one that does not: measured on
+  # node 37 (2026-09-14) the page cache built to 56 GB during generation and
+  # collapsed to 4 GB before the read, giving AU 18.7% / 108 MB/s, while the UI
+  # bench on the identical 65.108.232.28 (same CPU/RAM/NVMe/EC/flags) held
+  # 43.7 GB resident and got AU 97.3% / 557 MB/s. Same formula, same result.
+  _mult="${BENCH_DATASET_MULT:-17}"; [ "$_mult" -lt 17 ] 2>/dev/null && _mult=17
+  EC_DATASET_GB="${EC_DATASET_GB:-$(( _mult * d ))}"
+  [ "$EC_DATASET_GB" -lt 34 ] && EC_DATASET_GB=34
+  # READER CONCURRENCY MUST ALSO MATCH THE UI: rt = gateway vCPUs, pf = rt*2
+  # (run_bench.sh line ~1181). This script had a flat rt=4/pf=2, which is 3x/12x
+  # less read concurrency than the panel's bench on the same box — another reason
+  # a CLI number could never be compared to a UI number. MLPERF_RT/MLPERF_PF
+  # override for the fleet-concurrency case the old flat values were chosen for.
+  _gwcpu=$(nproc 2>/dev/null || echo 8)
+  EC_RT="${MLPERF_RT:-$_gwcpu}"; EC_PF="${MLPERF_PF:-$(( EC_RT * 2 ))}"
+  EC_ACCEL="${MLPERF_ACCEL:-1}"; fi
 # WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster
 # to conc=64 to see if more parallel GET streams lift blobber-served read throughput).
 EC_CONC="${WARP_CONC:-$EC_CONC}"
@@ -314,7 +338,13 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
       ++workload.workflow.generate_data=True ++workload.workflow.train=False 2>&1 | grep -iE 'Generation done|error' | tail -1
     # native-S3 multipart upload of the whole generated tree into the bucket (fast);
     # train then reads it back through the mp-s3 mount at $NG.
-    aws s3 cp "$LG/" "s3://$BKT/resnet50/" --recursive --endpoint-url "http://$GW:9000" --only-show-errors 2>&1 | tail -2
+    # --metadata zus-dedup=off: keep the bytes on THIS node. dlio's datagen is
+    # seeded (np.random.seed(10)) so every node generates identical tfrecords; with
+    # fleet dedup the 2nd node's upload binds the names to the FIRST node's blobs and
+    # the train then reads over the WAN (node 37: AU 18% at exactly 1 Gbps while the
+    # holder node read the same set at AU 97%, 2026-09-14). The gateway honors the
+    # flag by also storing a local copy, so this measures the node's own storage.
+    aws s3 cp "$LG/" "s3://$BKT/resnet50/" --recursive --metadata zus-dedup=off --endpoint-url "http://$GW:9000" --only-show-errors 2>&1 | tail -2
     g1=$(date +%s); gsec=$(( g1 - g0 )); [ "$gsec" -lt 1 ] && gsec=1
     gbytes=$(du -sb "$LG" 2>/dev/null | awk '{print $1+0}')
     [ "${gbytes:-0}" -gt 0 ] && \
@@ -384,7 +414,8 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # (2026-08-01): generation succeeded, training died, and the leg emitted only
   # its banner, so the suite looked like it had simply produced no numbers. Show
   # the metrics on success; show the tail of the real failure otherwise.
-  local tout trc
+  local tout trc xn0 xn
+  xn0=$(date -u +%Y-%m-%dT%H:%M:%S)   # cross-node read count window (see below)
   tout=$(MEMRUN "$MLPERF_MEM_CAP" $L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \
     ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \
     ++workload.workflow.train=True ++workload.workflow.evaluation=False ++workload.workflow.generate_data=False \
@@ -405,6 +436,21 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     sm=$(printf '%s\n' "$tout" | grep -iE "Training Throughput.*samples" | metval)
     io=$(printf '%s\n' "$tout" | grep -iE "Training I/O Throughput" | metval)
     echo "  mlperf read ($IFACE, accel=$ACC rt=$RT pf=$PF): AU ${au:-n/a}% · ${sm:-n/a} samples/s · ${io:-n/a} MB/s"
+    # CROSS-NODE READS: when this runs ON the node (GW is local and the gateway
+    # container is visible), count the GETs the gateway served from a fleet PEER in
+    # the train window. Non-zero = the number above measured the inter-node link,
+    # not this node's storage (see the zus-dedup=off note at the upload).
+    if command -v docker >/dev/null 2>&1; then
+      local gwc; gwc=$(sudo docker ps --filter publish=9000 --format '{{.Names}}' 2>/dev/null | head -1)
+      if [ -n "$gwc" ]; then
+        xn=$(sudo docker logs "$gwc" --since "$xn0" 2>&1 | grep -c "served cross-node from peer")
+        if [ "${xn:-0}" -gt 0 ] 2>/dev/null; then
+          echo "  mlperf cross-node: ${xn} GETs served from a fleet peer (WAN-bound, not this node's storage)"
+        else
+          echo "  mlperf cross-node: 0 — all reads served by this node's blobbers"
+        fi
+      fi
+    fi
   else
     echo "!! mlperf TRAIN produced no metrics (exit $trc) — last output:"
     printf '%s\n' "$tout" | tail -12 | sed 's/^/   | /'
