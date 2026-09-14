@@ -51,6 +51,15 @@ def main():
     ap.add_argument("--namespace", default="tpcds")
     ap.add_argument("--tables", default="", help="comma-separated subset (default: all 24)")
     ap.add_argument("--s3-endpoint", default="", help="custom S3 endpoint (MinIO etc.); blank = AWS")
+    # Nessie serves Iceberg REST under a BRANCH prefix (default "main"); the
+    # tabulario/iceberg-rest catalog serves the root and takes no prefix. Passing
+    # one where it is not expected 404s every call, so this stays opt-in.
+    ap.add_argument("--prefix", default="", help="Iceberg REST prefix (Nessie branch, e.g. main); blank = none")
+    # Explicit keys for an S3 that is not reachable by this box's IAM role — the
+    # fleet cache layer is key-authenticated, and pyiceberg/s3fs will otherwise
+    # sign anonymously and 403.
+    ap.add_argument("--s3-key", default="", help="S3 access key (blank = IAM role / env)")
+    ap.add_argument("--s3-secret", default="", help="S3 secret key")
     args = ap.parse_args()
 
     tables = [t.strip() for t in args.tables.split(",") if t.strip()] or TPCDS_TABLES
@@ -61,7 +70,7 @@ def main():
     # 2. HARD-FAIL if the warehouse bucket is in a different region than the source
     #    — a single S3 endpoint can't serve two regions, so pyiceberg's warehouse
     #    write would 301. Same-region is a hard requirement, so say so plainly.
-    if not args.s3_endpoint:
+    if not args.s3_endpoint and not args.s3_key:
         src_region = bucket_region(args.source_bucket)
         if src_region and src_region != args.region:
             print(f"  NOTE: source bucket {args.source_bucket} is in {src_region}, "
@@ -83,6 +92,11 @@ def main():
     print(f"  s3 endpoint: {s3_endpoint}  region: {args.region}")
     props = {"uri": args.catalog, "warehouse": args.warehouse,
              "s3.region": args.region, "s3.endpoint": s3_endpoint}
+    if args.prefix:
+        props["prefix"] = args.prefix
+    if args.s3_key:
+        props["s3.access-key-id"] = args.s3_key
+        props["s3.secret-access-key"] = args.s3_secret
     cat = RestCatalog("zus", **props)
 
     try:
@@ -90,7 +104,11 @@ def main():
     except NamespaceAlreadyExistsError:
         pass
 
-    fs = s3fs.S3FileSystem(client_kwargs={"region_name": args.region, "endpoint_url": s3_endpoint})
+    fs_kw = {"client_kwargs": {"region_name": args.region, "endpoint_url": s3_endpoint}}
+    if args.s3_key:
+        fs_kw["key"] = args.s3_key
+        fs_kw["secret"] = args.s3_secret
+    fs = s3fs.S3FileSystem(**fs_kw)
     ok = 0
     for tbl in tables:
         prefix = f"{args.source_bucket}/{tbl}/"

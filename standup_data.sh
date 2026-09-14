@@ -93,6 +93,42 @@ minio_source(){
   echo "REGION=us-east-1"
 }
 
+# --- 2a. FLEET CACHE LAYER (the default when --setup picked it) ---------------
+# The dataset lands on the Blimp fleet's own S3 endpoint rather than a bucket this
+# box owns. That is the "internal" path: the source is already inside the product,
+# so the gateway reads it over the cache layer with no cross-account bucket, no
+# IAM grant, and no MinIO container on the customer's box. Keys are the fleet keys
+# from GET /admin/credentials; the caller passes them in.
+fleet_source(){
+  local ep="${FLEET_ENDPOINT:?FLEET_ENDPOINT required}" bkt="${FLEET_BUCKET:-blimp-sf${SF}}"
+  command -v aws >/dev/null || die "awscli not installed — needed to upload to the fleet S3 endpoint"
+  log "uploading SF${SF} to the fleet cache layer: $ep (bucket $bkt)"
+  # The fleet endpoint is HTTPS with the cluster's own cert; --no-verify-ssl keeps
+  # a private/self-signed CA from blocking the load. Path-style: the fleet address
+  # is a single host, not per-bucket virtual hosts.
+  local vfy=""; case "$ep" in https://*) vfy="--no-verify-ssl";; esac
+  export AWS_ACCESS_KEY_ID="${FLEET_KEY:?FLEET_KEY required}"
+  export AWS_SECRET_ACCESS_KEY="${FLEET_SECRET:?FLEET_SECRET required}"
+  export AWS_DEFAULT_REGION="${REGION:-us-east-1}"
+  # shellcheck disable=SC2086
+  aws --endpoint-url "$ep" $vfy s3 mb "s3://$bkt" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  aws --endpoint-url "$ep" $vfy s3 sync "$OUT" "s3://$bkt/" --exclude ".done" >&2 \
+    || die "fleet upload failed (endpoint $ep, bucket $bkt)"
+  echo "ORIGIN_BUCKET=$bkt"
+  echo "WAREHOUSE=s3://$bkt/wh"
+  echo "S3_ENDPOINT=$ep"
+  echo "S3_KEY=$AWS_ACCESS_KEY_ID"
+  echo "S3_SECRET=$AWS_SECRET_ACCESS_KEY"
+  echo "REGION=${AWS_DEFAULT_REGION}"
+}
+
+if [ "${BLIMP_DATA_TARGET:-}" = fleet ]; then
+  fleet_source
+  log "SF${SF} data source ready"
+  exit 0
+fi
+
 ON_AWS=0; curl -s -m 2 -o /dev/null http://169.254.169.254/latest/meta-data/ 2>/dev/null && ON_AWS=1
 
 if [ "$ON_AWS" = 1 ] && command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then

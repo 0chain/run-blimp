@@ -87,7 +87,32 @@ export these (or source a file with `set -a`) and `--setup` runs unattended:
 REGION CLUSTER_ID ICEBERG_URL WAREHOUSE ORIGIN_BUCKET NAMESPACE \
 S3_KEY S3_SECRET        # external mode only; blank/unset in vpc mode
 GW GW_AK GW_SK          # optional — auto-derived from CLUSTER_ID when unset
+CATALOG_CHOICE=1|2|3    # A. Iceberg catalog: 1 = the node's own Nessie (default, nothing to
+                        #    install; warehouse NAME via ICEBERG_WAREHOUSE, default "mv"),
+                        #    2 = stand a Nessie up on this box (:8181), 3 = ICEBERG_URL you have
+SOURCE_CHOICE=1|2       # B. dataset location: 1 = the fleet cache layer (default; the fleet
+                        #    S3 URL + keys are fetched from the gateway), 2 = another S3 endpoint
+BUILD_DATASET=1|2       # C. 1 = generate a TPC-DS test set at B and register it in A (default),
+BLIMP_SF=1|10|100|1000  #    scale factor for it; 2 = bring your own data (ORIGIN_BUCKET/NAMESPACE)
 ```
+
+Option 1 + 1 is the internal path: a node with no catalog, no bucket and no
+data gets a working cluster in one command. Picking another S3 endpoint (B = 2)
+with the node's Nessie (A = 1) is refused and demoted to a local catalog: the
+gateway can only write table metadata into a warehouse *it* has configured,
+which lives on the fleet endpoint, and the source config carries one
+endpoint/key pair.
+
+**What `--query` measures.** The suite runs against the source `--setup` wired
+(the gateway calls it `customer`): phase 1 authors an MV from it and verifies
+it, phase 2 appends rows to it (`seed_tpcds.py --tick`) and fires
+`/admin/source/snapshot_changed`, phase 3 re-runs the query so the gateway
+delta-merges the appended rows into the MV, phase 4 verifies the merged MV.
+`--evict` forces a cold author first; `--verify` turns verification on (off by
+default — that is the production path). Every phase shows up as a run on the
+node panel's Query tab. `BLIMP_INGEST=1` additionally copies the namespace
+into the cluster warehouse first (`/prod/ingest`, a full copy); it is not part
+of the measurement.
 
 ### Step 1 — create a Blimp node
 

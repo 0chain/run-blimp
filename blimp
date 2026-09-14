@@ -54,8 +54,19 @@ usage(){
   cat <<'H'
 
   blimp --setup      Connect a Blimp cluster to your data (run on your app node).
-                     Uses your Iceberg REST + S3 endpoints if you have them, or
-                     stands up an Iceberg catalog / S3 bucket here if you don't.
+                     Asks three things, each defaulting to the INTERNAL option so
+                     a plain customer needs no pre-existing infrastructure:
+                       1. Iceberg catalog — the gateway's own Nessie (default),
+                          stand one up on this box, or an existing REST URL.
+                       2. Dataset location — the fleet cache layer at the fleet
+                          S3 address (default, keys auto-fetched), or any other
+                          S3 endpoint / your own bucket.
+                       3. Test dataset — build TPC-DS at SF1 (default), SF10,
+                          SF100 or SF1000 at that location and register it into
+                          the catalog from 1; or bring your own data.
+                     Every answer is overridable up-front via the env
+                     (CATALOG_CHOICE / SOURCE_CHOICE / BUILD_DATASET / BLIMP_SF),
+                     so a scripted run is non-interactive.
   blimp --storage    Test: storage suite.
   blimp --acid       Test: ACID / linearizability — a Jepsen-style porcupine
                      check that concurrent writers + readers never observe a
@@ -120,6 +131,10 @@ ICEBERG_URL=$ICEBERG_URL
 # seed_tpcds.py etc. never loop out through our own public IP and get blocked by
 # our own security group — see local_host().
 ICEBERG_URL_LOCAL=${ICEBERG_URL_LOCAL:-}
+# REST prefix. Nessie (the gateway's own catalog) serves every route under a
+# BRANCH prefix — "main" — while a plain REST catalog serves the root and 404s
+# if you send one. Blank = no prefix.
+ICEBERG_PREFIX=${ICEBERG_PREFIX:-}
 WAREHOUSE=$WAREHOUSE
 ORIGIN_BUCKET=$ORIGIN_BUCKET
 NAMESPACE=$NAMESPACE
@@ -137,7 +152,7 @@ S3_KEY=${S3_KEY:-}
 S3_SECRET=${S3_SECRET:-}
 GW_AK=${GW_AK:-}
 GW_SK=${GW_SK:-}
-BLIMP_PY=${BLIMP_PY:-python3}
+BLIMP_PY=${BLIMP_PY:-}
 E
   bold "saved wiring -> $ENVF"
 }
@@ -167,6 +182,16 @@ persist_wiring(){
 # refresh GW_AK/GW_SK/CLUSTER_TOKEN and persist them so the NEXT run is already
 # correct. No-op when the gateway is unreachable or nothing drifted (e.g. blimp
 # running on a separate box with no local gateway container to read the token from).
+# gateway_env VAR — one env var of the co-located minioserver container (empty
+# when not co-located or docker is absent). The gateway's own view of its
+# catalog/S3 addresses lives there; use it whenever the gateway, not this CLI,
+# will dial the address.
+gateway_env(){
+  command -v docker >/dev/null 2>&1 || return 0
+  docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | sed -n "s/^$1=//p" | head -1
+}
+
 heal_wiring(){
   [ -n "${GW:-}" ] || return 0
   # PREFERRED — read this node's ACTUAL gateway auth straight from the local
@@ -179,7 +204,16 @@ heal_wiring(){
   if command -v docker >/dev/null 2>&1 && docker inspect minioserver >/dev/null 2>&1; then
     local ea tok ak sk
     ea=$(docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)
-    tok=$(printf '%s' "$ea" | sed -n 's/^ZS3_ADMIN_TOKEN=//p' | head -1)
+    # The FILE is authoritative, the container env is only a PROVISION-TIME
+    # SNAPSHOT. Rotating the fleet token rewrites /opt/.../admin_token (zus-cdc
+    # re-reads it within 30s and the gateway honours it via its fleet bootstrap)
+    # but CANNOT rewrite a running container's env. Healing from the env
+    # therefore "healed" to a stale value and every later admin call 401'd —
+    # measured on node 37 (2026-09-14): env 83cfaafe… vs live file 36f62da5…,
+    # which failed `blimp --query` at /admin/source/snapshot_changed. Read the
+    # file first and fall back to the env for pre-fleet nodes that have none.
+    tok=$(cat /opt/0chain/zs3server/environment/admin_token 2>/dev/null | tr -d '\r\n')
+    [ -n "$tok" ] || tok=$(printf '%s' "$ea" | sed -n 's/^ZS3_ADMIN_TOKEN=//p' | head -1)
     ak=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_USER=//p' | head -1)
     sk=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_PASSWORD=//p' | head -1)
     [ -n "$tok" ] || tok="${CLUSTER_TOKEN:-blimp-${CLUSTER_ID:-}}"
@@ -276,87 +310,236 @@ local_url(){ # <url> <started_here:0|1>
 # A single `docker run` — no compose plugin needed on the client box (the only
 # thing that ever required it). The catalog is one container; compose bought us
 # nothing here. `docker` (or `sudo docker`) is the only dependency.
+# ---- pick one of N numbered options -----------------------------------------
+# Same no-tty contract as ask(): with no controlling terminal take the default
+# rather than dying, so CI / `ssh host blimp --setup` still completes.
+pick(){ # <var> <prompt> <default-number> <label1> <label2> ...
+  local var="$1" prompt="$2" def="$3"; shift 3
+  local cur="${!var:-}" n=1 v
+  [ -n "$cur" ] && { printf '%s' "$cur"; return; }
+  { echo; bold "$prompt"; } >&2
+  for l in "$@"; do printf '   %d) %s\n' "$n" "$l" >&2; n=$((n+1)); done
+  if ! { : < /dev/tty; } 2>/dev/null; then
+    printf '  choice [%s]: <no tty, using default>\n' "$def" >&2
+    printf '%s' "$def"; return
+  fi
+  printf '  choice [%s]: ' "$def" >&2; read -r v </dev/tty || true
+  v="${v:-$def}"
+  case "$v" in ''|*[!0-9]*) v="$def";; esac
+  [ "$v" -ge 1 ] 2>/dev/null && [ "$v" -le $# ] 2>/dev/null || v="$def"
+  printf '%s' "$v"; }
+
+# ---- fleet credentials from the gateway -------------------------------------
+# GET /admin/credentials returns the account-wide fleet S3 address and keys:
+#   fleet_url, fleet_s3_access_key, fleet_s3_secret_key
+# This is what makes the "use the fleet cache layer" option zero-config — the
+# customer never copies a key. Sets FLEET_URL / FLEET_AK / FLEET_SK; returns 1
+# when the gateway is older than the endpoint or fleet mode is off.
+fleet_creds(){
+  [ -n "${GW:-}" ] || return 1
+  local resp; resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" \
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" 2>/dev/null) || return 1
+  eval "$(printf '%s' "$resp" | "${BLIMP_PY:-python3}" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not d.get("fleet_enabled"): sys.exit(0)
+for k,v in (("FLEET_URL","fleet_url"),("FLEET_AK","fleet_s3_access_key"),("FLEET_SK","fleet_s3_secret_key")):
+    val=str(d.get(v,"") or "").replace("\x27","")
+    if val: print("%s=\x27%s\x27" % (k,val))' 2>/dev/null)"
+  [ -n "${FLEET_URL:-}" ] && [ -n "${FLEET_AK:-}" ]; }
+
+# ---- A. Iceberg catalog: gateway Nessie (default) | stand up here | existing --
+# The gateway ALREADY runs a Nessie that serves Iceberg REST at :19122/iceberg
+# over branch `main`. Registering into it is the internal path: nothing new to
+# run, and the catalog the gateway itself reads is the one holding the tables.
+# Standing one up here (:8181) or pointing at a URL you already have remain
+# available — those were the only two choices before.
+choose_catalog(){
+  local c; c=$(pick CATALOG_CHOICE "Iceberg catalog" 1 \
+    "use this cluster's gateway Nessie catalog (default, nothing to install)" \
+    "stand up an Iceberg REST catalog on THIS box (:8181)" \
+    "point at an Iceberg REST catalog I already have")
+  case "$c" in
+    1) ICEBERG_URL="http://$GW:19122/iceberg"
+       ICEBERG_PREFIX="${ICEBERG_PREFIX:-main}"
+       ICEBERG_URL_LOCAL="$ICEBERG_URL"
+       export ICEBERG_PREFIX ICEBERG_URL_LOCAL
+       if curl -s -m 8 "$ICEBERG_URL/v1/config" >/dev/null 2>&1; then
+         bold "  using the gateway Nessie catalog — $ICEBERG_URL (branch $ICEBERG_PREFIX)"
+         # Nessie warehouses are SERVER-CONFIGURED AND NAMED. A client cannot ask
+         # for an arbitrary path: GET /v1/config?warehouse=s3://blimp-src/wh
+         # returns 500 "Warehouse 's3://blimp-src/wh' is not known". The gateway
+         # itself uses the name `mv` (ZS3_ICEBERG_WAREHOUSE), which resolves to
+         # s3://tpcds-mv. So the warehouse here is a NAME, and table metadata
+         # lands in whatever bucket that name resolves to — not in the data
+         # bucket. Probe the name to confirm it before committing to it.
+         ICEBERG_WAREHOUSE=$(ask ICEBERG_WAREHOUSE "  Nessie warehouse name" "mv")
+         if curl -sf -m 8 "$ICEBERG_URL/v1/config?warehouse=$ICEBERG_WAREHOUSE" >/dev/null 2>&1; then
+           NESSIE_WAREHOUSE=$(curl -s -m 8 "$ICEBERG_URL/v1/config?warehouse=$ICEBERG_WAREHOUSE" 2>/dev/null \
+             | "${BLIMP_PY:-python3}" -c 'import json,sys
+try: print(json.load(sys.stdin).get("defaults",{}).get("warehouse","") or "")
+except Exception: print("")' 2>/dev/null)
+           bold "    warehouse \"$ICEBERG_WAREHOUSE\" -> ${NESSIE_WAREHOUSE:-?} (table metadata lands there)"
+         else
+           bold "  ! warehouse \"$ICEBERG_WAREHOUSE\" is not known to this Nessie — falling back to a catalog on this box"
+           ICEBERG_URL=""; ICEBERG_PREFIX=""; ICEBERG_WAREHOUSE=""
+         fi
+         export NESSIE_WAREHOUSE ICEBERG_WAREHOUSE
+       else
+         bold "  ! $ICEBERG_URL did not answer /v1/config — is :19122 reachable from here?"
+         bold "    falling back to standing a catalog up on this box"
+         ICEBERG_URL=""; ICEBERG_PREFIX=""
+       fi ;;
+    2) ICEBERG_URL=""; ICEBERG_PREFIX="" ;;   # standup_iceberg runs once WAREHOUSE is known
+    3) ICEBERG_URL=$(ask ICEBERG_URL "  Iceberg REST URL")
+       [ -n "$ICEBERG_URL" ] || die "an Iceberg REST URL is required for option 3"
+       ICEBERG_PREFIX=$(ask ICEBERG_PREFIX "  REST prefix (Nessie branch; blank for a plain REST catalog)")
+       ICEBERG_URL_LOCAL="$ICEBERG_URL"; export ICEBERG_PREFIX ICEBERG_URL_LOCAL ;;
+  esac
+  CATALOG_CHOICE="$c"; export CATALOG_CHOICE ICEBERG_URL
+}
+
+# ---- B. where the dataset (source) lives -------------------------------------
+# Default is the fleet cache layer: the product's own S3 address, keyed by the
+# fleet credentials the gateway hands out. The alternative is any other S3
+# endpoint — your own bucket, or a MinIO/other-cloud address.
+choose_source_location(){
+  local have_fleet=0; fleet_creds && have_fleet=1
+  local c
+  if [ "$have_fleet" = 1 ]; then
+    c=$(pick SOURCE_CHOICE "Dataset (source) location" 1 \
+      "the fleet cache layer — ${FLEET_URL} (default)" \
+      "another S3 endpoint (your own bucket / MinIO / other cloud)")
+  else
+    bold "  (no fleet credentials from the gateway — the fleet option needs a gateway with fleet mode on)"
+    c=2
+  fi
+  case "$c" in
+    1) SOURCE_TARGET=fleet
+       S3_ENDPOINT="$FLEET_URL"; S3_KEY="$FLEET_AK"; S3_SECRET="$FLEET_SK"
+       ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Bucket on the fleet endpoint" "blimp-src")
+       bold "  source → $S3_ENDPOINT/$ORIGIN_BUCKET (fleet keys, fetched from the gateway)" ;;
+    2) SOURCE_TARGET=external
+       ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (blank = generate one here)")
+       [ -n "$ORIGIN_BUCKET" ] && S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint (blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
+       # INCOMPATIBLE PAIR. The gateway's Nessie can only write table metadata
+       # into a warehouse IT has configured — here s3://tpcds-mv, on the FLEET
+       # endpoint. With the data on some other S3, metadata and data end up on
+       # two different endpoints with two different credentials, and the
+       # gateway's single source S3 config cannot reach both: every metadata
+       # read fails. That is guardrail 1. Pairing Nessie with the fleet is fine
+       # precisely because both buckets are then the same endpoint + keys.
+       if [ "${CATALOG_CHOICE:-}" = 1 ]; then
+         bold "  ! the gateway Nessie catalog writes metadata to its own warehouse on the FLEET"
+         bold "    endpoint, but your data is on a different S3 — the gateway cannot read both."
+         bold "    Standing a catalog up on this box instead, co-located with your bucket."
+         ICEBERG_URL=""; ICEBERG_PREFIX=""; ICEBERG_WAREHOUSE=""; NESSIE_WAREHOUSE=""
+         CATALOG_CHOICE=2; export CATALOG_CHOICE ICEBERG_URL ICEBERG_PREFIX
+       fi ;;
+  esac
+  SOURCE_CHOICE="$c"; export SOURCE_CHOICE SOURCE_TARGET
+}
+
+# ---- C. build a TPC-DS test dataset? ----------------------------------------
+# Default yes at SF1. The scale factors are the ones the query/bench suites are
+# calibrated against; SF1000 is ~1 TB and takes hours to generate, so it is
+# offered but never the default.
+choose_dataset(){
+  local c; c=$(pick BUILD_DATASET "Build a TPC-DS test dataset at that location?" 1 \
+    "yes (default)" "no — I will bring my own data")
+  if [ "$c" != 1 ]; then BUILD_DATASET=0; export BUILD_DATASET; return 0; fi
+  local sf; sf=$(pick SF_CHOICE "Scale factor" 1 \
+    "SF1    ~1 GB   (default — minutes)" \
+    "SF10   ~10 GB  (tens of minutes)" \
+    "SF100  ~100 GB (hours)" \
+    "SF1000 ~1 TB   (many hours; needs a big box + disk)")
+  case "$sf" in 1) BLIMP_SF=1;; 2) BLIMP_SF=10;; 3) BLIMP_SF=100;; 4) BLIMP_SF=1000;; esac
+  BUILD_DATASET=1; SF_CHOICE="$sf"; export BUILD_DATASET BLIMP_SF SF_CHOICE
+  bold "  will generate TPC-DS SF${BLIMP_SF} and register it into the catalog"
+}
+
 standup_iceberg(){
   local DKR=docker; command -v docker >/dev/null || DKR="sudo docker"
   $DKR info >/dev/null 2>&1 || DKR="sudo docker"
   $DKR info >/dev/null 2>&1 || die "docker not available — needed to stand up the Iceberg catalog. Install docker, or pass an existing Iceberg REST URL."
-  # IDEMPOTENT: a healthy catalog already serving THIS warehouse is reused. The
-  # previous behaviour was `rm -f` then recreate on every --setup, which tore
-  # down a working catalog (and anything mid-flight against it) to rebuild an
-  # identical one. Only a missing, unhealthy, or differently-pointed container is
-  # replaced.
-  if curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1; then
-    local cur cur_ep want_ep
-    cur=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
-          | sed -n 's/^CATALOG_WAREHOUSE=//p' | head -1)
-    # Reuse must also match the S3 endpoint, not just the warehouse: a catalog
-    # started before the endpoint was wired points at real AWS and 403s every
-    # registration, and warehouse-only matching would silently keep it.
-    cur_ep=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
-             | sed -n 's/^CATALOG_S3_ENDPOINT=//p' | head -1)
-    case "${S3_ENDPOINT:-}" in ""|*amazonaws.com*) want_ep="";; *) want_ep="$S3_ENDPOINT";; esac
-    # Reuse must also match the WAL catalog URI: a pre-WAL container keeps the
-    # ephemeral in-container SQLite that wedges with SQLITE_BUSY under
-    # concurrent commits+reads (4x on 2026-08-03) and loses the catalog on
-    # docker rm. A container without the durable WAL URI is replaced.
-    local cur_uri
-    cur_uri=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' iceberg-rest 2>/dev/null \
-              | sed -n 's/^CATALOG_URI=//p' | head -1)
-    if [ "$cur" = "$WAREHOUSE" ] && [ "$cur_ep" = "$want_ep" ] && [ "${cur_uri#*transaction_mode=IMMEDIATE}" != "$cur_uri" ]; then
-      ICEBERG_URL="http://$(this_host):8181"
-      ICEBERG_URL_LOCAL="http://$(local_host):8181"; export ICEBERG_URL_LOCAL
-      bold "  Iceberg catalog already up over $WAREHOUSE — reusing it ($ICEBERG_URL)"
+
+  # NESSIE, the same catalog the gateway runs internally.
+  #
+  # This used to be tabulario/iceberg-rest (a JDBC/SQLite REST catalog). Running
+  # a DIFFERENT implementation here than the product uses internally meant two
+  # catalogs to reason about and two dialects in every consumer: Nessie nests
+  # its routes under a branch prefix and takes a warehouse NAME, the JDBC one
+  # serves the root and takes an s3:// path. Every caller had to branch on which
+  # kind it was talking to. Standing up Nessie makes the local catalog identical
+  # in shape to the internal one — same prefix, same warehouse-name semantics,
+  # same REST dialect — so there is exactly one catalog type in the product.
+  # Recipe mirrors zs3-init.go installZusCatalog (ROCKSDB store, warehouse by
+  # name, S3 options + secret indirection, management iface off).
+  local wname="${ICEBERG_WAREHOUSE:-src}"
+  local wupper; wupper=$(printf '%s' "$wname" | tr '[:lower:]-' '[:upper:]_')
+  local wbucket="${ORIGIN_BUCKET:?a data bucket is required before standing up the catalog}"
+  local port="${ICEBERG_PORT:-8181}"
+  local ep="${S3_ENDPOINT:-https://s3.${REGION}.amazonaws.com}"
+
+  # IDEMPOTENT: a healthy Nessie already serving THIS warehouse name over THIS
+  # bucket is reused. Recreating on every --setup tore down a working catalog
+  # (and anything mid-flight against it) to rebuild an identical one.
+  if curl -sf -m 4 "http://localhost:$port/iceberg/v1/config?warehouse=$wname" >/dev/null 2>&1; then
+    local cur
+    cur=$($DKR inspect -f '{{range .Config.Env}}{{println .}}{{end}}' blimp-nessie 2>/dev/null \
+          | sed -n "s/^NESSIE_CATALOG_WAREHOUSES_${wupper}_LOCATION=//p" | head -1)
+    if [ "$cur" = "s3://$wbucket/" ]; then
+      ICEBERG_URL="http://$(this_host):$port/iceberg"
+      ICEBERG_URL_LOCAL="http://$(local_host):$port/iceberg"
+      ICEBERG_PREFIX="${ICEBERG_PREFIX:-main}"; ICEBERG_WAREHOUSE="$wname"
+      export ICEBERG_URL_LOCAL ICEBERG_PREFIX ICEBERG_WAREHOUSE
+      bold "  Nessie already up over s3://$wbucket ($ICEBERG_URL, warehouse $wname) — reusing it"
       return 0
     fi
-    bold "  catalog on :8181 points at ${cur:-<unknown>}, not $WAREHOUSE — replacing it"
+    bold "  catalog on :$port points at ${cur:-<unknown>}, not s3://$wbucket/ — replacing it"
   fi
-  bold "standing up an Iceberg REST catalog on :8181 over $WAREHOUSE"
-  # NON-AWS S3 (the MinIO source standup_data puts on this box) needs the endpoint
-  # AND path-style access pushed into the catalog's own S3FileIO. Without them the
-  # catalog signs its metadata writes against real s3.<region>.amazonaws.com while
-  # holding the MinIO key, and every table registration fails with
-  #   S3Exception: The AWS Access Key Id you provided does not exist in our records (403)
-  # -> "registered 0/24 tables". The client-side register script already handles
-  # this (--s3-endpoint); the catalog SERVICE did not.
-  local EP_ENV=""
-  case "${S3_ENDPOINT:-}" in
-    ""|*amazonaws.com*) ;;
-    *) EP_ENV="-e CATALOG_S3_ENDPOINT=$S3_ENDPOINT -e CATALOG_S3_PATH__STYLE__ACCESS=true" ;;
-  esac
-  $DKR rm -f iceberg-rest >/dev/null 2>&1 || true
-  # Durable WAL-mode catalog db on the HOST. The image default is an ephemeral
-  # in-container SQLite in rollback-journal mode: concurrent seeder commits +
-  # gateway added_files reads wedge it with SQLITE_BUSY/CommitStateUnknown
-  # (4 wedges on 2026-08-03), and `docker rm` destroys the catalog outright.
-  # WAL allows readers during a writer; busy_timeout absorbs bursts; the bind
-  # mount survives container recreation.
-  sudo mkdir -p /opt/blimp/catalog 2>/dev/null || mkdir -p /opt/blimp/catalog
-  sudo chown -R 1000:1000 /opt/blimp/catalog 2>/dev/null || true
-  # shellcheck disable=SC2086  # EP_ENV is an intentional word-split flag pair
-  $DKR run -d --name iceberg-rest --restart unless-stopped -p 8181:8181 \
-    --add-host host.docker.internal:host-gateway \
-    -e CATALOG_WAREHOUSE="$WAREHOUSE" \
-    -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
-    -e CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog \
-    -e CATALOG_URI='jdbc:sqlite:file:/catalog/cat.db?journal_mode=WAL&busy_timeout=30000&synchronous=NORMAL&transaction_mode=IMMEDIATE' \
-    -e CATALOG_JDBC_USER=user -e CATALOG_JDBC_PASSWORD=password \
-    -e CATALOG_CLIENTS=1 \
-    -v /opt/blimp/catalog:/catalog \
-    $EP_ENV \
-    -e AWS_REGION="$REGION" \
-    -e AWS_ACCESS_KEY_ID="${S3_KEY:-${CAT_AK:-${AWS_ACCESS_KEY_ID:-}}}" \
-    -e AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${CAT_SK:-${AWS_SECRET_ACCESS_KEY:-}}}" \
-    tabulario/iceberg-rest:latest >/dev/null || die "failed to start iceberg-rest"
-  for i in $(seq 1 20); do
-    curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1 && break; sleep 3
+
+  bold "standing up Nessie on :$port over s3://$wbucket (warehouse \"$wname\")"
+  sudo mkdir -p /opt/blimp/nessie 2>/dev/null || mkdir -p /opt/blimp/nessie
+  $DKR rm -f blimp-nessie >/dev/null 2>&1 || true
+  # Path-style access: the fleet endpoint and MinIO are single hosts, not
+  # per-bucket virtual hosts. Harmless against real AWS.
+  $DKR run -d --name blimp-nessie --restart unless-stopped \
+    -p "$port:19120" \
+    -v /opt/blimp/nessie:/data/nessie \
+    -e NESSIE_VERSION_STORE_TYPE=ROCKSDB \
+    -e NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH=/data/nessie \
+    -e NESSIE_CATALOG_DEFAULT_WAREHOUSE="$wname" \
+    -e "NESSIE_CATALOG_WAREHOUSES_${wupper}_LOCATION=s3://$wbucket/" \
+    -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION="$REGION" \
+    -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT="$ep" \
+    -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS=true \
+    -e NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key \
+    -e nessie.catalog.secrets.access-key.name="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" \
+    -e nessie.catalog.secrets.access-key.secret="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+    -e QUARKUS_HTTP_PORT=19120 \
+    -e QUARKUS_MANAGEMENT_ENABLED=false \
+    ghcr.io/projectnessie/nessie:latest >/dev/null || die "failed to start blimp-nessie"
+
+  # Quarkus cold-start on a small box runs well past a minute; the internal
+  # installer waits generously for the same reason.
+  local i
+  for i in $(seq 1 40); do
+    curl -sf -m 4 "http://localhost:$port/iceberg/v1/config?warehouse=$wname" >/dev/null 2>&1 && break
+    sleep 5
   done
-  curl -s -m 4 "http://localhost:8181/v1/config" >/dev/null 2>&1 || die "Iceberg catalog did not come up on :8181 (check: $DKR logs iceberg-rest)"
-  ICEBERG_URL="http://$(this_host):8181"
+  curl -sf -m 4 "http://localhost:$port/iceberg/v1/config?warehouse=$wname" >/dev/null 2>&1 \
+    || die "Nessie did not come up on :$port (check: $DKR logs blimp-nessie)"
+
+  ICEBERG_URL="http://$(this_host):$port/iceberg"
   # The cluster reaches it at ICEBERG_URL; WE reach it on loopback. Both are
   # written to the wiring so local tools (seed_tpcds.py, register_tpcds_tables.py)
   # never dial our own public address.
-  ICEBERG_URL_LOCAL="http://$(local_host):8181"; export ICEBERG_URL_LOCAL
-  bold "  Iceberg catalog up — cluster reaches it at $ICEBERG_URL (local tools use $ICEBERG_URL_LOCAL)"
+  ICEBERG_URL_LOCAL="http://$(local_host):$port/iceberg"
+  ICEBERG_PREFIX=main; ICEBERG_WAREHOUSE="$wname"
+  WAREHOUSE="$wname"     # Nessie takes the NAME everywhere, never the s3:// path
+  export ICEBERG_URL_LOCAL ICEBERG_PREFIX ICEBERG_WAREHOUSE
+  bold "  Nessie up — cluster reaches it at $ICEBERG_URL (local tools use $ICEBERG_URL_LOCAL), warehouse \"$wname\" -> s3://$wbucket/"
 }
 
 # ---- create an S3 warehouse bucket here (awscli) ----------------------------
@@ -625,36 +808,53 @@ cmd_setup(){
   export ADVERTISE_HOST
   NAMESPACE=$(ask NAMESPACE "Iceberg namespace" "tpcds")
 
-  # --- Iceberg REST catalog: BYO or stand up ---
-  echo; bold "Iceberg REST catalog"
-  ICEBERG_URL=$(ask ICEBERG_URL "  Existing Iceberg REST URL (blank = stand one up here)")
+  # --- A. Iceberg catalog · B. source location · C. test dataset -------------
+  # These three used to be EXTERNAL-only: "give me your REST URL or I stand one
+  # up here", "give me your bucket", and an implicit SF1 generated only when the
+  # bucket was left blank. The defaults are now the INTERNAL ones — the catalog
+  # the gateway already runs, and the fleet cache layer as the source — with the
+  # bring-your-own paths kept as explicit choices.
+  choose_catalog
+  echo; bold "Dataset (source) location"
+  choose_source_location
+  echo
+  choose_dataset
 
-  # --- S3 endpoint + data bucket + warehouse ---
-  # Two scenarios: (a) you HAVE data — give the bucket; (b) you have NONE — leave
-  # it blank and we generate a real TPC-DS SF1 (~1 GB) source for you: an S3 bucket
-  # in THIS box's region (AWS), or a MinIO server on this box (non-AWS). Either way
-  # standup_data emits ORIGIN_BUCKET/WAREHOUSE/S3_ENDPOINT/keys/REGION, and we
-  # auto-register the 24 tables after the catalog is up (DATA_GENERATED gate).
-  echo; bold "S3 / warehouse"
   DATA_GENERATED=0
-  ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (blank = generate a TPC-DS SF1 source here)")
-  if [ -z "$ORIGIN_BUCKET" ]; then
-    bold "  no data bucket given — generating a TPC-DS SF1 (~1 GB) source"
-    local gen; gen=$(REGION="$REGION" CLUSTER_ID="$CLUSTER_ID" ADVERTISE_HOST="${ADVERTISE_HOST:-}" \
-      bash "$HERE/standup_data.sh") || die "SF1 data standup failed"
+  if [ "${BUILD_DATASET:-0}" = 1 ]; then
+    bold "  generating TPC-DS SF${BLIMP_SF} — all 24 tables"
+    local gen
+    gen=$(REGION="$REGION" CLUSTER_ID="$CLUSTER_ID" ADVERTISE_HOST="${ADVERTISE_HOST:-}" \
+      BLIMP_SF="${BLIMP_SF:-1}" BLIMP_DATA_TARGET="${SOURCE_TARGET:-external}" \
+      FLEET_ENDPOINT="${S3_ENDPOINT:-}" FLEET_KEY="${S3_KEY:-}" FLEET_SECRET="${S3_SECRET:-}" \
+      FLEET_BUCKET="${ORIGIN_BUCKET:-}" \
+      bash "$HERE/standup_data.sh") || die "SF${BLIMP_SF} data standup failed"
     eval "$gen"                      # sets ORIGIN_BUCKET WAREHOUSE S3_ENDPOINT [S3_KEY S3_SECRET] REGION
+    # standup_data emits WAREHOUSE=s3://<bucket>/wh, which is right for a path
+    # catalog and WRONG for Nessie — it takes a warehouse NAME and 500s on a
+    # path. The eval above happens AFTER the catalog was chosen, so it would
+    # silently clobber the name: the first E2E registered 24/24 with "mv" but
+    # then wired the gateway with "s3://blimp-e2e/wh". Restore the name here.
+    [ -n "${ICEBERG_WAREHOUSE:-}" ] && WAREHOUSE="$ICEBERG_WAREHOUSE"
     DATA_GENERATED=1
-    bold "  SF1 source → bucket $ORIGIN_BUCKET · endpoint $S3_ENDPOINT · region $REGION"
-  else
-    S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint (blank = AWS S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
+    bold "  SF${BLIMP_SF} source → bucket $ORIGIN_BUCKET · endpoint $S3_ENDPOINT · region $REGION"
+  elif [ -z "${ORIGIN_BUCKET:-}" ]; then
+    die "no dataset to build and no data bucket given — pick a bucket, or answer yes to the test dataset"
   fi
-  # Warehouse (Iceberg metadata) co-locates INSIDE the data bucket (guardrail 1).
-  WAREHOUSE=$(ask WAREHOUSE "  Warehouse s3://bucket/prefix (blank = s3://<data-bucket>/wh)" \
-    "${ORIGIN_BUCKET:+s3://$ORIGIN_BUCKET/wh}")
+  # Warehouse (Iceberg metadata) co-locates INSIDE the data bucket (guardrail 1)
+  # — EXCEPT on Nessie, where the warehouse is a NAME the server already knows,
+  # not a path. Nessie 500s on an unknown one ("Warehouse 's3://…' is not
+  # known"), and this value goes to BOTH the registrar and the gateway's
+  # /admin/source/configure (which sends it as IRC_URL "<url>|<warehouse>"), so
+  # getting it wrong breaks registration AND every source read.
+  WAREHOUSE=$(ask WAREHOUSE "  Warehouse (Nessie: a warehouse NAME; otherwise s3://bucket/prefix)" \
+    "${ICEBERG_WAREHOUSE:-${ORIGIN_BUCKET:+s3://$ORIGIN_BUCKET/wh}}")
   # Guardrail 1 enforcement: warn loudly if warehouse and data bucket diverge — a
   # split makes the gateway's catalog-metadata reads 500 and the MV author refuse.
   local wh_bkt; wh_bkt=$(echo "$WAREHOUSE" | sed -E 's#^s3://([^/]+).*#\1#')
-  if [ -n "$ORIGIN_BUCKET" ] && [ "$wh_bkt" != "$ORIGIN_BUCKET" ]; then
+  # A Nessie warehouse name is not an s3:// path, so the co-location check does
+  # not apply to it at all — skip rather than warn on every run.
+  if [ -z "${ICEBERG_WAREHOUSE:-}" ] && [ -n "$ORIGIN_BUCKET" ] && [ "$wh_bkt" != "$ORIGIN_BUCKET" ]; then
     printf '\033[33m  ⚠ warehouse bucket (%s) ≠ data bucket (%s). The gateway serves catalog\n    metadata only from the data bucket; a split will make MV authoring fail.\n    Recommended: use s3://%s/wh. Continue anyway? [y/N] \033[0m' "$wh_bkt" "$ORIGIN_BUCKET" "$ORIGIN_BUCKET" >&2
     local yn; read -r yn </dev/tty || true
     [ "${yn:-N}" = y ] || [ "${yn:-N}" = Y ] || WAREHOUSE="s3://$ORIGIN_BUCKET/wh"
@@ -679,23 +879,42 @@ cmd_setup(){
   # stand up the catalog now that WAREHOUSE is known
   [ -n "$ICEBERG_URL" ] || standup_iceberg
 
-  # Scenario (b): we generated an SF1 source — register its 24 tables into the
-  # catalog now (BYO-data users register their own with register_tpcds_tables.py).
-  # register runs LOCALLY, so it reaches the catalog + MinIO on localhost.
+  # We generated a source — register its 24 tables into WHICHEVER catalog was
+  # chosen in A (BYO-data users register their own with register_tpcds_tables.py).
+  # Targets ICEBERG_URL_LOCAL, which is loopback for a catalog we stood up here
+  # and the gateway's address for the Nessie option — NOT a hardcoded :8181,
+  # which silently registered into the wrong catalog once a second one existed.
   if [ "${DATA_GENERATED:-0}" = 1 ]; then
+    local cat_url="${ICEBERG_URL_LOCAL:-${ICEBERG_URL:-http://localhost:8181}}"
+    # Nessie serves every REST route under its branch prefix; a plain REST
+    # catalog does not. Build both the probe path and the registrar flag from it.
+    local pfx="${ICEBERG_PREFIX:-}" pfx_path="" pfx_flag=""
+    [ -n "$pfx" ] && { pfx_path="/$pfx"; pfx_flag="--prefix $pfx"; }
     # IDEMPOTENT: registration is add_files against the catalog, so re-running it
     # on an already-populated namespace is wasted work that ends in a warning.
-    local have; have=$(curl -s -m 8 "http://localhost:8181/v1/namespaces/$NAMESPACE/tables" 2>/dev/null \
+    local have; have=$(curl -s -m 8 "$cat_url/v1$pfx_path/namespaces/$NAMESPACE/tables" 2>/dev/null \
                        | grep -o '"name"' | wc -l | tr -d ' ')
     if [ "${have:-0}" -ge 24 ]; then
       bold "  ✓ $NAMESPACE already has $have tables registered — skipping registration"
     else
-    bold "registering the 24 TPC-DS SF1 tables into the catalog"
+    # Nessie takes the warehouse NAME (it resolves it server-side); a plain REST
+    # catalog takes the s3:// path. Sending the path to Nessie is a hard 500.
+    local reg_wh="$WAREHOUSE"
+    [ -n "${ICEBERG_WAREHOUSE:-}" ] && reg_wh="$ICEBERG_WAREHOUSE"
+    bold "registering the 24 TPC-DS SF${BLIMP_SF:-1} tables into $cat_url (warehouse $reg_wh)"
     local reg_ep=""; case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint http://localhost:9000";; esac
+    # The fleet endpoint is not loopback and is key-authenticated, so pass it and
+    # the keys through explicitly instead of relying on this box's IAM role.
+    local reg_keys=""
+    if [ "${SOURCE_TARGET:-}" = fleet ]; then
+      reg_ep="--s3-endpoint $S3_ENDPOINT"
+      reg_keys="--s3-key $S3_KEY --s3-secret $S3_SECRET"
+    fi
+    # shellcheck disable=SC2086  # reg_ep/reg_keys/pfx_flag are intentional flag pairs
     AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
-      "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog http://localhost:8181 \
-      --warehouse "$WAREHOUSE" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
-      --namespace "$NAMESPACE" $reg_ep 2>&1 | tail -3 \
+      "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog "$cat_url" \
+      --warehouse "$reg_wh" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
+      --namespace "$NAMESPACE" $reg_ep $reg_keys $pfx_flag 2>&1 | tail -3 \
       || bold "  (auto-register had issues — re-run register_tpcds_tables.py manually)"
     fi
   fi
@@ -734,9 +953,44 @@ cmd_setup(){
     # workload, and filling it with source scans both pollutes it and pushes the
     # allocation toward the evictor's watermark. Off by default; VIA_ROUTER=1 in
     # the environment is the deliberate opt-in.
-    HOOK_BODY=$(HB_IRC="$ICEBERG_URL" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
-      HB_BKT="$ORIGIN_BUCKET" HB_KEY="${S3_KEY:-}" HB_SEC="${S3_SECRET:-}" HB_REG="$REGION" \
-      HB_EP="${S3_ENDPOINT:-}" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
+    # FLEET SOURCE: the gateway reads it from ITS OWN S3, not the public fleet
+    # address. The fleet URL is the EXTERNAL write path — that is how this CLI
+    # uploaded the data — but handing it to the gateway makes the gateway take a
+    # public round trip (and, on a multi-node fleet, round-robin to a peer) to
+    # read a bucket it serves locally. The gateway's own S3 is what its DuckDB
+    # prelude already uses (ZS3_DUCKDB_S3_ENDPOINT=http://localhost:9000), so
+    # send that plus the gateway's own root keys, which heal_wiring keeps fresh.
+    HOOK_EP="${S3_ENDPOINT:-}"; HOOK_KEY="${S3_KEY:-}"; HOOK_SEC="${S3_SECRET:-}"
+    if [ "${SOURCE_TARGET:-}" = fleet ]; then
+      # The gateway's own root keys are fetched LATER in this run ("finishing
+      # setup"), which is after this call — so populate them now. heal_wiring
+      # reads them from the local minioserver container when co-located (the
+      # node-correct values) and falls back to that gateway's own
+      # /admin/credentials otherwise. Idempotent, so the later block is a no-op.
+      [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || heal_wiring
+      HOOK_EP="http://localhost:9000"
+      HOOK_KEY="${GW_AK:-$HOOK_KEY}"; HOOK_SEC="${GW_SK:-$HOOK_SEC}"
+      bold "  source endpoint for the gateway: $HOOK_EP (its own zs3 — the fleet URL is the upload path only)"
+    fi
+    # CATALOG URL FOR THE GATEWAY. With the gateway's own Nessie (catalog option
+    # 1) this CLI reaches it at http://<GW>:19122/iceberg — the HOST port — but
+    # the gateway runs in a container, where a 127.0.0.1 address is loopback to
+    # ITSELF: the ATTACH fails, every MV author declines, and the suite prints
+    # "?" for every timing (node 37, 2026-09-14). The gateway already knows its
+    # own catalog address (ZS3_ICEBERG_REST_URL, http://zus-nessie:19120/iceberg
+    # on a node). Read it from the container when co-located and send THAT; the
+    # CLI's address stays for the registrar/seeder, which run here.
+    HOOK_IRC="$ICEBERG_URL"
+    if [ "${CATALOG_CHOICE:-}" = 1 ]; then
+      local gwirc; gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
+      if [ -n "$gwirc" ]; then
+        HOOK_IRC="$gwirc"
+        bold "  catalog URL for the gateway: $gwirc (its own Nessie, container address)"
+      fi
+    fi
+    HOOK_BODY=$(HB_IRC="$HOOK_IRC" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
+      HB_BKT="$ORIGIN_BUCKET" HB_KEY="$HOOK_KEY" HB_SEC="$HOOK_SEC" HB_REG="$REGION" \
+      HB_EP="$HOOK_EP" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
       python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
     HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
       -H "Authorization: Bearer ${CLUSTER_TOKEN:-zus-$CLUSTER_ID}" -H "Content-Type: application/json" \
@@ -1178,10 +1432,62 @@ PY
   return 0
 }
 
+# prod_ingest — pull the customer's Iceberg tables INTO the cluster's own
+# eblobber-backed warehouse before querying.
+#
+# THIS IS THE PATH THE PRODUCT ACTUALLY USES. The panel's Prod Query does exactly
+# this (datalake ProdQuery -> zus-cdc /prod/ingest, then /admin/query/run), and it
+# is why the UI can author MVs over a customer source. `blimp --setup` instead
+# wires a BYO ATTACH (source=customer), which points the gateway at the customer
+# catalog — and on that path every grain-gate cardinality probe fails to resolve
+# the schema, so authoring falls through to "serve base" with status=no_mv and
+# every timing reads "?". Measured on node 37 (2026-09-14) at SF1 and SF10.
+#
+# After ingesting, queries must NOT carry source=customer: the tables now live in
+# the CLUSTER's catalog, and asking for the customer source re-attaches the BYO
+# one and defeats the ingest.
+prod_ingest(){
+  local tables="$1"          # JSON array string, or "" for the whole namespace
+  local base="http://$GW:${CDC_PORT:-9401}/prod/ingest"
+  local body
+  body=$(ING_IRC="$ICEBERG_URL" ING_WH="$WAREHOUSE" ING_NS="${NAMESPACE:-tpcds}"     ING_EP="${S3_ENDPOINT:-}" ING_KEY="${S3_KEY:-}" ING_SEC="${S3_SECRET:-}" ING_TBL="$tables"     "${BLIMP_PY:-python3}" -c 'import json,os
+b={"iceberg_url":os.environ["ING_IRC"],"warehouse":os.environ["ING_WH"],
+   "namespace":os.environ["ING_NS"],"s3_endpoint":os.environ["ING_EP"],
+   "s3_key":os.environ["ING_KEY"],"s3_secret":os.environ["ING_SEC"]}
+t=os.environ.get("ING_TBL","").strip()
+if t: b["tables"]=json.loads(t)
+print(json.dumps(b))')
+  bold "ingesting the source into the cluster warehouse (zus-cdc /prod/ingest)"
+  local out
+  out=$(curl -s -m "${INGEST_TIMEOUT:-1800}" -X POST "$base" \
+    -H "Authorization: Bearer ${CLUSTER_TOKEN:-blimp-$CLUSTER_ID}" \
+    -H "Content-Type: application/json" -d "$body" 2>/dev/null)
+  case "$out" in
+    *'"ingested"'*) printf '%s' "$out" | "${BLIMP_PY:-python3}" -c 'import json,sys
+d=json.load(sys.stdin)
+for t in d.get("ingested",[]): print("    %-18s %s rows" % (t.get("table"), t.get("rows")))
+sk=d.get("skipped") or []
+if sk: print("    skipped:", sk)' 2>/dev/null || echo "  $out" ;;
+    *) bold "  ! ingest did not report tables — continuing anyway: ${out:0:200}" ;;
+  esac
+}
+
 cmd_query(){
   need_env
   : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
   preflight 0 0
+  # The suite runs against the source wired by `blimp --setup` (the gateway's
+  # "customer" source): the gateway authors MVs from it, the CDC append lands in
+  # it, and the delta merge diffs its snapshots. That is the production path.
+  # `/prod/ingest` (BLIMP_INGEST=1) is a one-shot FULL COPY of the namespace into
+  # the cluster warehouse (delete + re-append every table) — useful to snapshot a
+  # remote source locally, useless for the suite: with the gateway Nessie as the
+  # catalog it copies the namespace onto itself, and a later append to the source
+  # is never seen by the copy, so every timing came back "?" (node 37,
+  # 2026-09-14). Ingest is therefore opt-in and never replaces the source.
+  if [ "${BLIMP_INGEST:-0}" = 1 ]; then
+    prod_ingest "${INGEST_TABLES:-}"
+  fi
   # S3_ENDPOINT/KEY/SECRET must cross this whitelist. bench_cdc.sh forwards
   # $S3_KEY/$S3_SECRET to seed_tpcds.py and seed_tpcds.py falls back to
   # $S3_ENDPOINT — but none of the three were listed here, so the CDC APPEND
@@ -1224,6 +1530,11 @@ cmd_bench(){
 # Flags may follow the command: `blimp --query --verify`. VERIFY is OFF by default
 # because that is the PRODUCTION path — the gateway does no verification while
 # serving, so an unflagged run measures what customers actually get.
+# LIBRARY MODE: `BLIMP_LIB_ONLY=1 . ./blimp` defines every function and then
+# stops, without parsing argv or running a command. test_setup_options.sh uses
+# this to unit-test the setup choices; nothing else should set it.
+if [ "${BLIMP_LIB_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
 CMD="${1:-}"; shift 2>/dev/null || true
 pending=""   # name of the variable the NEXT argument fills (--queries "3 7 19")
 for f in "$@"; do
