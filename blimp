@@ -79,6 +79,10 @@ usage(){
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
+                     --sql <file|dir>    run YOUR SQL (any dataset): tables + fact are
+                                         derived from the SQL and the catalog
+                     --tick-cmd '<cmd>'  your streamer appends in phase 2 (default:
+                                         the TPC-DS seeder, test set only)
                      --queries "3 7 19"  which TPC-DS queries (default: --first-10)
                      --second-40 | --third-30 | --fourth-19 | --all
                                          run a batch from suites/: --first-10 (the 10
@@ -1501,6 +1505,8 @@ cmd_query(){
     S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
     QNRS="${QNRS:-}" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
+    SQL_FILES="${SQL_FILES:-}" CDC_TICK_CMD="${CDC_TICK_CMD:-}" \
+    ICEBERG_PREFIX="${ICEBERG_PREFIX:-}" ICEBERG_URL_LOCAL="${ICEBERG_URL_LOCAL:-}" \
     VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
 }
 
@@ -1554,6 +1560,14 @@ for f in "$@"; do
     # --queries "3 7 19": the TPC-DS query numbers to run (default: the proven
     # delta-merge set). --append-rows N: base rows for the CDC tick (default 5000).
     --queries)      pending=QNRS ;;
+    # --sql <file|dir>: run ANY SQL against the wired source (author → verify →
+    # append → merge → serve); the query's tables and fact are derived from the
+    # SQL + catalog. --tick-cmd '<cmd>': your own streamer does the phase-2
+    # append (default: the TPC-DS seeder for the test set).
+    --sql)          pending=SQL_FILES ;;
+    --sql=*)        SQL_FILES="${f#--sql=}"; export SQL_FILES ;;
+    --tick-cmd)     pending=CDC_TICK_CMD ;;
+    --tick-cmd=*)   CDC_TICK_CMD="${f#--tick-cmd=}"; export CDC_TICK_CMD ;;
     --first-10|--second-40|--third-30|--fourth-19)
                     QNRS="${QNRS:+$QNRS }${f#--}"; export QNRS ;;
     --all)          QNRS="$(seq -s ' ' 1 99)"; export QNRS ;;

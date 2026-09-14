@@ -251,5 +251,19 @@ done
 if "${BLIMP_PY:-python3}" -c "import ast,sys; ast.parse(open('$HERE/register_tpcds_tables.py').read())" 2>/dev/null; then
   ok "registrar parses"; else bad "registrar has a syntax error"; fi
 
+# ================================================== query_tables.py =========
+# --sql: the queries' tables come from the SQL text (every FROM/JOIN item, comma
+# lists and nested subqueries included, CTE names excluded). Offline via --list-refs.
+case_ "query_tables.py table references"
+QT_TMP=$(mktemp -d)
+cat > "$QT_TMP/a.sql" <<'SQL'
+with ctr as (select sr_customer_sk c, sum(sr_return_amt) t from store_returns, date_dim where sr_returned_date_sk = d_date_sk group by 1)
+select c_customer_id from ctr, store, customer -- from nothing
+where exists (select 1 from (select x from t1 join t2 using (k)) s left join t3 on s.x = t3.y) limit 10
+SQL
+refs=$("${BLIMP_PY:-python3}" "$HERE/query_tables.py" --sql-file "$QT_TMP/a.sql" --list-refs | "${BLIMP_PY:-python3}" -c 'import json,sys;print(" ".join(json.load(sys.stdin)["refs"]))')
+if [ "$refs" = "store_returns date_dim store customer t1 t2 t3" ]; then ok "refs: $refs"; else bad "refs wrong: '$refs'"; fi
+rm -rf "$QT_TMP"
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]
