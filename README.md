@@ -103,6 +103,17 @@ gateway can only write table metadata into a warehouse *it* has configured,
 which lives on the fleet endpoint, and the source config carries one
 endpoint/key pair.
 
+**Your own SQL and your own streamer.** `blimp --query --sql <file|dir>` runs any
+SQL against the wired source; the tables it reads and its fact table are derived
+from the SQL and the catalog (`query_tables.py`: names from FROM/JOIN, existence
+from the catalog listing, fact = the referenced table with the most rows — the
+gateway's own rule). Nothing about the dataset is assumed. In production your
+streamer does the appends; `--tick-cmd '<cmd>'` runs it in phase 2 (with
+`NAMESPACE`, `ICEBERG_URL`, `WAREHOUSE`, `S3_ENDPOINT` and the S3 keys in its
+environment), after which the suite fires `snapshot_changed` for exactly the
+tables your queries read and measures merge + serve. Without `--tick-cmd` the
+TPC-DS seeder appends (test set only).
+
 **What `--query` measures.** The suite runs against the source `--setup` wired
 (the gateway calls it `customer`): phase 1 authors an MV from it and verifies
 it, phase 2 appends rows to it (`seed_tpcds.py --tick`) and fires
