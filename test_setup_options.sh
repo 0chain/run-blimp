@@ -387,10 +387,10 @@ case_ "CLI benchmark knobs match the panel's"
 RC="$HERE/run_cluster.sh"
 
 # warp concurrency: vCPU-derived, not a flat tier.
-if grep -qE '^_gwcpu=\$\(nproc' "$RC" && grep -qF '_warpconc=$(( _gwcpu * 2 ))' "$RC" && grep -qF 'EC_CONC=$_warpconc' "$RC"; then
-  ok "warp concurrency = 2x gateway vCPUs (measured PUT peak)"
+if grep -qE '^_gwcpu=\$\(nproc' "$RC" && grep -qF 'EC_CONC=$_gwcpu' "$RC" && ! grep -qF '_warpconc' "$RC"; then
+  ok "warp concurrency = gateway vCPUs (1x), identical to the panel"
 else
-  bad "warp concurrency is not 2x-vCPU-derived — CLI and panel numbers diverge"
+  bad "warp concurrency is not 1x-vCPU — CLI and panel numbers diverge"
 fi
 grep -qE 'EC_CONC=(64|16)$' "$RC" \
   && bad "a flat warp-concurrency tier is still present" \
