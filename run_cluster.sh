@@ -18,6 +18,9 @@
 #   MLPERF_NUM_FILES (200) NFS_MNT (/mnt/zusnfs). Disk-fill guard aborts at 90%.
 
 set -uo pipefail
+# shellcheck source=scratch_dir.sh
+. "$(dirname "${BASH_SOURCE[0]}")/scratch_dir.sh"
+
 WHAT="${1:-all}"; GW="${GW:?set GW (gateway ip:host w/o port)}"; NFS="${NFS:-$GW}"
 EC="${EC:-2/1}"; DUR="${BENCH_DURATION:-30}"; TTFB_DUR="${TTFB_DUR:-30}"; MNT="${NFS_MNT:-/mnt/zusnfs}"
 OSZ="${WARP_OBJ_SIZE:-96MiB}"
@@ -271,7 +274,11 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # on a .4xlarge or bigger. Needs CLUSTER_ID + the box's IAM ec2:DescribeInstances.
   if [ -z "${MLPERF_ACCELS:-}" ] && [ -n "${CLUSTER_ID:-}" ] && command -v aws >/dev/null 2>&1; then
     local _reg GWTYPE
+    # AWS-only endpoint; other clouds answer the same URL with an HTML error
+    # page. Keep the value only when it is shaped like a region, else fall back
+    # to $REGION below — off AWS this guard simply does not apply.
     _reg=$(curl -s --max-time 3 http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+    case "${_reg:-}" in [a-z][a-z]-[a-z]*-[0-9]) :;; *) _reg="";; esac
     # test_cache.sh exports the GATEWAY S3 keys as AWS_ACCESS_KEY_ID/SECRET globally
     # (for warp/aws-s3 against the gateway endpoint). This describe hits REAL AWS EC2,
     # so unset those first (env -u) — otherwise it AuthFailures to empty and the guard
@@ -329,9 +336,16 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     # suite. Instead: generate to a LOCAL scratch dir (fast local disk), then upload
     # via `aws s3 cp` (native S3 MULTIPART, the same fast path warp uses). TRAIN
     # below still READS via mp-s3 ($NG) — mp-s3 READ is fine, only WRITE wedges.
-    local g0 g1 gsec gbytes LG
-    LG="${MLPERF_LOCAL_GEN:-/var/tmp/mlperf-gen}/resnet50"
-    sudo rm -rf "$LG" 2>/dev/null; sudo mkdir -p "$LG"; sudo chown -R "$(id -u)" "$(dirname "$LG")"
+    local g0 g1 gsec gbytes LG LGBASE
+    # dlio generates the WHOLE dataset locally before the native-S3 upload, and
+    # the old default (/var/tmp) is the boot disk: a fresh node filled root and
+    # aborted the suite after the earlier legs had already produced numbers.
+    # ~150 MB per train file, plus headroom.
+    LGBASE="$(scratch_pick $(( (NF * 150) / 1024 + 4 )) "${MLPERF_LOCAL_GEN:-}" mlperf-gen)" || {
+      echo "SKIP: mlperf — not enough local scratch to stage the dataset"; return 0; }
+    LG="$LGBASE/resnet50"
+    sudo rm -rf "$LG" 2>/dev/null; sudo mkdir -p "$LG"; sudo chown -R "$(id -u)" "$LGBASE"
+    scratch_report "$LGBASE"
     g0=$(date +%s)
     MEMRUN "$MLPERF_GEN_MEM_CAP" "$DLIO" workload=resnet50_h100 ++workload.dataset.data_folder="$LG" \
       ++workload.dataset.num_files_train="$NF" ++workload.dataset.num_files_eval="$NE" \

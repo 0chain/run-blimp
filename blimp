@@ -353,6 +353,49 @@ for k,v in (("FLEET_URL","fleet_url"),("FLEET_AK","fleet_s3_access_key"),("FLEET
     if val: print("%s=\x27%s\x27" % (k,val))' 2>/dev/null)"
   [ -n "${FLEET_URL:-}" ] && [ -n "${FLEET_AK:-}" ]; }
 
+# ---- an endpoint that points back at THIS node ------------------------------
+# A cloud VM usually cannot connect to its OWN public IP: there is no hairpin
+# NAT, so the packet leaves and never comes back. The fleet endpoint
+# fleet-<account>.blimp.software resolves to exactly that public IP, so on a
+# single-node fleet every upload and every metadata write to it times out.
+# Reported from a fresh GCP node (2026-09-15): "Connect timeout ... worked
+# around by pinning the hostname to 127.0.0.1 in /etc/hosts".
+#
+# Same shape for the gateway's own docker hostname (minioserver:9000), which
+# resolves inside the container network and nowhere else — table registration
+# ran on the HOST and got 0/24.
+#
+# We do not try to work out WHY an address is unreachable (hairpin, split-horizon
+# DNS, a firewall): we probe. If the published address will not open and the same
+# port on loopback will, loopback is the same service one hop shorter — in a
+# fleet EVERY node serves the fleet endpoint, and the gateway on this box serves
+# its own S3. Anything genuinely remote is left alone.
+endpoint_local(){
+  local url="$1"
+  [ -n "$url" ] || { printf '%s' "$url"; return 0; }
+  "${BLIMP_PY:-python3}" - "$url" <<'PYEOF' 2>/dev/null || printf '%s' "$url"
+import socket, sys
+from urllib.parse import urlsplit, urlunsplit
+
+url = sys.argv[1]
+u = urlsplit(url if "://" in url else "http://" + url)
+host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
+if not host or host in ("127.0.0.1", "localhost", "::1"):
+    print(url); raise SystemExit
+
+def opens(h, p, t=3.0):
+    try:
+        with socket.create_connection((h, p), timeout=t):
+            return True
+    except Exception:
+        return False
+
+# Only rewrite when the published address is DEAD and loopback is ALIVE.
+print(url if opens(host, port) or not opens("127.0.0.1", port)
+      else urlunsplit((u.scheme, "127.0.0.1:%d" % port, u.path, u.query, u.fragment)))
+PYEOF
+}
+
 # ---- A. Iceberg catalog: gateway Nessie (default) | stand up here | existing --
 # The gateway ALREADY runs a Nessie that serves Iceberg REST at :19122/iceberg
 # over branch `main`. Registering into it is the internal path: nothing new to
@@ -410,21 +453,47 @@ except Exception: print("")' 2>/dev/null)
 # endpoint — your own bucket, or a MinIO/other-cloud address.
 choose_source_location(){
   local have_fleet=0; fleet_creds && have_fleet=1
+  # Option 2 is THIS node's own gateway S3. It was missing, and its absence was
+  # a dead end on a locked-down box (reported 2026-09-15): if the fleet endpoint
+  # could not be reached, the only other route stood up a fresh MinIO container
+  # on :9000 — which needs a Docker Hub pull that an egress-restricted node
+  # refuses, and collides with the gateway's own minioserver already on :9000.
+  # The gateway is right there, already serving S3, already keyed.
+  # GW_AK/GW_SK are this node's own MinIO root keys, discovered by heal_wiring()
+  # from the local minioserver container (or the admin API when blimp runs off-box).
+  local have_gw=0
+  [ -n "${GW:-}" ] && [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] && have_gw=1
   local c
-  if [ "$have_fleet" = 1 ]; then
-    c=$(pick SOURCE_CHOICE "Dataset (source) location" 1 \
-      "the fleet cache layer — ${FLEET_URL} (default)" \
+  if [ "$have_fleet" = 1 ] || [ "$have_gw" = 1 ]; then
+    c=$(pick SOURCE_CHOICE "Dataset (source) location" "$([ "$have_fleet" = 1 ] && echo 1 || echo 2)" \
+      "the fleet cache layer — ${FLEET_URL:-(unavailable)} (default)" \
+      "this node's own gateway S3 — http://${GW:-?}:${S3_PORT:-9000} (nothing to install)" \
       "another S3 endpoint (your own bucket / MinIO / other cloud)")
   else
-    bold "  (no fleet credentials from the gateway — the fleet option needs a gateway with fleet mode on)"
+    bold "  (no fleet or gateway credentials — falling back to an external S3 endpoint)"
+    c=3
+  fi
+  if [ "$c" = 1 ] && [ "$have_fleet" != 1 ]; then
+    bold "  ! the fleet option needs a gateway with fleet mode on — using this node's gateway S3 instead"
     c=2
+  fi
+  if [ "$c" = 2 ] && [ "$have_gw" != 1 ]; then
+    bold "  ! could not read this node's gateway S3 credentials — choose an external endpoint"
+    c=3
   fi
   case "$c" in
     1) SOURCE_TARGET=fleet
        S3_ENDPOINT="$FLEET_URL"; S3_KEY="$FLEET_AK"; S3_SECRET="$FLEET_SK"
        ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Bucket on the fleet endpoint" "blimp-src")
        bold "  source → $S3_ENDPOINT/$ORIGIN_BUCKET (fleet keys, fetched from the gateway)" ;;
-    2) SOURCE_TARGET=external
+    2) SOURCE_TARGET=gateway
+       # The gateway's own S3, reached on loopback from this box. No container to
+       # pull, no port to fight over, and the keys come from the node itself.
+       S3_ENDPOINT="http://${GW}:${S3_PORT:-9000}"
+       S3_KEY="$GW_AK"; S3_SECRET="$GW_SK"
+       ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Bucket on this node's gateway S3" "blimp-src")
+       bold "  source → $S3_ENDPOINT/$ORIGIN_BUCKET (this node's gateway, keys read locally)" ;;
+    3) SOURCE_TARGET=external
        ORIGIN_BUCKET=$(ask ORIGIN_BUCKET "  Data bucket (blank = generate one here)")
        [ -n "$ORIGIN_BUCKET" ] && S3_ENDPOINT=$(ask S3_ENDPOINT "  S3 endpoint URL of that bucket (MinIO/Ceph/R2/any cloud, e.g. http://minio:9000; blank = your cloud's S3 in $REGION)" "https://s3.${REGION}.amazonaws.com")
        # INCOMPATIBLE PAIR. The gateway's Nessie can only write table metadata
@@ -453,12 +522,21 @@ choose_dataset(){
   local c; c=$(pick BUILD_DATASET "Build a TPC-DS test dataset at that location?" 1 \
     "yes (default)" "no — I will bring my own data")
   if [ "$c" != 1 ]; then BUILD_DATASET=0; export BUILD_DATASET; return 0; fi
+  # Generation stages the whole dataset on local disk before upload, so the
+  # sizes below are what the SCRATCH disk needs, not just the bucket. Anything
+  # past SF1000 wants a dedicated data disk — scratch_pick() refuses up front
+  # rather than filling root mid-run.
   local sf; sf=$(pick SF_CHOICE "Scale factor" 1 \
-    "SF1    ~1 GB   (default — minutes)" \
-    "SF10   ~10 GB  (tens of minutes)" \
-    "SF100  ~100 GB (hours)" \
-    "SF1000 ~1 TB   (many hours; needs a big box + disk)")
-  case "$sf" in 1) BLIMP_SF=1;; 2) BLIMP_SF=10;; 3) BLIMP_SF=100;; 4) BLIMP_SF=1000;; esac
+    "SF1      ~1 GB    (default — minutes)" \
+    "SF10     ~10 GB   (tens of minutes)" \
+    "SF100    ~100 GB  (hours)" \
+    "SF1000   ~1 TB    (many hours; needs a big box + disk)" \
+    "SF10000  ~10 TB   (days; needs a dedicated data disk)" \
+    "SF100000 ~100 TB  (fleet scale; plan the disk before you pick this)")
+  case "$sf" in
+    1) BLIMP_SF=1;; 2) BLIMP_SF=10;; 3) BLIMP_SF=100;; 4) BLIMP_SF=1000;;
+    5) BLIMP_SF=10000;; 6) BLIMP_SF=100000;;
+  esac
   BUILD_DATASET=1; SF_CHOICE="$sf"; export BUILD_DATASET BLIMP_SF SF_CHOICE
   bold "  will generate TPC-DS SF${BLIMP_SF} and register it into the catalog"
 }
@@ -683,13 +761,23 @@ PY
   printf '%s' "$cur"
 }
 
+# IMDS is AWS-specific. On GCP and Azure the SAME address answers, with an HTML
+# error page — which used to be stored as the node's "IP" and printed mid-run
+# (reported from a GCP node, 2026-09-15). Accept a value only if it looks like
+# what was asked for; off AWS that yields empty, which is a no-op, not an error.
+imds_ipv4(){
+  local v; v=$(curl -s -m 2 "$@" 2>/dev/null) || return 0
+  case "$v" in ""|*[!0-9.]*) return 0;; esac
+  case "$v" in *.*.*.*) printf '%s' "$v";; esac
+}
+
 assess_mode(){
   MODE=external; GW_PRIV=""; GW_PUB=""
   local imds="http://169.254.169.254/latest/meta-data" tok
   tok=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null)
   local H=(); [ -n "$tok" ] && H=(-H "X-aws-ec2-metadata-token: $tok")
-  CLIENT_PRIV=$(curl -s -m 2 "${H[@]}" "$imds/local-ipv4" 2>/dev/null)
-  CLIENT_PUB=$(curl -s -m 2 "${H[@]}" "$imds/public-ipv4" 2>/dev/null)
+  CLIENT_PRIV=$(imds_ipv4 "${H[@]}" "$imds/local-ipv4")
+  CLIENT_PUB=$(imds_ipv4 "${H[@]}" "$imds/public-ipv4")
   # discover the cluster gateway's private IP (needs aws CLI + creds + a running gw)
   if command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then
     read -r GW_PRIV GW_PUB <<<"$(aws ec2 describe-instances --region "$CLUSTER_REGION" \
@@ -863,7 +951,7 @@ cmd_setup(){
     local gen
     gen=$(REGION="$REGION" CLUSTER_ID="$CLUSTER_ID" ADVERTISE_HOST="${ADVERTISE_HOST:-}" \
       BLIMP_SF="${BLIMP_SF:-1}" BLIMP_DATA_TARGET="${SOURCE_TARGET:-external}" \
-      FLEET_ENDPOINT="${S3_ENDPOINT:-}" FLEET_KEY="${S3_KEY:-}" FLEET_SECRET="${S3_SECRET:-}" \
+      FLEET_ENDPOINT="$(endpoint_local "${S3_ENDPOINT:-}")" FLEET_KEY="${S3_KEY:-}" FLEET_SECRET="${S3_SECRET:-}" \
       FLEET_BUCKET="${ORIGIN_BUCKET:-}" \
       bash "$HERE/standup_data.sh") || die "SF${BLIMP_SF} data standup failed"
     eval "$gen"                      # sets ORIGIN_BUCKET WAREHOUSE S3_ENDPOINT [S3_KEY S3_SECRET] REGION
@@ -939,14 +1027,20 @@ cmd_setup(){
     local reg_wh="$WAREHOUSE"
     [ -n "${ICEBERG_WAREHOUSE:-}" ] && reg_wh="$ICEBERG_WAREHOUSE"
     bold "registering the 24 TPC-DS SF${BLIMP_SF:-1} tables into $cat_url (warehouse $reg_wh)"
-    local reg_ep=""; case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint http://localhost:9000";; esac
-    # The fleet endpoint is not loopback and is key-authenticated, so pass it and
-    # the keys through explicitly instead of relying on this box's IAM role.
+    # Registration runs on the HOST, so it needs an address the host can reach:
+    # not the gateway's docker-internal minioserver:9000, and not a fleet
+    # hostname that resolves to this node's own un-hairpinnable public IP.
+    # endpoint_local() probes and rewrites only when loopback actually serves it.
+    local reg_ep=""
+    case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")";; esac
+    # The fleet endpoint is key-authenticated, so pass it and the keys through
+    # explicitly instead of relying on this box's IAM role.
     local reg_keys=""
-    if [ "${SOURCE_TARGET:-}" = fleet ]; then
-      reg_ep="--s3-endpoint $S3_ENDPOINT"
-      reg_keys="--s3-key $S3_KEY --s3-secret $S3_SECRET"
-    fi
+    case "${SOURCE_TARGET:-}" in
+      fleet|gateway)
+        reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")"
+        reg_keys="--s3-key $S3_KEY --s3-secret $S3_SECRET" ;;
+    esac
     # shellcheck disable=SC2086  # reg_ep/reg_keys/pfx_flag are intentional flag pairs
     AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
       "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog "$cat_url" \
@@ -998,7 +1092,10 @@ cmd_setup(){
     # prelude already uses (ZS3_DUCKDB_S3_ENDPOINT=http://localhost:9000), so
     # send that plus the gateway's own root keys, which heal_wiring keeps fresh.
     HOOK_EP="${S3_ENDPOINT:-}"; HOOK_KEY="${S3_KEY:-}"; HOOK_SEC="${S3_SECRET:-}"
-    if [ "${SOURCE_TARGET:-}" = fleet ]; then
+    # `gateway` lands here too: the data is on this node's own S3, so the gateway
+    # must read it on its own loopback rather than back out through its public
+    # address — the same reasoning as for the fleet upload path.
+    case "${SOURCE_TARGET:-}" in fleet|gateway)
       # The gateway's own root keys are fetched LATER in this run ("finishing
       # setup"), which is after this call — so populate them now. heal_wiring
       # reads them from the local minioserver container when co-located (the
@@ -1007,8 +1104,8 @@ cmd_setup(){
       [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || heal_wiring
       HOOK_EP="http://localhost:9000"
       HOOK_KEY="${GW_AK:-$HOOK_KEY}"; HOOK_SEC="${GW_SK:-$HOOK_SEC}"
-      bold "  source endpoint for the gateway: $HOOK_EP (its own zs3 — the fleet URL is the upload path only)"
-    fi
+      bold "  source endpoint for the gateway: $HOOK_EP (its own zs3 — the published URL is the upload path only)"
+    ;; esac
     # CATALOG URL FOR THE GATEWAY. With the gateway's own Nessie (catalog option
     # 1) this CLI reaches it at http://<GW>:19122/iceberg — the HOST port — but
     # the gateway runs in a container, where a 127.0.0.1 address is loopback to

@@ -211,9 +211,14 @@ DIM_BY_SUFFIX = [
     ("reason_sk",       ("reason", "r_reason_sk")),
 ]
 
-# Fallback dimension key ranges, used ONLY when the catalog cannot be read.
-# These are SF1000 values (measured on test2 2026-08-04) and are WRONG at other
-# scale factors — which is exactly why the catalog is the primary source.
+# LAST-RESORT dimension key ranges, used only when neither the catalog stats nor
+# a column scan can be read (i.e. the table is unreachable, not merely
+# stats-less). These are SF1000 values and are WRONG at every other scale:
+# measured against the TPC-DS row counts they over-state item by 94% at SF1,
+# 66% at SF10 and 32% at SF100, and customer by 99/96/83%. A key drawn above a
+# dimension's real max cannot join, so using these silently folds most of the
+# delta away — at SF1 to zero (visible), at SF100 to a plausible-looking but
+# wrong number (worse). scan_dim_hi() exists so this is essentially never hit.
 FALLBACK_DIM_HI = {
     "date_dim": 2488070, "time_dim": 86399, "item": 300000, "customer": 12000000,
     "customer_demographics": 1920800, "household_demographics": 7200,
@@ -568,6 +573,53 @@ def catalog_bounds(cat, namespace, table, col, min_rows=0):
         return None, None
 
 
+def scan_dim_hi(cat, namespace, table, col):
+    """max(col) read from the DATA, for when manifest statistics are missing.
+
+    Iceberg only records lower/upper bounds when the parquet files carry column
+    statistics; files written without them leave catalog_bounds() blind (the
+    same condition that prints "statistics missing for column N"). Scanning is
+    the difference between a bound that is EXACT AT ANY SCALE FACTOR and a
+    constant that is only right at the one scale it was measured on.
+
+    Projects a SINGLE key column of a DIMENSION table, and streams it: the max
+    is folded batch by batch so peak memory is one batch, not one column. That
+    matters at the top of the range — customer is 2M rows at SF100 but 65M at
+    SF10000 and 100M at SF100000, where materialising the column would be
+    hundreds of MB for a single number."""
+    try:
+        t = cat.load_table((namespace, table))
+        scan = t.scan(selected_fields=(col,))
+
+        def _fold(colv, best):
+            try:
+                import pyarrow.compute as pc
+                v = pc.max(colv).as_py()
+            except Exception:
+                # No pyarrow.compute, or a non-arrow column.
+                vals = [x for x in colv.to_pylist() if x is not None]
+                v = max(vals) if vals else None
+            return v if best is None else (best if v is None else max(best, v))
+
+        best = None
+        reader = getattr(scan, "to_arrow_batch_reader", None)
+        if reader is not None:
+            try:
+                for batch in reader():
+                    if batch.num_rows:
+                        best = _fold(batch.column(0), best)
+                return int(best) if best is not None else None
+            except Exception:
+                best = None  # fall through to the whole-column read
+        arrow = scan.to_arrow()
+        if arrow.num_rows == 0:
+            return None
+        best = _fold(arrow.column(col), best)
+        return int(best) if best is not None else None
+    except Exception:
+        return None
+
+
 def load_dim_hi(cat, namespace, dimtables, verbose=True):
     """dimension table -> max surrogate key, read from the LIVE catalog.
 
@@ -580,11 +632,22 @@ def load_dim_hi(cat, namespace, dimtables, verbose=True):
     for d in dimtables:
         keycol = next((k for s, (t, k) in DIM_BY_SUFFIX if t == d), None)
         lo, hi = catalog_bounds(cat, namespace, d, keycol) if keycol else (None, None)
+        src = "stats"
+        if hi is None and keycol:
+            # Manifest stats missing (not the table). Read the real max instead
+            # of guessing: a scanned bound is correct at SF1, SF10, SF100 and
+            # SF1000 alike, where the constant below is correct at exactly one.
+            hi = scan_dim_hi(cat, namespace, d, keycol)
+            src = "scan"
         if hi is None:
             hi = FALLBACK_DIM_HI.get(d)
+            src = "SF1000 constant"
             if verbose:
-                print(f"   WARN: {d}.{keycol} bounds unreadable; falling back to "
-                      f"SF1000 value {hi} — keys may not join at this scale factor")
+                print(f"   WARN: {d}.{keycol} unreadable by stats AND by scan; "
+                      f"falling back to the SF1000 constant {hi} — at a smaller "
+                      f"scale factor most appended keys will NOT join")
+        elif src == "scan" and verbose:
+            print(f"   {d}.{keycol} <= {hi} (scanned; manifest stats missing)")
         out[d] = hi
     if verbose and out:
         print("   dim key ranges from catalog: "

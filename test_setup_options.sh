@@ -281,5 +281,100 @@ case "$g2" in
   *) bad "unresolvable id fell back to a dead legacy name: $g2" ;;
 esac
 
-printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]
+
+# ---------------------------------------------------- scale factors ----
+# A fresh cloud node reported (2026-09-15) that the SF picker stopped at SF1000.
+# The generator is duckdb's dsdgen(sf=N), which takes any N; the only real limit
+# is local scratch, which scratch_pick() now checks up front.
+case_ "scale factors offered"
+
+SF_BLOCK=$(sed -n '/pick SF_CHOICE/,/esac/p' "$HERE/blimp")
+for sf in 1 10 100 1000 10000 100000; do
+  if printf '%s' "$SF_BLOCK" | grep -q "BLIMP_SF=$sf;"; then ok "SF$sf selectable"
+  else bad "SF$sf missing from the picker"; fi
+done
+# The mapping must be 1:1 — a duplicated case arm silently generates the wrong
+# size, which at these scales is hours of wasted generation.
+DUPES=$(printf '%s' "$SF_BLOCK" | grep -o 'BLIMP_SF=[0-9]*' | sort | uniq -d)
+eq "$DUPES" "" "each menu entry maps to a distinct scale factor"
+
+# ------------------------------------------- gateway-S3 source option ----
+# Reported: with the fleet endpoint unreachable, the only other route stood up a
+# MinIO container on :9000 — a Docker Hub pull a locked-down box refuses, and a
+# port collision with the gateway's own minioserver. The node's own gateway S3
+# is right there.
+case_ "dataset source options"
+
+SRC_BLOCK=$(sed -n '/choose_source_location(){/,/^}/p' "$HERE/blimp")
+printf '%s' "$SRC_BLOCK" | grep -q "SOURCE_TARGET=gateway" \
+  && ok "the node's own gateway S3 is offered as a source" \
+  || bad "no gateway-S3 source option"
+printf '%s' "$SRC_BLOCK" | grep -q 'GW_AK' \
+  && ok "gateway source uses the node's own MinIO root keys" \
+  || bad "gateway source does not use GW_AK/GW_SK"
+# It must degrade, not dead-end: no fleet AND no gateway keys still has to reach
+# the external branch rather than leaving SOURCE_TARGET unset.
+printf '%s' "$SRC_BLOCK" | grep -q 'c=3' \
+  && ok "falls through to an external endpoint when neither is available" \
+  || bad "no fallback when fleet and gateway are both unavailable"
+
+# standup_data.sh must route `gateway` the same way it routes `fleet` — both are
+# "an S3 endpoint plus keys the caller already resolved".
+grep -q 'fleet|gateway' "$HERE/standup_data.sh" \
+  && ok "standup_data.sh uploads a gateway source like a fleet source" \
+  || bad "standup_data.sh does not handle BLIMP_DATA_TARGET=gateway"
+
+# ------------------------------------------------ unreachable endpoints ----
+# The fleet hostname resolves to the node's OWN public IP, which a cloud VM
+# cannot hairpin to; the gateway's minioserver:9000 resolves only inside docker.
+# endpoint_local() probes and rewrites to loopback ONLY when loopback serves it.
+case_ "endpoints that point back at this node"
+
+EL=$(sed -n '/^endpoint_local(){/,/^}/p' "$HERE/blimp")
+[ -n "$EL" ] && ok "endpoint_local exists" || bad "endpoint_local missing"
+printf '%s' "$EL" | grep -q '127.0.0.1' \
+  && ok "rewrites to loopback" || bad "no loopback rewrite"
+# The safety property: never rewrite an endpoint that is genuinely reachable.
+printf '%s' "$EL" | grep -q 'opens(host, port)' \
+  && ok "leaves a reachable endpoint alone" \
+  || bad "does not check the published address first"
+
+for site in 'FLEET_ENDPOINT="$(endpoint_local' 'reg_ep="--s3-endpoint $(endpoint_local'; do
+  grep -qF "$site" "$HERE/blimp" \
+    && ok "applied at: ${site%%=*}" || bad "not applied at ${site%%=*}"
+done
+
+# ------------------------------------------------------- scratch space ----
+# The mlperf leg wrote ~33 GiB to /var/tmp (boot disk) and aborted the whole
+# suite with ENOSPC after earlier legs had already produced numbers.
+case_ "local scratch is sized before it is used"
+
+[ -f "$HERE/scratch_dir.sh" ] && ok "scratch_dir.sh present" || bad "scratch_dir.sh missing"
+grep -q 'scratch_pick' "$HERE/standup_data.sh" \
+  && ok "dataset generation sizes its scratch" || bad "generation still assumes the boot disk"
+grep -q 'scratch_pick' "$HERE/run_cluster.sh" \
+  && ok "mlperf gen sizes its scratch" || bad "mlperf gen still defaults to /var/tmp"
+# Check the duckdb INVOCATION, not any mention of /tmp: the script also cleans
+# up the old boot-disk path for anyone upgrading, which is not a regression.
+if grep -E '^\s*duckdb "' "$HERE/standup_data.sh" | grep -q 'SF_SCRATCH'; then
+  ok "duckdb working DB is staged off the boot disk"
+else
+  bad "duckdb still opens its working DB on the boot disk"
+fi
+
+# ------------------------------------------------------ cloud portability ----
+# IMDS is AWS-only; other clouds answer the same URL with an HTML error page,
+# which used to be stored as an IP/region and printed mid-run.
+case_ "non-AWS clouds"
+
+grep -q 'imds_ipv4' "$HERE/blimp" \
+  && ok "IMDS responses are shape-checked before use" \
+  || bad "IMDS responses used unvalidated"
+sed -n '/placement\/region/,+2p' "$HERE/run_cluster.sh" | grep -q 'a-z\]\[a-z\]-' \
+  && ok "region is shape-checked before use" || bad "region used unvalidated"
+
+
+printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
+# Exit non-zero on failure so CI and `blimp --selftest` actually gate on this.
+[ "$FAIL" -eq 0 ]

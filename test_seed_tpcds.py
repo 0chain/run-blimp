@@ -586,3 +586,84 @@ class StringDomainsTest(unittest.TestCase):
         cols = [("i_item_sk", "l"), ("i_category", "s")]
         out = S.gen_table_cols("item", cols, 5, date_lo=1, date_hi=2, dim_hi={}, key_base=1, rnd=random.Random(1))
         self.assertEqual(out["i_category"][0], "i_category:1")
+
+
+class TestDimBoundsAreScaleFree(unittest.TestCase):
+    """The seeder must derive dimension key bounds from the DATA, never from a
+    constant measured at one scale factor.
+
+    Reported from a fresh on-prem node (2026-09-15): at SF1 the CDC tick logged
+    "bounds unreadable; falling back to SF1000 value" and the delta-merge folded
+    0 rows. The cause is not SF1 — it is that Iceberg only exposes bounds when
+    the parquet carries column statistics, and without them the code guessed
+    SF1000. Against the TPC-DS row counts that constant over-states `item` by
+    94% at SF1, 66% at SF10 and 32% at SF100, so keys drawn above the real max
+    cannot join. SF1 fails visibly; SF100 would fail QUIETLY with a plausible
+    but wrong delta."""
+
+    class _Col:
+        """Minimal stand-in for an arrow column: only to_pylist() is needed."""
+        def __init__(self, vals):
+            self.vals = vals
+        def to_pylist(self):
+            return self.vals
+
+    class _FakeCat:
+        """Catalog whose manifests carry no statistics — the reported condition."""
+        def __init__(self, maxes):
+            self.maxes = maxes
+            self.scanned = []
+
+        def load_table(self, ident):
+            table = ident[1]
+            outer = self
+
+            class _Arrow:
+                def __init__(self, n):
+                    self.num_rows = n
+                def column(self, _c):
+                    return outer.maxes[table]
+
+            class _Scan:
+                def to_arrow(self_inner):
+                    outer.scanned.append(table)
+                    return _Arrow(1)
+
+            class _T:
+                def scan(self_inner, selected_fields=None):
+                    return _Scan()
+
+            return _T()
+
+    def _run(self, maxes):
+        cat = self._FakeCat({k: self._Col([1, v, 2]) for k, v in maxes.items()})
+        # catalog_bounds returns (None, None) here because _FakeCat has no
+        # plan_files — exactly the stats-less case.
+        return S.load_dim_hi(cat, "tpcds_sf1", list(maxes), verbose=False), cat
+
+    def test_scans_the_real_max_when_stats_are_missing(self):
+        for sf, maxes in (
+            ("SF1", {"item": 18000, "customer": 100000, "store": 12}),
+            ("SF10", {"item": 102000, "customer": 500000, "store": 102}),
+            ("SF100", {"item": 204000, "customer": 2000000, "store": 402}),
+        ):
+            with self.subTest(sf=sf):
+                out, cat = self._run(maxes)
+                self.assertEqual(out, maxes, f"{sf}: must use the scanned max")
+                self.assertEqual(sorted(cat.scanned), sorted(maxes),
+                                 f"{sf}: every dimension must be scanned")
+
+    def test_never_returns_the_sf1000_constant_when_data_is_readable(self):
+        """The regression itself: SF1's item is 18000, not 300000."""
+        out, _ = self._run({"item": 18000})
+        self.assertEqual(out["item"], 18000)
+        self.assertNotEqual(out["item"], S.FALLBACK_DIM_HI["item"],
+                            "fell back to the SF1000 constant with data available")
+
+    def test_constant_is_only_used_when_the_table_is_unreachable(self):
+        class _Dead:
+            def load_table(self, ident):
+                raise RuntimeError("table unreachable")
+        out = S.load_dim_hi(_Dead(), "tpcds_sf1", ["item"], verbose=False)
+        self.assertEqual(out["item"], S.FALLBACK_DIM_HI["item"],
+                         "a truly unreachable table still needs some bound")

@@ -14,9 +14,16 @@
 # Everything human-facing goes to stderr so stdout is clean to eval.
 set -uo pipefail
 SF="${BLIMP_SF:-1}"
+# shellcheck source=scratch_dir.sh
+. "$(dirname "${BASH_SOURCE[0]}")/scratch_dir.sh"
+# duckdb's working database plus the parquet output both land locally before the
+# upload. Budget ~2x the scale factor in GB (the .duckdb file and the parquet
+# tree), with a 2 GB floor so SF1 does not demand a whole gigabyte for nothing.
+SF_NEED_GB=$(( SF * 2 )); [ "$SF_NEED_GB" -lt 2 ] && SF_NEED_GB=2
+SF_SCRATCH="$(scratch_pick "$SF_NEED_GB" "${BLIMP_SCRATCH:-}" "sf${SF}")" || exit 1
 REGION="${REGION:-ap-south-1}"
 CLUSTER_ID="${CLUSTER_ID:-local}"
-OUT="${BLIMP_DATA_DIR:-$HOME/.blimp_sf${SF}}"
+OUT="${BLIMP_DATA_DIR:-$SF_SCRATCH/data}"
 log(){ printf '\033[1m[data]\033[0m %s\n' "$*" >&2; }
 die(){ printf '\033[31m[data] FATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 # All 24 TPC-DS tables — must match register_tpcds_tables.py's TPCDS_TABLES
@@ -50,9 +57,12 @@ if [ "$NEED_GEN" = 1 ]; then
   mkdir -p "$OUT"; COPIES=""
   for t in $TABLES; do mkdir -p "$OUT/$t"; COPIES="$COPIES COPY $t TO '$OUT/$t/data.parquet' (FORMAT PARQUET);"; done
   # temp on-disk db so a small box (4 GiB) doesn't OOM building SF1 in memory
-  rm -f /tmp/_sf${SF}.duckdb
-  duckdb "/tmp/_sf${SF}.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=${SF}); $COPIES" >&2 \
+  rm -f "$SF_SCRATCH/_sf${SF}.duckdb"
+  scratch_report "$SF_SCRATCH"
+  duckdb "$SF_SCRATCH/_sf${SF}.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=${SF}); $COPIES" >&2 \
     || die "SF${SF} generation failed (duckdb tpcds dsdgen)"
+  rm -f "$SF_SCRATCH/_sf${SF}.duckdb"   # the parquet tree is the artefact; reclaim the working DB
+  # Upgrade hygiene: earlier versions staged the working DB on the boot disk.
   rm -f "/tmp/_sf${SF}.duckdb"; touch "$OUT/.done"
   log "generated $(du -sh "$OUT" 2>/dev/null | awk '{print $1}') across 24 tables in $OUT"
 fi
@@ -102,7 +112,7 @@ minio_source(){
 fleet_source(){
   local ep="${FLEET_ENDPOINT:?FLEET_ENDPOINT required}" bkt="${FLEET_BUCKET:-blimp-sf${SF}}"
   command -v aws >/dev/null || die "awscli not installed — needed to upload to the fleet S3 endpoint"
-  log "uploading SF${SF} to the fleet cache layer: $ep (bucket $bkt)"
+  log "uploading SF${SF} to ${BLIMP_DATA_TARGET:-fleet} S3: $ep (bucket $bkt)"
   # The fleet endpoint is HTTPS with the cluster's own cert; --no-verify-ssl keeps
   # a private/self-signed CA from blocking the load. Path-style: the fleet address
   # is a single host, not per-bucket virtual hosts.
@@ -123,11 +133,17 @@ fleet_source(){
   echo "REGION=${AWS_DEFAULT_REGION}"
 }
 
-if [ "${BLIMP_DATA_TARGET:-}" = fleet ]; then
-  fleet_source
-  log "SF${SF} data source ready"
-  exit 0
-fi
+# `gateway` is the same shape as `fleet`: an S3 endpoint plus keys that the
+# caller already resolved — only the address differs (this node's own gateway
+# rather than the fleet address). Routing it here is what makes "use the S3
+# that is already running on this box" possible without pulling a MinIO
+# container that would collide with it on :9000.
+case "${BLIMP_DATA_TARGET:-}" in
+  fleet|gateway)
+    fleet_source
+    log "SF${SF} data source ready"
+    exit 0 ;;
+esac
 
 ON_AWS=0; curl -s -m 2 -o /dev/null http://169.254.169.254/latest/meta-data/ 2>/dev/null && ON_AWS=1
 
