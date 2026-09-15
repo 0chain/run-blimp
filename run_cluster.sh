@@ -31,9 +31,20 @@ OSZ="${WARP_OBJ_SIZE:-96MiB}"
 #   8/1 -> warp-conc 64,
 #          mlperf resnet50 accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain=136*7
 d="${EC%%/*}"
-if [ "$d" -ge 8 ]; then EC_CONC=64
+# WARP CONCURRENCY = GATEWAY vCPUs, matching run_bench.sh (the script the panel
+# runs, zs3-init.go: `EC_CONC=$_gwcpu`). This used to be a flat 64 (>=8 shards)
+# or 16, which is the single biggest reason a CLI warp number did not match the
+# UI's on the SAME box: on an 8-vCPU gateway the CLI drove conc=64 against the
+# UI's 8. run_bench caps at this value deliberately — "empirically >EC_CONC
+# degrades throughput for that EC width — client contention" — so the flat tiers
+# were also over-driving the client and measuring warp's own contention rather
+# than the storage. The reader concurrency below was aligned for exactly this
+# reason; warp was missed. WARP_CONC still overrides, which is how you
+# deliberately push a small cluster past its vCPU count.
+_gwcpu=$(nproc 2>/dev/null || echo 8)
+if [ "$d" -ge 8 ]; then EC_CONC=$_gwcpu
   EC_DATASET_GB=136; EC_ACCEL="${MLPERF_ACCEL:-6}"; EC_RT=24; EC_PF=48
-else                    EC_CONC=16
+else                    EC_CONC=$_gwcpu
   # 45 GiB set: still > the 32 GiB gateway RAM (so the warp GET / mlperf read can NOT
   # be served from page cache), but sized to FIT the small 2/1 on-prem allocation
   # (~64 GiB usable on an 8x12GB cluster). The old 68 GiB overfilled it to 90%+ and
@@ -63,7 +74,6 @@ else                    EC_CONC=16
   # less read concurrency than the panel's bench on the same box — another reason
   # a CLI number could never be compared to a UI number. MLPERF_RT/MLPERF_PF
   # override for the fleet-concurrency case the old flat values were chosen for.
-  _gwcpu=$(nproc 2>/dev/null || echo 8)
   EC_RT="${MLPERF_RT:-$_gwcpu}"; EC_PF="${MLPERF_PF:-$(( EC_RT * 2 ))}"
   EC_ACCEL="${MLPERF_ACCEL:-1}"; fi
 # WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster

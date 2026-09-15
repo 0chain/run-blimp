@@ -375,6 +375,43 @@ sed -n '/placement\/region/,+2p' "$HERE/run_cluster.sh" | grep -q 'a-z\]\[a-z\]-
   && ok "region is shape-checked before use" || bad "region used unvalidated"
 
 
+# ------------------------------------------------- CLI vs UI comparability ----
+# The panel runs run_bench.sh (embedded in zs3-init.go); the CLI runs
+# run_cluster.sh. They measure the same box, so their knobs must agree or the two
+# numbers are not comparable — which is exactly what was reported. warp
+# concurrency was the outlier: a flat 64 (>=8 shards) / 16 in the CLI against the
+# panel's "gateway vCPUs", i.e. 8x apart on an 8-vCPU gateway, on the single knob
+# that most moves the result.
+case_ "CLI benchmark knobs match the panel's"
+
+RC="$HERE/run_cluster.sh"
+
+# warp concurrency: vCPU-derived, not a flat tier.
+if grep -qE '^_gwcpu=\$\(nproc' "$RC" && grep -qE 'EC_CONC=\$_gwcpu' "$RC"; then
+  ok "warp concurrency derives from gateway vCPUs"
+else
+  bad "warp concurrency is not vCPU-derived — CLI and panel numbers diverge"
+fi
+grep -qE 'EC_CONC=(64|16)$' "$RC" \
+  && bad "a flat warp-concurrency tier is still present" \
+  || ok "no flat 64/16 warp tier remains"
+
+# The reader concurrency alignment that was already done — keep it.
+grep -qF 'EC_RT="${MLPERF_RT:-$_gwcpu}"' "$RC" \
+  && ok "mlperf read threads = gateway vCPUs (matches the panel)" \
+  || bad "mlperf rt no longer matches the panel"
+grep -qF 'EC_PF="${MLPERF_PF:-$(( EC_RT * 2 ))}"' "$RC" \
+  && ok "mlperf prefetch = rt*2 (matches the panel)" \
+  || bad "mlperf pf no longer matches the panel"
+
+# The override has to survive: it is how you deliberately push past vCPU count.
+grep -qF 'EC_CONC="${WARP_CONC:-$EC_CONC}"' "$RC" \
+  && ok "WARP_CONC still overrides" || bad "WARP_CONC override lost"
+
+# Object size must match too, or the throughput figures are not comparable.
+grep -qF 'OSZ="${WARP_OBJ_SIZE:-96MiB}"' "$RC" \
+  && ok "warp object size 96MiB (matches the panel)" || bad "warp object size drifted"
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 # Exit non-zero on failure so CI and `blimp --selftest` actually gate on this.
 [ "$FAIL" -eq 0 ]
