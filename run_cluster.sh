@@ -31,20 +31,19 @@ OSZ="${WARP_OBJ_SIZE:-96MiB}"
 #   8/1 -> warp-conc 64,
 #          mlperf resnet50 accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain=136*7
 d="${EC%%/*}"
-# WARP CONCURRENCY = GATEWAY vCPUs, matching run_bench.sh (the script the panel
-# runs, zs3-init.go: `EC_CONC=$_gwcpu`). This used to be a flat 64 (>=8 shards)
-# or 16, which is the single biggest reason a CLI warp number did not match the
-# UI's on the SAME box: on an 8-vCPU gateway the CLI drove conc=64 against the
-# UI's 8. run_bench caps at this value deliberately — "empirically >EC_CONC
-# degrades throughput for that EC width — client contention" — so the flat tiers
-# were also over-driving the client and measuring warp's own contention rather
-# than the storage. The reader concurrency below was aligned for exactly this
-# reason; warp was missed. WARP_CONC still overrides, which is how you
-# deliberately push a small cluster past its vCPU count.
+# WARP CONCURRENCY = 2x GATEWAY vCPUs. Measured on a 12-vCPU gateway
+# (37.x, 2026-09-15, 96MiB objects): PUT was 617 MiB/s at 1x (12), 676 MiB/s at
+# 2x (24), and collapsed to 153 MiB/s at a flat 64 — client contention on the
+# write path (GET was flat ~1.1 GiB/s across all three). 2x is the peak; the old
+# flat 64 was ~4.4x too high and under-reported PUT by that much, which is why a
+# CLI warp number never matched reality (the tester saw ~143 MiB/s = the conc=64
+# figure). The panel currently uses 1x (run_bench.sh EC_CONC=$_gwcpu) — safe but
+# ~10% short of peak; run_bench should move to 2x too. WARP_CONC overrides.
 _gwcpu=$(nproc 2>/dev/null || echo 8)
-if [ "$d" -ge 8 ]; then EC_CONC=$_gwcpu
+_warpconc=$(( _gwcpu * 2 ))
+if [ "$d" -ge 8 ]; then EC_CONC=$_warpconc
   EC_DATASET_GB=136; EC_ACCEL="${MLPERF_ACCEL:-6}"; EC_RT=24; EC_PF=48
-else                    EC_CONC=$_gwcpu
+else                    EC_CONC=$_warpconc
   # 45 GiB set: still > the 32 GiB gateway RAM (so the warp GET / mlperf read can NOT
   # be served from page cache), but sized to FIT the small 2/1 on-prem allocation
   # (~64 GiB usable on an 8x12GB cluster). The old 68 GiB overfilled it to 90%+ and
