@@ -30,7 +30,7 @@ scratch_pick(){
   # paths, then the boot-disk fallbacks. A candidate counts only if it exists
   # and we can write to it.
   local c avail best="" best_avail=0
-  for c in /data /data1 /data2 /mnt/data /mnt "$BLIMP_SCRATCH_ROOT" \
+  for c in /data /data1 /data2 /mnt/data /mnt "${BLIMP_SCRATCH_ROOT:-}" \
            /var/0chain /opt /var/tmp /tmp "$HOME"; do
     [ -n "$c" ] && [ -d "$c" ] || continue
     [ -w "$c" ] || sudo test -w "$c" 2>/dev/null || continue
@@ -63,5 +63,8 @@ scratch_pick(){
 scratch_report(){
   local d="$1" avail
   avail=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')
-  echo "  scratch: $d (${avail:-?} GB free on $(df -P "$d" 2>/dev/null | awk 'NR==2{print $6}'))"
+  # To STDERR: this is a human status line; its "(NNN GB free)" text is not a
+  # value and must never land on stdout, where a caller capturing/`eval`-ing the
+  # scratch dir would choke on the parentheses (bash syntax error).
+  echo "  scratch: $d (${avail:-?} GB free on $(df -P "$d" 2>/dev/null | awk 'NR==2{print $6}'))" >&2
 }

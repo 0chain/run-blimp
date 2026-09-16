@@ -1633,9 +1633,17 @@ cmd_query(){
   # With no append there is no delta, so every query fell back to a full
   # re-author (mode='no-delta') and the delta-merge path — the whole point of
   # this suite — was never exercised while the run still reported DONE.
+  # Pin the CDC seeder's S3 endpoint to the node's OWN gateway over loopback:
+  # the tick writes both the parquet DATA and the Iceberg METADATA there, and on
+  # a cloud VM the published fleet endpoint (fleet-<id>.blimp.software:9443 -> the
+  # node's own public IP) can't hairpin, while the catalog vends the container-only
+  # name minioserver:9000 which the host can't resolve. endpoint_local() rewrites
+  # to loopback ONLY when loopback actually serves the port, so a genuinely-remote
+  # external source is left untouched. Mirrors the --setup fix.
+  local Q_S3_ENDPOINT; Q_S3_ENDPOINT="$(endpoint_local "${S3_ENDPOINT:-http://$GW:9000}")"
   exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
     NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
-    S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
+    S3_ENDPOINT="$Q_S3_ENDPOINT" MV_S3_ENDPOINT="$Q_S3_ENDPOINT" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
     QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
     QNRS="${QNRS:-}" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
     SQL_FILES="${SQL_FILES:-}" CDC_TICK_CMD="${CDC_TICK_CMD:-}" \
