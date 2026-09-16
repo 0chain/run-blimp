@@ -410,10 +410,14 @@ choose_catalog(){
   case "$c" in
     1) ICEBERG_URL="http://$GW:19122/iceberg"
        ICEBERG_PREFIX="${ICEBERG_PREFIX:-main}"
-       ICEBERG_URL_LOCAL="$ICEBERG_URL"
+       # Raw Nessie (:19122) is bound to localhost on the node (never exposed).
+       # On-node register/seed/query reach it via loopback — which also sidesteps
+       # the cloud-VM hairpin (a box cannot connect to its own public IP). Remote
+       # query engines use the bearer-gated read-only shim on :19123 instead.
+       ICEBERG_URL_LOCAL="http://127.0.0.1:19122/iceberg"
        export ICEBERG_PREFIX ICEBERG_URL_LOCAL
-       if curl -s -m 8 "$ICEBERG_URL/v1/config" >/dev/null 2>&1; then
-         bold "  using the gateway Nessie catalog — $ICEBERG_URL (branch $ICEBERG_PREFIX)"
+       if curl -s -m 8 "$ICEBERG_URL_LOCAL/v1/config" >/dev/null 2>&1; then
+         bold "  using the gateway Nessie catalog — $ICEBERG_URL_LOCAL (branch $ICEBERG_PREFIX)"
          # Nessie warehouses are SERVER-CONFIGURED AND NAMED. A client cannot ask
          # for an arbitrary path: GET /v1/config?warehouse=s3://blimp-src/wh
          # returns 500 "Warehouse 's3://blimp-src/wh' is not known". The gateway
@@ -422,8 +426,8 @@ choose_catalog(){
          # lands in whatever bucket that name resolves to — not in the data
          # bucket. Probe the name to confirm it before committing to it.
          ICEBERG_WAREHOUSE=$(ask ICEBERG_WAREHOUSE "  Nessie warehouse name" "mv")
-         if curl -sf -m 8 "$ICEBERG_URL/v1/config?warehouse=$ICEBERG_WAREHOUSE" >/dev/null 2>&1; then
-           NESSIE_WAREHOUSE=$(curl -s -m 8 "$ICEBERG_URL/v1/config?warehouse=$ICEBERG_WAREHOUSE" 2>/dev/null \
+         if curl -sf -m 8 "$ICEBERG_URL_LOCAL/v1/config?warehouse=$ICEBERG_WAREHOUSE" >/dev/null 2>&1; then
+           NESSIE_WAREHOUSE=$(curl -s -m 8 "$ICEBERG_URL_LOCAL/v1/config?warehouse=$ICEBERG_WAREHOUSE" 2>/dev/null \
              | "${BLIMP_PY:-python3}" -c 'import json,sys
 try: print(json.load(sys.stdin).get("defaults",{}).get("warehouse","") or "")
 except Exception: print("")' 2>/dev/null)
