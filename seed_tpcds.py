@@ -1254,13 +1254,47 @@ def main():
         print("== CDC tick plan (base=%d rows, returns_ratio=%.3f) =="%(a.rows,a.returns_ratio))
         for x in extras: print(f"   {x}: +{xn}")
         for sf,sn,rf,rn in plan: print(f"   {sf}: +{sn}    {rf}: +{rn}")
-        for x in extras:
-            append_table(cat,fs,a.namespace,x,xn,date_lo=date_lo,date_hi=date_hi,
-                         dim_hi_cache=dim_hi_cache,strict=strict)
-        geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
-        for sf,sn,rf,rn in plan:
-            append_fact(cat,fs,a.namespace,sf,sn,date_lo=date_lo,date_hi=date_hi,
-                        dim_hi_cache=dim_hi_cache,returns_rows=rn,strict=strict,geo=geo)
+        # ALL-OR-NOTHING TICK. Iceberg commits per table (add_files -> one snapshot
+        # each), so a tick that appends 24 tables and then FAILS on table N leaves
+        # the first N-1 appended and the rest not — a partial, referentially-broken
+        # dataset (dims advanced, their facts didn't, or vice versa) that no
+        # rollback ever undid. Snapshot every table this tick will touch BEFORE
+        # writing; on any failure, roll each advanced table back to that snapshot so
+        # the dataset ends EXACTLY as it started, then re-raise so the caller sees
+        # the non-zero exit (bench_cdc.sh prints "CDC TICK FAILED").
+        touched=list(dict.fromkeys(
+            extras + [t for sf,sn,rf,rn in plan for t in (sf,rf) if t]))
+        pre_snap={}
+        for tbl in touched:
+            try:
+                cs=cat.load_table((a.namespace,tbl)).current_snapshot()
+                pre_snap[tbl]=cs.snapshot_id if cs else None
+            except Exception:
+                pre_snap[tbl]=None   # table doesn't exist yet — created this tick
+        try:
+            for x in extras:
+                append_table(cat,fs,a.namespace,x,xn,date_lo=date_lo,date_hi=date_hi,
+                             dim_hi_cache=dim_hi_cache,strict=strict)
+            geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
+            for sf,sn,rf,rn in plan:
+                append_fact(cat,fs,a.namespace,sf,sn,date_lo=date_lo,date_hi=date_hi,
+                            dim_hi_cache=dim_hi_cache,returns_rows=rn,strict=strict,geo=geo)
+        except Exception as tick_err:
+            import sys as _sys
+            print(f"!! CDC tick FAILED ({tick_err}) — rolling back partial appends "
+                  f"so the dataset is left unchanged",file=_sys.stderr)
+            for tbl,snap in pre_snap.items():
+                if snap is None:
+                    continue   # nothing to roll back to (table was new this tick)
+                try:
+                    t=cat.load_table((a.namespace,tbl)); t.refresh()
+                    cur=t.current_snapshot()
+                    if cur is not None and cur.snapshot_id!=snap:
+                        t.manage_snapshots().rollback_to_snapshot(snap).commit()
+                        print(f"   rolled back {tbl} -> snapshot {snap}",file=_sys.stderr)
+                except Exception as rb_err:
+                    print(f"   WARN: could not roll back {tbl}: {rb_err}",file=_sys.stderr)
+            raise
         return
 
     # ---------------- single-table mode (legacy / upsert) -------------------

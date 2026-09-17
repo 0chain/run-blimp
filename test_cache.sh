@@ -56,8 +56,11 @@ export GW GW_AK GW_SK EC REGION
 reap_bench_buckets(){
   [ -n "${BENCH_KEEP:-}" ] && { echo "[reap] BENCH_KEEP set — leaving bench scratch buckets"; return 0; }
   command -v aws >/dev/null 2>&1 || return 0
-  echo "[reap] removing bench scratch buckets (warpbench/warpprobe/ttfb1k/mlperf-bench) to free the allocation disk"
-  for b in warpbench warpprobe ttfb1k mlperf-bench; do
+  # With no args (the EXIT trap) reap EVERYTHING; with args reap just those buckets
+  # (used to free warp scratch BEFORE the mlperf leg — see below).
+  local buckets="${*:-warpbench warpprobe ttfb1k mlperf-bench}"
+  echo "[reap] removing bench scratch buckets ($buckets) to free the allocation disk"
+  for b in $buckets; do
     AWS_ACCESS_KEY_ID="$GW_AK" AWS_SECRET_ACCESS_KEY="$GW_SK" AWS_REGION="${REGION:-us-east-1}" \
       aws s3 rb "s3://$b" --force --endpoint-url "http://$GW:9000" >/dev/null 2>&1 || true
   done
@@ -169,6 +172,12 @@ if want warp; then
   run "1/2 warp TTFB (1KiB, conc=1)"   env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" ttfb 2>&1 | tee -a "$WL"
   run "   warp PUT/GET (96MiB, conc=16)" env GW="$GW" NFS="$GW" EC="$EC" AK="$GW_AK" SK="$GW_SK" "$HERE/run_cluster.sh" warp 2>&1 | tee -a "$WL"
   bl_post "$WB" done warp "$(bl_parse warp "$WL")" "$WL"; rm -f "$WL"
+  # Free the warp PUT/GET scratch NOW, before mlperf generates its ~66 GiB dataset.
+  # Both land on the same small on-prem allocation disk; leaving warp's set resident
+  # until the EXIT trap means the mlperf generate runs on top of it and trips the
+  # gateway's >90% write-threshold (PUT broken pipe). Olyad hit exactly this. Only
+  # when mlperf actually follows; BENCH_KEEP still keeps everything (reap no-ops).
+  if want mlperf; then reap_bench_buckets warpbench warpprobe ttfb1k; fi
 fi
 
 # 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)

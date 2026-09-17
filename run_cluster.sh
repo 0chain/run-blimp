@@ -279,26 +279,33 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # (AU ~45%). accel 1 on a gateway smaller than .4xlarge (<16 vCPU), EC accel (3/4/6)
   # on a .4xlarge or bigger. Needs CLUSTER_ID + the box's IAM ec2:DescribeInstances.
   if [ -z "${MLPERF_ACCELS:-}" ] && [ -n "${CLUSTER_ID:-}" ] && command -v aws >/dev/null 2>&1; then
-    local _reg GWTYPE
+    local _reg GWTYPE _awsreg
     # AWS-only endpoint; other clouds answer the same URL with an HTML error
-    # page. Keep the value only when it is shaped like a region, else fall back
-    # to $REGION below — off AWS this guard simply does not apply.
+    # page. Keep the value only when it is shaped like a region.
     _reg=$(curl -s --max-time 3 http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
     case "${_reg:-}" in [a-z][a-z]-[a-z]*-[0-9]) :;; *) _reg="";; esac
-    # test_cache.sh exports the GATEWAY S3 keys as AWS_ACCESS_KEY_ID/SECRET globally
-    # (for warp/aws-s3 against the gateway endpoint). This describe hits REAL AWS EC2,
-    # so unset those first (env -u) — otherwise it AuthFailures to empty and the guard
-    # silently skips, leaving accel at the EC default on a small gateway.
-    GWTYPE=$(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-      aws ec2 describe-instances --region "${_reg:-${REGION:-us-east-1}}" \
-      --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
-      --query 'Reservations[].Instances[].InstanceType' --output text 2>/dev/null | head -1)
-    [ -z "$GWTYPE" ] && echo "  [mlperf] gw-guard: could not resolve gateway type (CLUSTER_ID=${CLUSTER_ID:-} region=${_reg:-${REGION:-?}}) — accel stays $ACC"
-    case "$GWTYPE" in
-      *.large|*.xlarge|*.2xlarge)
-        [ "$ACC" -gt 1 ] && echo "  [mlperf] gateway $GWTYPE (< .4xlarge) serves the reads -> accel 1 instead of $ACC (small-gateway read guard)"
-        ACC=1 ;;
-    esac
+    # This guard describes an AWS EC2 gateway, so it only applies on AWS: either
+    # IMDS gave a region, or the operator set REGION for an AWS cluster. Off AWS
+    # (on-prem / GCP) there is nothing to describe — skip SILENTLY. (Previously it
+    # ran `aws ec2 describe-instances` anyway and printed a confusing "could not
+    # resolve gateway type" on every GCP/on-prem run — cosmetic, but alarming.)
+    _awsreg="${_reg:-${REGION:-}}"
+    if [ -n "$_awsreg" ]; then
+      # test_cache.sh exports the GATEWAY S3 keys as AWS_ACCESS_KEY_ID/SECRET
+      # globally (for warp/aws-s3 against the gateway endpoint). This describe hits
+      # REAL AWS EC2, so unset those first (env -u) — otherwise it AuthFailures to
+      # empty and the guard silently skips, leaving accel at the EC default.
+      GWTYPE=$(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+        aws ec2 describe-instances --region "$_awsreg" \
+        --filters "Name=tag:Name,Values=cluster-${CLUSTER_ID}-zs3server" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[].Instances[].InstanceType' --output text 2>/dev/null | head -1)
+      [ -z "$GWTYPE" ] && echo "  [mlperf] gw-guard: could not resolve gateway type (CLUSTER_ID=${CLUSTER_ID:-} region=$_awsreg) — accel stays $ACC"
+      case "$GWTYPE" in
+        *.large|*.xlarge|*.2xlarge)
+          [ "$ACC" -gt 1 ] && echo "  [mlperf] gateway $GWTYPE (< .4xlarge) serves the reads -> accel 1 instead of $ACC (small-gateway read guard)"
+          ACC=1 ;;
+      esac
+    fi
   fi
   local BATCH="${MLPERF_BATCH:-1200}" EP="${MLPERF_EPOCHS:-1}"
   local NF="${MLPERF_NUM_FILES:-$(( EC_DATASET_GB * 7 ))}" NE="${MLPERF_NUM_EVAL:-64}"
