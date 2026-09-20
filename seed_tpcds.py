@@ -54,7 +54,7 @@ Plus: web_returns was not a recognised --table at all. It fell through to the
 store_returns branch, which built sr_* columns and add_files'd them into
 web_returns — every wr_* column NULL, i.e. a 100%-dead delta.
 """
-import argparse, random, decimal, os, json
+import argparse, bisect, random, decimal, os, json
 DRY_RUN = False   # --dry-run: build + conform every delta, write nothing
 # NOTE: pyarrow/pyiceberg are imported INSIDE the catalog-facing functions, never
 # at module scope. The generator and its regression tests must run on a plain
@@ -227,29 +227,194 @@ FALLBACK_DIM_HI = {
     "web_page": 3000, "web_site": 54, "reason": 65,
 }
 
-# Key pools from query_pools.py (--key-pools): {"date_sk": [...], "dims": {dim: [...]}}.
-# When a dimension (or the date) has a pool, appended fact rows draw from it so
-# the tick HITS the target query's filters instead of folding to 0 rows.
-KEY_POOLS = {"date_sk": [], "dims": {}}
+# Key pools from query_pools.py (--key-pools). Shape:
+#   {"date_sk": [...],                      union over the wave (legacy)
+#    "dims": {dim: [...]},                  union over the wave (legacy)
+#    "date_by_col": {fact_col: [...]},      union, keyed by the fact column
+#    "queries": [{"name", "date_by_col", "date_sk", "dims"}, ...]}
+#
+# WHY PER-QUERY AND PER-COLUMN, not one flat list (measured 2026-09-19, q72 on
+# node 1788402989672). q72's MV bakes `d1.d_year = 1999`; the gateway's bounds
+# prover refused every tick with
+#     kterm_dimfilter_empty: Δcatalog_sales.cs_sold_date_sk ∈ [2451545,2452640]
+#     vs date_dim.d_date_sk under "d1.d_year = 1999" ∈ [2451180,2451544]
+#     — disjoint, the term contributes no rows
+#     delta_noop: the Δ terms produced 0 rows — no part written
+# 2451545..2452640 is exactly date_sk_bounds([2000,2001,2002]), i.e. the UNIFORM
+# default: no date window reached the sold-date column at all. Two defects made
+# that possible and both are structural, not q72-specific:
+#   1. the pool was ONE list for every fact column. q72 filters cs_sold_date_sk
+#      (via date_dim d1) and q67 filters ss_sold_date_sk (via the bare
+#      date_dim); unioned, each query's own fact gets only a share of its window
+#      and a query whose date_dim instance is NOT the one joined to the sold
+#      date (q72 has three: d1 sold, d2 inventory, d3 ship) gets nothing usable.
+#   2. every column was drawn from the union INDEPENDENTLY, so a row could take
+#      its date from q67 and its demographics keys from q72 and satisfy neither.
+#      q72's MV needs d_year=1999 AND cd_marital_status='D' AND
+#      hd_buy_potential='>10000' on the SAME row.
+# Fix: each appended row is OWNED by one query (round-robin over the queries
+# that constrain this table) and draws its date and its dimension keys from that
+# query's pools. Columns no query constrains keep the uniform draw.
+KEY_POOLS = {"date_sk": [], "dims": {}, "date_by_col": {}, "queries": []}
+
+# Lines describing which window each date column drew from, drained and printed
+# by append_fact / append_table. A structural no-op is then visible IN THE TICK
+# LOG instead of only in the gateway's refusal three minutes later.
+DATE_REPORTS = []
+
+
+def _span(v):
+    return "[%d..%d]x%d" % (min(v), max(v), len(v)) if v else "-"
+
+
+def flush_date_reports():
+    global DATE_REPORTS
+    for line in DATE_REPORTS:
+        print(line)
+    DATE_REPORTS = []
+
 
 def load_key_pools(path):
     global KEY_POOLS
     with open(path) as f:
         d = json.load(f)
-    KEY_POOLS = {"date_sk": list(d.get("date_sk") or []), "dims": {k: list(v) for k, v in (d.get("dims") or {}).items() if v}}
-    print("   key pools: %d date(s), %s" % (len(KEY_POOLS["date_sk"]), {k: len(v) for k, v in KEY_POOLS["dims"].items()}))
+    qs = []
+    for q in (d.get("queries") or []):
+        e = {"name": q.get("name") or "?",
+             "date_by_col": {k: list(v) for k, v in (q.get("date_by_col") or {}).items() if v},
+             "date_sk": list(q.get("date_sk") or []),
+             "dims": {k: list(v) for k, v in (q.get("dims") or {}).items() if v}}
+        if e["date_by_col"] or e["dims"]:
+            qs.append(e)
+    KEY_POOLS = {
+        "date_sk": list(d.get("date_sk") or []),
+        "dims": {k: list(v) for k, v in (d.get("dims") or {}).items() if v},
+        "date_by_col": {k: list(v) for k, v in (d.get("date_by_col") or {}).items() if v},
+        "queries": qs,
+    }
+    print("   key pools: %d date(s) [union], dims %s"
+          % (len(KEY_POOLS["date_sk"]), {k: len(v) for k, v in KEY_POOLS["dims"].items()}))
+    for q in qs:
+        print("   key pools: %s -> dates %s; dims %s"
+              % (q["name"],
+                 {c: _span(v) for c, v in q["date_by_col"].items()} or "NO date window",
+                 {k: len(v) for k, v in q["dims"].items()} or "-"))
+    if not qs:
+        print("   key pools: legacy file with NO per-query windows — every column is "
+              "drawn from the UNION, so a query whose MV bakes a date filter gets "
+              "only its share of the rows and may get none")
 
+
+def clear_key_pools():
+    """Drop every pool (used by --stream-days, which dates rows by wall position)."""
+    global KEY_POOLS
+    KEY_POOLS = {"date_sk": [], "dims": {}, "date_by_col": {}, "queries": []}
+
+
+def pool_queries_for(colnames):
+    """The per-query pool entries that constrain at least one of these columns.
+
+    A query qualifies if it has a date window for one of the table's date
+    columns, or a pool for one of the dimensions the table references."""
+    cols = set(colnames)
+    dims = {d[0] for d in (dim_for(c) for c in colnames) if d}
+    return [q for q in KEY_POOLS["queries"]
+            if any(c in cols for c in q["date_by_col"]) or any(d in dims for d in q["dims"])]
+
+
+def row_owners(colnames, n):
+    """(owner per row, qualifying queries). Round-robin so the share is exact
+    and not left to chance: with k queries each gets ceil(n/k) rows whose keys
+    ALL come from its own predicate box."""
+    qs = pool_queries_for(colnames)
+    if not qs:
+        return [None] * n, []
+    return [qs[i % len(qs)] for i in range(n)], qs
+
+
+def _date_pool_for_row(owner, col):
+    """(pool, label) a row owned by `owner` should use for `col`, most specific
+    first: the owner's window for exactly this column, then any window the owner
+    has (its own year beats another query's), then the wave-wide union for this
+    column, then the wave-wide union, then no pool at all."""
+    if owner:
+        p = owner["date_by_col"].get(col)
+        if p:
+            return p, owner["name"]
+        if owner["date_sk"]:
+            return owner["date_sk"], owner["name"] + " (its other window)"
+    p = KEY_POOLS["date_by_col"].get(col)
+    if p:
+        return p, "(wave union for this column)"
+    if KEY_POOLS["date_sk"]:
+        return KEY_POOLS["date_sk"], "(wave union)"
+    return None, "(uniform)"
+
+
+def _note(prov, label, pool, value):
+    """Record one drawn date under `label`: [pool, rows drawn, lo, hi]."""
+    if prov is None:
+        return
+    e = prov.get(label)
+    if e is None:
+        prov[label] = [pool, 1, value, value]
+        return
+    e[1] += 1
+    e[2] = min(e[2], value)
+    e[3] = max(e[3], value)
+
+
+def draw_dates(col, n, owners, date_lo, date_hi, rnd, prov=None):
+    """n dates for `col`. `prov` (a dict) collects {label: [pool, rows, lo, hi]}
+    so the caller can state WHICH window each row actually came from — a guess
+    reconstructed from KEY_POOLS gets the fallbacks wrong."""
+    out = []
+    for i in range(n):
+        p, label = _date_pool_for_row(owners[i] if i < len(owners) else None, col)
+        v = rnd.choice(p) if p else rnd.randint(date_lo, date_hi)
+        out.append(v)
+        _note(prov, label, p, v)
+    return out
+
+
+def draw_dim(dimtbl, n, owners, lo, hi, rnd):
+    out = []
+    union = KEY_POOLS["dims"].get(dimtbl)
+    for i in range(n):
+        o = owners[i] if i < len(owners) else None
+        p = (o["dims"].get(dimtbl) if o else None) or union
+        out.append(rnd.choice(p) if p else rnd.randint(lo, hi))
+    return out
+
+
+def date_window_report(table, col, vals, prov):
+    """One line: which window each row was dated from and how many of the whole
+    append landed inside it. `0/N in window` is the structural no-op, stated at
+    append time instead of three minutes later in the gateway's refusal."""
+    parts = []
+    for label, (pool, drawn, lo, hi) in prov.items():
+        if not pool:
+            parts.append("%s %d rows spread %d..%d — NO query window; a query whose MV "
+                         "bakes a date filter outside that span merges 0 of them"
+                         % (label, drawn, lo, hi))
+            continue
+        s = set(pool)
+        parts.append("%s [%d..%d] %d drawn, %d/%d of the append in window"
+                     % (label, min(pool), max(pool), drawn,
+                        sum(1 for v in vals if v in s), len(vals)))
+    return "   %s.%s: %s" % (table, col, "; ".join(parts) or "no rows")
+
+
+# DEPRECATED shims — the generator now uses draw_dim / draw_dates with a row
+# OWNER so a row's keys all come from one query. These keep the pre-2026-09-19
+# signatures working for an external tick script (CDC_TICK_CMD) that imported
+# them; they can only ever produce the union behaviour.
 def pool_pick(dimtbl, n, lo, hi, rnd):
     """n keys for dimtbl: from its pool when one exists, else uniform in [lo, hi]."""
-    pool = KEY_POOLS["dims"].get(dimtbl)
-    if pool:
-        return [rnd.choice(pool) for _ in range(n)]
-    return [rnd.randint(lo, hi) for _ in range(n)]
+    return draw_dim(dimtbl, n, [None] * n, lo, hi, rnd)
 
 def pool_dates(n, date_lo, date_hi, rnd):
-    if KEY_POOLS["date_sk"]:
-        return [rnd.choice(KEY_POOLS["date_sk"]) for _ in range(n)]
-    return [rnd.randint(date_lo, date_hi) for _ in range(n)]
+    return draw_dates("", n, [None] * n, date_lo, date_hi, rnd)
 
 def dim_for(col):
     """(dimension_table, key_column) a fact column references, or None."""
@@ -293,22 +458,67 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
         return dim_hi.get(dimtbl) or FALLBACK_DIM_HI.get(dimtbl) or 1000
 
     # --- keys -------------------------------------------------------------
-    # One primary date per row drives every other date on that row.
-    sold = pool_dates(n, date_lo, date_hi, rnd)
+    # Each row belongs to ONE query's predicate box (see KEY_POOLS): its date
+    # AND its dimension keys come from the same query, so a query with several
+    # predicates gets rows that satisfy all of them together.
+    owners, _qs = row_owners(names, n)
+    # One primary date per row drives every other date on that row. The primary
+    # is the fact's own sold/returned date — the column a query's date filter
+    # almost always binds — identified as the date column that is not a ship
+    # date, never by name.
+    primary = next((c for c, _ in columns
+                    if (dim_for(c) or ("",))[0] == "date_dim" and "ship" not in c), None)
+    prov = {}
+    sold = (draw_dates(primary, n, owners, date_lo, date_hi, rnd, prov) if primary
+            else [rnd.randint(date_lo, date_hi) for _ in range(n)])
+    if primary:
+        DATE_REPORTS.append(date_window_report(fact, primary, sold, prov))
     for name, kind in columns:
         d = dim_for(name)
         if d is None:
             continue
         dimtbl = d[0]
         if dimtbl == "date_dim":
-            # ship dates trail the sale; sold/returned dates ARE the primary date
-            out[name] = ([s + rnd.randint(2, 90) for s in sold]
-                         if "ship" in name else list(sold))
+            if "ship" not in name:
+                out[name] = list(sold)          # sold / returned: the primary date
+                continue
+            # A ship date TRAILS the sale. When a query constrains this exact
+            # column it gets its own window, but only the part of it that is
+            # still after the sale — q72 itself requires d3.d_date > d1.d_date+5,
+            # so a ship date drawn independently of the sale would be filtered
+            # out by the query even though it sits inside the window.
+            v, sprov, _sorted = [], {}, {}
+            for i in range(n):
+                o = owners[i]
+                p = (o["date_by_col"].get(name) if o else None) or KEY_POOLS["date_by_col"].get(name)
+                cand = None
+                if p:
+                    # bisect a sorted copy instead of filtering the pool per row:
+                    # the naive scan is O(rows x pool) and a 50k-row append
+                    # against a 20k-key pool is a billion comparisons.
+                    key = id(p)
+                    sp = _sorted.get(key)
+                    if sp is None:
+                        sp = _sorted[key] = sorted(p)
+                    j = bisect.bisect_right(sp, sold[i])
+                    cand = sp[j:] if j < len(sp) else None
+                if cand:
+                    x = cand[rnd.randrange(len(cand))]
+                    v.append(x)
+                    _note(sprov, o["name"] if o and o["date_by_col"].get(name)
+                          else "(wave union for this column)", p, x)
+                else:
+                    x = sold[i] + rnd.randint(2, 90)
+                    v.append(x)
+                    _note(sprov, "(sale + 2..90 days)", None, x)
+            out[name] = v
+            if any(e[0] for e in sprov.values()):
+                DATE_REPORTS.append(date_window_report(fact, name, v, sprov))
         elif dimtbl == "time_dim":
             out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
         else:
             h = hi(dimtbl)
-            out[name] = pool_pick(dimtbl, n, 1, h, rnd)
+            out[name] = draw_dim(dimtbl, n, owners, 1, h, rnd)
 
     keycol = FACT_KEY_COL.get(fact)
     if keycol and keycol in names:
@@ -428,9 +638,13 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
     idx = rnd.sample(range(n), m)
 
     # Start from a standalone generation so no column can be missed, then
-    # overwrite everything that must agree with the parent sale.
+    # overwrite everything that must agree with the parent sale. The standalone
+    # generation's date report describes dates that are about to be replaced by
+    # the parent's, so drop it and restate below.
+    _mark = len(DATE_REPORTS)
     out = gen_fact_cols(rfact, returns_columns, m, date_lo=date_lo, date_hi=date_hi,
                         dim_hi=dim_hi, key_base=1, rnd=rnd)
+    del DATE_REPORTS[_mark:]
 
     for scol, rcol in keypairs:
         if rcol in out and scol in sales_cols:
@@ -456,6 +670,11 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
         for rcol in names:
             if rcol.endswith("_returned_date_sk"):
                 out[rcol] = [sales_cols[sold_col][i] + rnd.randint(1, 60) for i in idx]
+                if out[rcol]:
+                    DATE_REPORTS.append(
+                        "   %s.%s: parent sale date + 1..60 days (%d..%d) — a query "
+                        "that filters the RETURN date needs its window to extend past "
+                        "the sale window" % (rfact, rcol, min(out[rcol]), max(out[rcol])))
 
     # money: refund a subset of what was actually paid on that sale
     sqty = next((c for c in sales_cols if c.endswith("_quantity")), None)
@@ -964,6 +1183,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
 
     cols = gen_fact_cols(fact, columns, n, date_lo=date_lo, date_hi=date_hi,
                          dim_hi=dim_hi_cache, key_base=kb)
+    if verbose:
+        flush_date_reports()
     if apply_geo_correlation(cols, fact, geo) and verbose:
         print(f"   {fact}: customer/address/store drawn as zip-consistent triples")
     if (xm := apply_cross_fact(cols, fact)) and verbose:
@@ -997,6 +1218,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
     rcols = gen_referential_returns(fact, cols, rcolumns, returns_rows,
                                     date_lo=date_lo, date_hi=date_hi,
                                     dim_hi=dim_hi_cache)
+    if verbose:
+        flush_date_reports()
     rw = len(next(iter(rcols.values())))
     if (xp := record_cross_pairs(rcols)) and verbose:
         print(f"   {rfact}: {xp} (customer, item) pairs recorded for the cross-fact draw")
@@ -1072,16 +1295,19 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
         return dim_hi.get(dimtbl) or FALLBACK_DIM_HI.get(dimtbl) or 1000
 
     d0 = datetime.date(1998, 1, 1)
+    owners, _qs = row_owners(names, n)
     for name, kind in columns:
         d = dim_for(name)
         if d is not None and d[0] == table:
             out[name] = [key_base + i for i in range(n)]            # own PK
         elif d is not None and d[0] == "date_dim":
-            out[name] = pool_dates(n, date_lo, date_hi, rnd)
+            prov = {}
+            out[name] = draw_dates(name, n, owners, date_lo, date_hi, rnd, prov)
+            DATE_REPORTS.append(date_window_report(table, name, out[name], prov))
         elif d is not None and d[0] == "time_dim":
             out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
         elif d is not None:
-            h = hi(d[0]); out[name] = pool_pick(d[0], n, 1, h, rnd)
+            h = hi(d[0]); out[name] = draw_dim(d[0], n, owners, 1, h, rnd)
         elif kind == "s" and str_domains and str_domains.get(name):
             dom = str_domains[name]
             out[name] = [rnd.choice(dom) for _ in range(n)]
@@ -1126,6 +1352,8 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
     cols = gen_table_cols(table, columns, n, date_lo=date_lo, date_hi=date_hi,
                           dim_hi=dim_hi_cache, key_base=kb,
                           str_domains=load_string_domains(t, columns, verbose=verbose))
+    if verbose:
+        flush_date_reports()
     data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
     _write_and_add(fs, t, data, n, f"{namespace}.{table}", strict=strict)
     # the facts appended after this may now reference the new keys
@@ -1182,6 +1410,13 @@ def main():
              "physical column is generated from the live schema; the table's own "
              "surrogate key continues from the catalog max. Appended BEFORE the "
              "facts so the tick's sales rows can reference the new keys.")
+    ap.add_argument("--dim-rate",type=float,default=0.0001,
+        help="with --tick: rows appended to each --extra-tables table as a FRACTION "
+             "of its current row count (default 1e-4: store 1,002 -> 1 row, item "
+             "300,000 -> 30, customer 12,000,000 -> 1,200), minimum 1. A flat "
+             "--rows per dimension grew store to 1,428,002 rows in ~290 ticks on "
+             "SF1000 (2026-09-19); dimensions change slowly, facts do not. "
+             "--extra-rows overrides.")
     ap.add_argument("--extra-rows",type=int,default=0,
         help="rows per extra table (default: same as --rows, the flat count the "
              "internal wave used)")
@@ -1240,9 +1475,16 @@ def main():
         if now is None:
             raise SystemExit("--stream-days: no sold-date bounds in the catalog for the sales facts")
         date_lo,date_hi=now-a.stream_days+1,now
-        KEY_POOLS["date_sk"]=[]
-        print(f"== STREAM mode: dataset now = d_date_sk {now}; appended rows dated {date_lo}..{date_hi} (last {a.stream_days} days); date pool ignored ==")
-    print(f"== delta date span: d_date_sk {date_lo}..{date_hi} (years {years}) ==")
+        clear_key_pools()
+        print(f"== STREAM mode: dataset now = d_date_sk {now}; appended rows dated {date_lo}..{date_hi} (last {a.stream_days} days); ALL key pools ignored ==")
+    if KEY_POOLS["queries"] or KEY_POOLS["date_sk"] or KEY_POOLS["date_by_col"]:
+        print(f"== delta date span: per-query windows from --key-pools; "
+              f"{date_lo}..{date_hi} (years {years}) is the fallback for any column "
+              f"no query constrains ==")
+    else:
+        print(f"== delta date span: d_date_sk {date_lo}..{date_hi} (years {years}) — "
+              f"UNIFORM, no --key-pools: a query whose MV bakes a date filter outside "
+              f"this span merges 0 rows ==")
 
     # ---------------- one realistic tick across all six facts ---------------
     if a.tick:
@@ -1250,9 +1492,17 @@ def main():
             raise SystemExit("--tick is append-only (upsert rewrites files; use --table)")
         plan=plan_tick(a.rows,parse_ratios(a.ratios),a.returns_ratio)
         extras=[x for x in a.extra_tables.replace(","," ").split() if x]
-        xn=a.extra_rows or a.rows
-        print("== CDC tick plan (base=%d rows, returns_ratio=%.3f) =="%(a.rows,a.returns_ratio))
-        for x in extras: print(f"   {x}: +{xn}")
+        def extra_rows_for(x):
+            if a.extra_rows: return a.extra_rows
+            try:
+                cs=cat.load_table((a.namespace,x)).current_snapshot()
+                n=int((cs.summary or {}).get("total-records",0)) if cs else 0
+            except Exception:
+                n=0
+            return max(1,int(round(n*a.dim_rate))) if n>0 else 1
+        xrows={x:extra_rows_for(x) for x in extras}
+        print("== CDC tick plan (base=%d rows, returns_ratio=%.3f, dim_rate=%g) =="%(a.rows,a.returns_ratio,a.dim_rate))
+        for x in extras: print(f"   {x}: +{xrows[x]}")
         for sf,sn,rf,rn in plan: print(f"   {sf}: +{sn}    {rf}: +{rn}")
         # ALL-OR-NOTHING TICK. Iceberg commits per table (add_files -> one snapshot
         # each), so a tick that appends 24 tables and then FAILS on table N leaves
@@ -1273,7 +1523,7 @@ def main():
                 pre_snap[tbl]=None   # table doesn't exist yet — created this tick
         try:
             for x in extras:
-                append_table(cat,fs,a.namespace,x,xn,date_lo=date_lo,date_hi=date_hi,
+                append_table(cat,fs,a.namespace,x,xrows[x],date_lo=date_lo,date_hi=date_hi,
                              dim_hi_cache=dim_hi_cache,strict=strict)
             geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
             for sf,sn,rf,rn in plan:

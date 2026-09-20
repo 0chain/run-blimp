@@ -667,3 +667,495 @@ class TestDimBoundsAreScaleFree(unittest.TestCase):
         out = S.load_dim_hi(_Dead(), "tpcds_sf1", ["item"], verbose=False)
         self.assertEqual(out["item"], S.FALLBACK_DIM_HI["item"],
                          "a truly unreachable table still needs some bound")
+
+
+# ---------------------------------------------------------------------------
+# QUERY-TARGETED TICK (2026-09-19).
+#
+# The measured failure, from the gateway's own bounds prover on node
+# 1788402989672 while ticking for q72:
+#
+#   kterm_dimfilter_empty: Δcatalog_sales.cs_sold_date_sk ∈ [2451545, 2452640]
+#     vs date_dim.d_date_sk under "d1.d_year = 1999" ∈ [2451180, 2451544]
+#     — disjoint, the term contributes no rows
+#   delta_noop: the Δ terms produced 0 rows — no part written, watermark
+#     advanced, MV untouched
+#
+# [2451545, 2452640] is exactly date_sk_bounds([2000, 2001, 2002]): the UNIFORM
+# default. Every "merge" the run reported for q72 was a structural no-op, and
+# the serve that followed (1,834 ms) proved nothing.
+#
+# These fixtures use the REAL q72 / q67 text (the predicates are the thing under
+# test, so they are quoted verbatim, as test fixtures may).
+# ---------------------------------------------------------------------------
+import contextlib
+import io
+import json
+import os
+import tempfile
+
+import query_pools as QP
+
+Q72_SQL = """
+SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, count(*) total_cnt
+FROM catalog_sales
+JOIN inventory ON (cs_item_sk = inv_item_sk)
+JOIN warehouse ON (w_warehouse_sk=inv_warehouse_sk)
+JOIN item ON (i_item_sk = cs_item_sk)
+JOIN customer_demographics ON (cs_bill_cdemo_sk = cd_demo_sk)
+JOIN household_demographics ON (cs_bill_hdemo_sk = hd_demo_sk)
+JOIN date_dim d1 ON (cs_sold_date_sk = d1.d_date_sk)
+JOIN date_dim d2 ON (inv_date_sk = d2.d_date_sk)
+JOIN date_dim d3 ON (cs_ship_date_sk = d3.d_date_sk)
+LEFT OUTER JOIN promotion ON (cs_promo_sk=p_promo_sk)
+LEFT OUTER JOIN catalog_returns ON (cr_item_sk = cs_item_sk
+                                    AND cr_order_number = cs_order_number)
+WHERE d1.d_week_seq = d2.d_week_seq
+  AND inv_quantity_on_hand < cs_quantity
+  AND d3.d_date > d1.d_date + 5 -- SQL Server: DATEADD(day, 5, d1.d_date)
+  AND hd_buy_potential = '>10000'
+  AND d1.d_year = 1999
+  AND cd_marital_status = 'D'
+GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq
+"""
+
+Q67_SQL = """
+SELECT i_category, d_year, s_store_id, sum(ss_sales_price*ss_quantity) sumsales
+FROM store_sales, date_dim, store, item
+WHERE ss_sold_date_sk=d_date_sk
+  AND ss_item_sk=i_item_sk
+  AND ss_store_sk = s_store_sk
+  AND d_month_seq BETWEEN 1200 AND 1200+11
+GROUP BY rollup(i_category, d_year, s_store_id)
+"""
+
+# The two windows the queries above actually select, from the SF1000 date_dim
+# bounds already asserted by TestDateBounds. d_month_seq 1200..1211 is calendar
+# year 2000.
+W1999 = list(range(2451180, 2451545))
+W2000 = list(range(2451545, 2451911))
+
+
+class TestPoolDerivationBindsTheRightDateInstance(unittest.TestCase):
+    """query_pools must say WHICH fact column each date window filters."""
+
+    def test_q72_cross_alias_conjunct_is_not_a_filter(self):
+        """`d3.d_date > d1.d_date + 5` compares two date_dim instances.
+
+        It used to be filed as a third pool group under alias "" whose SQL
+        (`d_date > d_date + 5`) is unsatisfiable; any such conjunct that DID
+        return rows would union a non-filtering instance's keys into the
+        filtering one's pool."""
+        preds = QP.dim_predicates(Q72_SQL)
+        self.assertEqual(sorted(preds["date_dim"]), ["d1"],
+                         "only the d1 instance carries a filter")
+        self.assertEqual(preds["date_dim"]["d1"], ["d_year = 1999"])
+
+    def test_q72_binds_each_date_instance_to_its_fact_column(self):
+        """The joins are in ON clauses, which where_conjuncts never sees."""
+        self.assertEqual(QP.dim_join_columns(Q72_SQL, "date_dim"),
+                         {"d1": ["cs_sold_date_sk"],
+                          "d2": ["inv_date_sk"],
+                          "d3": ["cs_ship_date_sk"]})
+
+    def test_q67_binds_the_bare_date_dim_to_the_store_sales_date(self):
+        self.assertEqual(QP.dim_join_columns(Q67_SQL, "date_dim"),
+                         {"": ["ss_sold_date_sk"]})
+        self.assertEqual(QP.dim_predicates(Q67_SQL)["date_dim"],
+                         {"": ["d_month_seq BETWEEN 1200 AND 1200+11"]})
+
+    def test_a_dimension_key_on_both_sides_is_not_a_fact_join(self):
+        self.assertEqual(QP.dim_join_columns("select 1 from t where d_date_sk = d_date_sk",
+                                             "date_dim"), {})
+
+
+class TestPoolDerivationAgainstDuckDB(unittest.TestCase):
+    """The predicates evaluated for real, against a date_dim fixture.
+
+    Only the pool SQL is exercised here (no Iceberg / no catalog), which is what
+    query_pools.pool_by_alias emits."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import duckdb
+        except ImportError:
+            raise unittest.SkipTest("duckdb not installed")
+        cls.con = duckdb.connect()
+        cls.con.execute("ATTACH ':memory:' AS src; CREATE SCHEMA src.ns;")
+        # d_date_sk 2450815 is 1998-01-01 and d_month_seq 1176 is 1998-01
+        # (TPC-DS: month_seq counts months from 1900-01). One row per day,
+        # 1998-01-01 .. 2002-12-31, generated — never a literal table.
+        cls.con.execute("""
+            CREATE TABLE src.ns.date_dim AS
+            SELECT 2450815 + i           AS d_date_sk,
+                   DATE '1998-01-01' + i::INTEGER AS d_date,
+                   year(DATE '1998-01-01' + i::INTEGER) AS d_year,
+                   1176 + (year(DATE '1998-01-01' + i::INTEGER) - 1998) * 12
+                        + month(DATE '1998-01-01' + i::INTEGER) - 1 AS d_month_seq,
+                   i / 7                 AS d_week_seq
+            FROM range(0, 1826) t(i)
+        """)
+
+    def _pools(self, sql, name):
+        preds = QP.dim_predicates(sql)
+        joins = QP.dim_join_columns(sql, "date_dim")
+        by_alias = QP.pool_by_alias(self.con, "ns", "date_dim", "d_date_sk",
+                                    preds["date_dim"], 100000)
+        out = {}
+        for al, ks in by_alias.items():
+            for c in joins.get(al, []):
+                out[c] = ks
+        return {"name": name, "date_by_col": out,
+                "date_sk": sorted({k for v in out.values() for k in v}), "dims": {}}
+
+    def test_q72_pool_is_1999_on_the_sold_date_only(self):
+        p = self._pools(Q72_SQL, "q72")
+        self.assertEqual(list(p["date_by_col"]), ["cs_sold_date_sk"])
+        ks = p["date_by_col"]["cs_sold_date_sk"]
+        self.assertEqual((min(ks), max(ks), len(ks)), (2451180, 2451544, 365),
+                         "must be exactly the window the trace named")
+
+    def test_q67_pool_is_2000_on_the_store_sales_date(self):
+        p = self._pools(Q67_SQL, "q67")
+        ks = p["date_by_col"]["ss_sold_date_sk"]
+        self.assertEqual((min(ks), max(ks), len(ks)), (2451545, 2451910, 366))
+
+    def test_the_two_windows_are_disjoint(self):
+        """Which is why unioning them cannot serve both."""
+        a = set(self._pools(Q72_SQL, "q72")["date_by_col"]["cs_sold_date_sk"])
+        b = set(self._pools(Q67_SQL, "q67")["date_by_col"]["ss_sold_date_sk"])
+        self.assertEqual(a & b, set())
+
+
+def _pools_file(payload):
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f)
+    return path
+
+
+class PoolSeedingCase(unittest.TestCase):
+    """Base: install pools, always restore, never leak into another test."""
+
+    def setUp(self):
+        self._saved = S.KEY_POOLS
+        S.DATE_REPORTS.clear()
+
+    def tearDown(self):
+        S.KEY_POOLS = self._saved
+        S.DATE_REPORTS.clear()
+
+    def install(self, payload):
+        path = _pools_file(payload)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                S.load_key_pools(path)
+        finally:
+            os.unlink(path)
+
+    def gen(self, fact, n=400, seed=7):
+        rnd = random.Random(seed)
+        lo, hi = S.date_sk_bounds([2000, 2001, 2002])
+        return S.gen_fact_cols(fact, S.FACT_COLUMNS[fact], n, date_lo=lo, date_hi=hi,
+                               dim_hi={}, key_base=1, rnd=rnd)
+
+
+# The wave under test: q72 (catalog_sales, 1999 + two demographics filters) and
+# q67 (store_sales, 2000). CD/HD pools stand in for the keys
+# `cd_marital_status='D'` / `hd_buy_potential='>10000'` select.
+Q72_CD = list(range(1, 400))
+Q72_HD = list(range(1, 25))
+OTHER_CD = list(range(100000, 100400))       # some other query's demographics
+WAVE = {
+    "date_sk": sorted(W1999 + W2000),
+    "dims": {"customer_demographics": sorted(Q72_CD + OTHER_CD),
+             "household_demographics": Q72_HD},
+    "date_by_col": {"cs_sold_date_sk": W1999, "ss_sold_date_sk": W2000},
+    "queries": [
+        {"name": "q72", "date_by_col": {"cs_sold_date_sk": W1999}, "date_sk": W1999,
+         "dims": {"customer_demographics": Q72_CD, "household_demographics": Q72_HD}},
+        {"name": "q67", "date_by_col": {"ss_sold_date_sk": W2000}, "date_sk": W2000,
+         "dims": {}},
+        {"name": "qX", "date_by_col": {}, "date_sk": [],
+         "dims": {"customer_demographics": OTHER_CD}},
+    ],
+}
+
+
+class TestTheMeasuredQ72Noop(PoolSeedingCase):
+    def test_uniform_draws_land_entirely_OUTSIDE_the_q72_window(self):
+        """Reproduce the failure before asserting the fix.
+
+        No pools -> the uniform default span, which the trace showed is
+        disjoint from d_year=1999."""
+        self.install({})
+        cols = self.gen("catalog_sales")
+        sold = cols["cs_sold_date_sk"]
+        self.assertEqual(sum(1 for v in sold if v in set(W1999)), 0,
+                         "fixture wrong: the uniform span must miss 1999 entirely")
+        self.assertGreaterEqual(min(sold), 2451545)
+        self.assertLessEqual(max(sold), 2452640)
+
+    def test_query_pools_put_every_catalog_sales_row_inside_the_q72_window(self):
+        self.install(WAVE)
+        cols = self.gen("catalog_sales")
+        sold = cols["cs_sold_date_sk"]
+        inwin = sum(1 for v in sold if v in set(W1999))
+        self.assertEqual(inwin, len(sold),
+                         "q72 is the only query constraining catalog_sales; all "
+                         "its rows must land in 1999")
+
+    def test_report_states_the_window_and_the_count(self):
+        self.install(WAVE)
+        S.DATE_REPORTS.clear()
+        self.gen("catalog_sales")
+        line = next(l for l in S.DATE_REPORTS if "cs_sold_date_sk" in l)
+        self.assertIn("q72 [2451180..2451544]", line)
+        self.assertIn("400/400 of the append in window", line)
+
+    def test_report_names_the_noop_when_no_window_exists(self):
+        self.install({})
+        S.DATE_REPORTS.clear()
+        self.gen("catalog_sales")
+        line = next(l for l in S.DATE_REPORTS if "cs_sold_date_sk" in l)
+        self.assertIn("(uniform)", line)
+        self.assertIn("merges 0 of them", line)
+
+
+class TestRowsAreCoherentWithOneQuery(PoolSeedingCase):
+    """A row must satisfy ONE query's predicates TOGETHER, not a column each.
+
+    q72's MV needs d_year=1999 AND cd_marital_status='D' AND
+    hd_buy_potential='>10000' on the SAME row. Drawing each column from the
+    wave-wide union independently satisfies each marginally and the conjunction
+    almost never."""
+
+    def _q72_rows(self, cols, datecol):
+        cd, hd = set(Q72_CD), set(Q72_HD)
+        win = set(W1999)
+        return sum(1 for d, c, h in zip(cols[datecol], cols["cs_bill_cdemo_sk"],
+                                        cols["cs_bill_hdemo_sk"])
+                   if d in win and c in cd and h in hd)
+
+    def test_union_pools_satisfy_the_conjunction_for_almost_no_row(self):
+        """The old behaviour, as a legacy (queries-less) pools file."""
+        self.install({k: WAVE[k] for k in ("date_sk", "dims")})
+        cols = self.gen("catalog_sales", n=2000)
+        hits = self._q72_rows(cols, "cs_sold_date_sk")
+        # date 1/2 x cd 399/799 x hd 1 ~= 25%
+        self.assertLess(hits, 0.4 * 2000,
+                        "union draws should satisfy q72 on only a fraction of rows")
+
+    def test_per_query_pools_satisfy_the_conjunction_for_every_owned_row(self):
+        self.install(WAVE)
+        cols = self.gen("catalog_sales", n=2000)
+        hits = self._q72_rows(cols, "cs_sold_date_sk")
+        owners = S.row_owners([c for c, _ in S.FACT_COLUMNS["catalog_sales"]], 2000)[0]
+        owned = sum(1 for o in owners if o["name"] == "q72")
+        self.assertEqual(hits, owned,
+                         "every row owned by q72 must satisfy ALL of q72's predicates")
+        self.assertGreater(hits, 0)
+
+    def test_per_query_beats_union_on_the_same_seed(self):
+        self.install({k: WAVE[k] for k in ("date_sk", "dims")})
+        union_hits = self._q72_rows(self.gen("catalog_sales", n=2000), "cs_sold_date_sk")
+        self.install(WAVE)
+        pq_hits = self._q72_rows(self.gen("catalog_sales", n=2000), "cs_sold_date_sk")
+        self.assertGreater(pq_hits, union_hits)
+
+
+class TestEveryQueryGetsItsShare(PoolSeedingCase):
+    def test_store_sales_rows_reach_q67s_window(self):
+        """store_sales is claimed by q67 (its date) and by q72 (ss_cdemo_sk /
+        ss_hdemo_sk), so q67 owns its round-robin share and every one of those
+        rows is inside 2000."""
+        self.install(WAVE)
+        cols = self.gen("store_sales", n=600)
+        names = [c for c, _ in S.FACT_COLUMNS["store_sales"]]
+        owners = S.row_owners(names, 600)[0]
+        win = set(W2000)
+        q67 = [i for i, o in enumerate(owners) if o["name"] == "q67"]
+        self.assertGreater(len(q67), 0, "q67 must own a share of store_sales")
+        self.assertTrue(all(cols["ss_sold_date_sk"][i] in win for i in q67),
+                        "every q67-owned row must be dated inside q67's window")
+
+    def test_a_query_that_does_not_touch_the_fact_does_not_own_its_rows(self):
+        self.install(WAVE)
+        names = [c for c, _ in S.FACT_COLUMNS["catalog_sales"]]
+        owners = set(o["name"] for o in S.row_owners(names, 50)[0])
+        self.assertNotIn("q67", owners,
+                         "q67 constrains only ss_sold_date_sk — it must not own "
+                         "catalog_sales rows and date them in 2000")
+
+    def test_owner_without_a_window_for_this_column_uses_its_own_other_window(self):
+        """q72 has no window for ss_sold_date_sk. Its rows must NOT fall back to
+        the wave-wide union (which contains q67's year) — its own 1999 window is
+        the better answer and keeps the row self-consistent."""
+        self.install(WAVE)
+        cols = self.gen("store_sales", n=600)
+        owners = S.row_owners([c for c, _ in S.FACT_COLUMNS["store_sales"]], 600)[0]
+        win = set(W1999)
+        q72 = [i for i, o in enumerate(owners) if o["name"] == "q72"]
+        self.assertTrue(all(cols["ss_sold_date_sk"][i] in win for i in q72))
+
+
+class TestShipDatesStillTrailTheSale(PoolSeedingCase):
+    def test_ship_after_sold_with_pools(self):
+        self.install(WAVE)
+        cols = self.gen("catalog_sales", n=500)
+        self.assertTrue(all(s < sh for s, sh in zip(cols["cs_sold_date_sk"],
+                                                    cols["cs_ship_date_sk"])),
+                        "q72 itself requires d3.d_date > d1.d_date + 5")
+
+    def test_a_ship_window_is_honoured_but_never_before_the_sale(self):
+        """A query filtering the SHIP date gets its own window for that column."""
+        ship_win = list(range(2451200, 2451500))
+        self.install({"date_sk": W1999, "dims": {},
+                      "date_by_col": {"cs_sold_date_sk": W1999,
+                                      "cs_ship_date_sk": ship_win},
+                      "queries": [{"name": "qS",
+                                   "date_by_col": {"cs_sold_date_sk": W1999,
+                                                   "cs_ship_date_sk": ship_win},
+                                   "date_sk": W1999, "dims": {}}]})
+        cols = self.gen("catalog_sales", n=500)
+        pairs = list(zip(cols["cs_sold_date_sk"], cols["cs_ship_date_sk"]))
+        self.assertTrue(all(sh > s for s, sh in pairs), "ship must trail the sale")
+        inwin = sum(1 for _, sh in pairs if sh in set(ship_win))
+        self.assertGreater(inwin, 0.5 * len(pairs),
+                           "most ship dates should land in the query's ship window")
+
+
+class TestNonFactTablesUseTheSameWindows(PoolSeedingCase):
+    def test_inventory_date_takes_the_window_bound_to_its_own_column(self):
+        """q72's d2 is joined to inv_date_sk. If that instance ever carries a
+        filter, the inventory append must honour IT — not the sold-date pool."""
+        inv_win = list(range(2451300, 2451340))
+        self.install({"date_sk": W1999, "dims": {},
+                      "date_by_col": {"inv_date_sk": inv_win},
+                      "queries": [{"name": "q72", "date_by_col": {"inv_date_sk": inv_win},
+                                   "date_sk": inv_win, "dims": {}}]})
+        cols = S.gen_table_cols(
+            "inventory",
+            [("inv_date_sk", "i"), ("inv_item_sk", "i"), ("inv_warehouse_sk", "i"),
+             ("inv_quantity_on_hand", "i")],
+            300, date_lo=2451545, date_hi=2452640, dim_hi={}, key_base=1,
+            rnd=random.Random(3))
+        self.assertTrue(all(v in set(inv_win) for v in cols["inv_date_sk"]))
+
+
+class TestStreamModeStillIgnoresPools(PoolSeedingCase):
+    def test_clear_key_pools_drops_every_pool(self):
+        self.install(WAVE)
+        S.clear_key_pools()
+        self.assertEqual(S.KEY_POOLS,
+                         {"date_sk": [], "dims": {}, "date_by_col": {}, "queries": []})
+        cols = self.gen("catalog_sales", n=100)
+        self.assertEqual(sum(1 for v in cols["cs_sold_date_sk"] if v in set(W1999)), 0)
+
+
+class TestLegacyPoolsFileStillWorks(PoolSeedingCase):
+    def test_a_file_with_no_queries_key_behaves_as_before(self):
+        self.install({"date_sk": W1999, "dims": {"item": [1, 2, 3]}})
+        cols = self.gen("catalog_sales", n=200)
+        self.assertTrue(all(v in set(W1999) for v in cols["cs_sold_date_sk"]))
+        self.assertTrue(all(v in {1, 2, 3} for v in cols["cs_item_sk"]))
+
+
+class TestEndToEndQueryTextToAppendedRows(PoolSeedingCase):
+    """q72 + q67 SQL -> query_pools.main() -> pools JSON -> appended rows.
+
+    The whole chain, with only the Iceberg connection stubbed by the same
+    date_dim fixture TestPoolDerivationAgainstDuckDB builds. This is the test
+    that would have caught the measured no-op."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import duckdb
+        except ImportError:
+            raise unittest.SkipTest("duckdb not installed")
+        self.tmp = tempfile.mkdtemp()
+        for name, sql in (("q72", Q72_SQL), ("q67", Q67_SQL)):
+            with open(os.path.join(self.tmp, name + ".sql"), "w") as f:
+                f.write(sql)
+        self.con = duckdb.connect()
+        self.con.execute("ATTACH ':memory:' AS src; CREATE SCHEMA src.ns;")
+        self.con.execute("""
+            CREATE TABLE src.ns.date_dim AS
+            SELECT 2450815 + i AS d_date_sk,
+                   DATE '1998-01-01' + i::INTEGER AS d_date,
+                   year(DATE '1998-01-01' + i::INTEGER) AS d_year,
+                   1176 + (year(DATE '1998-01-01' + i::INTEGER) - 1998) * 12
+                        + month(DATE '1998-01-01' + i::INTEGER) - 1 AS d_month_seq
+            FROM range(0, 1826) t(i)
+        """)
+        # the demographics tables q72 also filters
+        self.con.execute("CREATE TABLE src.ns.customer_demographics AS "
+                         "SELECT i AS cd_demo_sk, CASE WHEN i%4=0 THEN 'D' ELSE 'M' END "
+                         "AS cd_marital_status FROM range(1, 4001) t(i)")
+        self.con.execute("CREATE TABLE src.ns.household_demographics AS "
+                         "SELECT i AS hd_demo_sk, CASE WHEN i%10=0 THEN '>10000' ELSE '501-1000' END "
+                         "AS hd_buy_potential FROM range(1, 1001) t(i)")
+
+    def _derive(self):
+        import sys
+        out = os.path.join(self.tmp, "pools.json")
+        argv = sys.argv
+        connect = QP.duck_connect
+        QP.duck_connect = lambda a: self.con
+        sys.argv = ["query_pools.py",
+                    "--sql-file", os.path.join(self.tmp, "q72.sql"),
+                    "--sql-file", os.path.join(self.tmp, "q67.sql"),
+                    "--catalog", "x", "--warehouse", "x", "--namespace", "ns",
+                    "--out", out]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                QP.main()
+        finally:
+            sys.argv = argv
+            QP.duck_connect = connect
+        with open(out) as f:
+            return json.load(f), err.getvalue()
+
+    def test_pools_json_carries_a_per_query_window_per_fact_column(self):
+        pools, _ = self._derive()
+        byq = {q["name"]: q for q in pools["queries"]}
+        self.assertEqual(sorted(byq), ["q67", "q72"])
+        self.assertEqual(list(byq["q72"]["date_by_col"]), ["cs_sold_date_sk"])
+        ks = byq["q72"]["date_by_col"]["cs_sold_date_sk"]
+        self.assertEqual((min(ks), max(ks)), (2451180, 2451544))
+        ks = byq["q67"]["date_by_col"]["ss_sold_date_sk"]
+        self.assertEqual((min(ks), max(ks)), (2451545, 2451910))
+        # q72's demographics predicates came through too, and are ITS keys
+        self.assertTrue(all(k % 4 == 0 for k in byq["q72"]["dims"]["customer_demographics"]))
+        self.assertTrue(all(k % 10 == 0 for k in byq["q72"]["dims"]["household_demographics"]))
+
+    def test_the_stderr_log_names_the_instance_the_window_binds_to(self):
+        _, log = self._derive()
+        self.assertIn("date_dim [d1] -> cs_sold_date_sk: 365 key(s) [2451180..2451544]", log)
+        self.assertIn("date_dim [-] -> ss_sold_date_sk: 366 key(s) [2451545..2451910]", log)
+
+    def test_appended_catalog_sales_rows_satisfy_every_q72_predicate(self):
+        pools, _ = self._derive()
+        self.install(pools)
+        cols = self.gen("catalog_sales", n=1000)
+        win = set(pools["queries"][0]["date_by_col"]["cs_sold_date_sk"])
+        cd = set(pools["queries"][0]["dims"]["customer_demographics"])
+        hd = set(pools["queries"][0]["dims"]["household_demographics"])
+        self.assertEqual(pools["queries"][0]["name"], "q72")
+        hits = sum(1 for d, c, h in zip(cols["cs_sold_date_sk"],
+                                        cols["cs_bill_cdemo_sk"],
+                                        cols["cs_bill_hdemo_sk"])
+                   if d in win and c in cd and h in hd)
+        self.assertEqual(hits, 1000,
+                         "q72 is the only query constraining catalog_sales; every "
+                         "appended row must satisfy its year AND both demographics")
+
+    def test_without_the_pools_the_same_rows_satisfy_none_of_them(self):
+        """The before picture, on the same generator and the same seed."""
+        pools, _ = self._derive()
+        self.install({})
+        cols = self.gen("catalog_sales", n=1000)
+        win = set(pools["queries"][0]["date_by_col"]["cs_sold_date_sk"])
+        self.assertEqual(sum(1 for d in cols["cs_sold_date_sk"] if d in win), 0)

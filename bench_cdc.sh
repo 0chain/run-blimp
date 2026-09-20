@@ -18,7 +18,7 @@
 # only wakes them, not a herd of stale multi-fact MVs from earlier runs.
 #
 # Env: GW CLUSTER_ID ICEBERG_URL WAREHOUSE [NAMESPACE=tpcds] [REGION=ap-south-1]
-#      [CDC_ROWS=5000] [FORCE_AUTHOR=0] [VERIFY=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
+#      [CDC_ROWS=5000] [FORCE_AUTHOR=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
 #      runs on the gateway; set the gateway's duckdb threads there to change it.)
 set -u
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
@@ -197,22 +197,21 @@ names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = 
 declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
-  # VERIFY=1 (blimp --query --verify) turns verification ON for the whole run;
-  # default 0 is PROD-LIKE, because the gateway does no verification in the serving
-  # path — correctness checking is a full source scan and production must not pay it
-  # per request. Verification is a TEST-TIME option here, and a separate background
-  # sampler is what catches drift in prod.
+  # EVERY call passes skip_verify, and that is the PRODUCTION path: the gateway
+  # does no verification while serving, because a correctness check is a full
+  # source scan and production cannot pay it per request.
   #
-  # arg3=2 marks the phase-4 VERIFY call: verify whenever VERIFY=1. It was
-  # gated on EVICT too, so a run without --evict sent skip_verify on its
-  # "verify" phase and phase 4 was a plain warm serve reported as verified
-  # (five-query run, node 1788402989672, 2026-09-04).
-  # arg3=1 marks the AUTHOR phase: verify it when VERIFY=1 AND the run evicted
-  # (a cold author needs its proof). A warm phase-1 touch of an already-verified
-  # MV re-proved it at 1–5 min per query (two full base scans) for nothing —
-  # the merged MV is what phase 4 verifies (2026-09-03). Every other call
-  # is a warm serve / delta-merge → skip_verify. Passing skip_verify on the
-  # author too suppressed the single verification the CDC model relies on.
+  # This does NOT weaken the correctness gate. The author's own row-hash runs
+  # regardless of skip_verify and an MV cannot bank until it matches the
+  # original — measured on 2026-09-19, a run passing skip_verify on the author
+  # still logged `[mv-authoring][row_hash] MATCH n=130340916`. That line is the
+  # proof to quote.
+  #
+  # What used to live here was VERIFY=1 (the old --verify flag) turning on a
+  # phase-4 re-verification of the MERGED MV against the source. It was a full
+  # original scan per query — 42 min on q72's 7.79M-row MV — and it dominated
+  # every fix-and-prove cycle while proving nothing a bench run needs. Removed
+  # 2026-09-19 along with the flag.
   #
   # force_author is NO LONGER implied by arg3. A forced author is not what
   # production does: a real query arrives, the matcher finds (or does not find) an
@@ -229,7 +228,7 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":not(sys.argv[5]=="1" and (sys.argv[3]=="2" or (sys.argv[3]=="1" and sys.argv[7]=="1"))),"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":True,"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
 }
 
 # ---- MV content signature + THE DELTA GATE -----------------------------------
@@ -373,7 +372,7 @@ except Exception: print(-1)' 2>/dev/null)
     done
   }
 
-  echo ">> phase 1: serve/author all (evict=${EVICT:-0} verify=${VERIFY:-0}; phase-1 proofs only on a cold author, phase 4 verifies the merged MV)"
+  echo ">> phase 1: serve/author all (evict=${EVICT:-0}; correctness is the author's row-hash, which always runs)"
   for n in $FNAMES; do
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
@@ -500,13 +499,20 @@ except Exception: print(-1)' 2>/dev/null)
     POOLS_ARG=""
     if [ "${CDC_TARGET_POOLS:-1}" != "0" ]; then
       pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query, --sql or TPC-DS
-      if [ -n "$pf" ] && python3 -c "import duckdb" 2>/dev/null; then
-        if python3 "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
+      if [ -z "$pf" ]; then
+        echo "   pools: no query SQL loaded — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
+      elif ! python3 -c "import duckdb" 2>/dev/null; then
+        # This used to be a silent `&&` in the if-condition: no duckdb meant no
+        # pools, no message, and a whole wave of structurally-noop ticks that
+        # looked like fast merges (q72, 2026-09-19).
+        echo "   pools: python3 has no duckdb module — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
+      elif python3 "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
              ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} --out /tmp/cdc_pools.json 2>/tmp/cdc_pools.log; then
-          POOLS_ARG="--key-pools /tmp/cdc_pools.json"; sed "s/^/   pools: /" /tmp/cdc_pools.log | tail -6
-        else
-          echo "   pools: derivation failed (uniform draws) — $(tail -1 /tmp/cdc_pools.log)"
-        fi
+        POOLS_ARG="--key-pools /tmp/cdc_pools.json"
+        # the per-query window lines are the point; -6 truncated them away
+        grep -E '^pools:|-> ' /tmp/cdc_pools.log | sed "s/^/   pools: /"
+      else
+        echo "   pools: derivation failed (UNIFORM draws) — $(tail -1 /tmp/cdc_pools.log)"
       fi
     fi
     # THE APPEND IS PLUGGABLE. A customer's own streamer does the append in
@@ -618,27 +624,28 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
-  # ---- phase 4 (OPT-IN): verify the MERGED MV against the source -------------
-  # A delta-merge is NOT verified anywhere: phase 3 passes skip_verify, and the
-  # gateway deliberately does no verification in the serving path — correctness
-  # checking is a full source scan and production must not pay it per request.
-  # So a wrong delta is SERVED, unlike a wrong author which the row-hash gate
-  # rejects. VERIFY_AFTER_MERGE=1 re-runs each query with verification ON, which
-  # re-scans the source and row-hash-compares it to the merged MV.
+  # ---- phase 4: REMOVED (2026-09-19) -----------------------------------------
+  # It re-verified the MERGED MV against the source: a full original scan per
+  # query, because an append invalidates the 24h original-hash cache. Measured
+  # 36 s for q9, 1m27s for q23, and 42 MINUTES for q72's 7.79M-row MV, and it
+  # was the dominant cost of every fix-and-prove cycle.
   #
-  # Costs a full original scan per query (measured at SF1000: 36s for q9, 1m27s
-  # for q23, ~1m10s for q4) because the append INVALIDATES the 24h original-hash
-  # cache — the answer changed, so the cached hash cannot be reused. Budget
-  # ~1.5 min per query. Still far cheaper than a Spark job, which stays the
-  # independent third check on a select few.
-  if [ "${VERIFY:-0}" = "1" ]; then
-    echo ">> phase 4: verify merged MVs against source (opt-in)"
-    for n in $FNAMES; do
-      R=$(run "${SQL[$n]}" "$n:verify" 2)
-      V=$(echo "$R" | J status); VM=$(echo "$R" | J mv_table)
-      echo "   $n: verify_status=${V:-?} mv=${VM:-none}"
-    done
-  fi
+  # What it covered, honestly: a wrong DELTA would be served, because phase 3
+  # passes skip_verify and the gateway does no verification in the serving
+  # path. A wrong AUTHOR cannot bank — the row-hash gate rejects it — so that
+  # half is still covered, for free, on every run.
+  #
+  # Delta correctness now belongs to the DELTA GATE below (mv content signature
+  # + row counts, which tells a merge that changed the MV from one that did
+  # nothing) and to the gateway's own background sampler. If you ever need the
+  # full re-scan back for one query, run that query by hand against the source;
+  # do not put it back in the suite's hot path.
+  # PHASE 4 IS GONE (2026-09-19). It re-verified the merged MV against the
+  # source — a full original scan per query, 42 min on q72's 7.79M-row MV —
+  # and it was the dominant cost of every fix-and-prove cycle while proving
+  # nothing the run needs. Correctness is gated at AUTHOR time: an MV cannot
+  # bank until its row-hash matches the original. Read that verdict from the
+  # author's log/trace line, not from a second full scan here.
 done
 sleep 4
 
