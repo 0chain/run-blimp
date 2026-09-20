@@ -1346,7 +1346,41 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
     keycol = next((c for c, _ in columns if (dim_for(c) or ("",))[0] == table), None)
     if keycol:
         _, mx = catalog_bounds(cat, namespace, table, keycol)
-        kb = (mx or 0) + 1
+        if mx is None:
+            # NEVER RE-ISSUE A DIMENSION KEY FROM 1.
+            #
+            # `kb = (mx or 0) + 1` turned a missing manifest bound into
+            # key_base=1, so the append re-issued keys that already exist. That
+            # breaks the premise the whole incremental design rests on, stated
+            # in bench_cdc.sh: "seed_tpcds.py issues each dimension's surrogate
+            # key as max(existing)+1 (never reused) ... that is the exact
+            # premise the RI-prune gate asserts when it drops an insert-only dim
+            # delta as zero-contribution". A duplicate key IS reachable from
+            # pre-append facts, so the gate must refuse, and the merge pays a
+            # full fact scan instead of a metadata comparison.
+            #
+            # Measured on q72 (node 37.27.65.188, 2026-09-20): the gate reported
+            # "old catalog_sales rows reach cs_bill_hdemo_sk=7200, appended
+            # household_demographics keys start at 1 — a probe decides", and the
+            # tick spent 71.5 s scanning catalog_sales for a delta that should
+            # have been discharged from manifests alone.
+            #
+            # scan_dim_hi() already solves this for the fact-FK path
+            # (load_dim_hi); the dim-append path simply never called it.
+            mx = scan_dim_hi(cat, namespace, table, keycol)
+            if verbose and mx is not None:
+                print(f"   {table}.{keycol}: manifest bound missing — scanned max={mx}")
+        if mx is None:
+            # Still unknown: appending here would silently duplicate keys and
+            # poison every later merge for this table. Refuse loudly instead.
+            raise SystemExit(
+                f"FATAL: {namespace}.{table}.{keycol}: no manifest bound and no "
+                f"scannable max, so a fresh key cannot be issued above the "
+                f"existing ones. Appending would REUSE keys and break the "
+                f"referential-integrity premise the delta merge depends on "
+                f"(a re-used key is reachable from pre-append facts). Fix the "
+                f"table's statistics, or exclude it from CDC_EXTRA_TABLES.")
+        kb = mx + 1
         if verbose:
             print(f"   {table}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
     cols = gen_table_cols(table, columns, n, date_lo=date_lo, date_hi=date_hi,
