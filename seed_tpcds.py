@@ -425,6 +425,26 @@ def dim_for(col):
             return dim
     return None
 
+def own_key_of(table):
+    """The surrogate key a DIMENSION issues for its own rows, or None.
+
+    dim_for() resolves FACT columns by suffix, so it cannot name a dimension's
+    own key when that key does not carry the suffix: "hd_demo_sk" ends in
+    "_demo_sk", not "hdemo_sk", and likewise "cd_demo_sk". Both callers that
+    ask "which of this table's columns is its PK" were using dim_for() and got
+    None, so the demographics dims never issued fresh keys — gen_table_cols
+    filled the PK with int noise and append_table skipped its bounds lookup.
+
+    Measured on the node 2026-09-21: household_demographics held 62,320 rows
+    over 7,200 distinct hd_demo_sk (8.66x duplication, max never past 7,200),
+    and its 6-row tick appends carried random keys in 25..943. A re-used key is
+    reachable from pre-append facts, so the RI-prune gate must refuse the dim
+    delta and the merge pays a fact scan instead of a metadata comparison —
+    q72's chart merge ran 95-170 s for 785 delta rows.
+    """
+    return next((k for _s, (t, k) in DIM_BY_SUFFIX if t == table), None)
+
+
 def dims_needed(columns):
     """Every dimension table the given fact columns reference, deduped."""
     out = []
@@ -1298,7 +1318,7 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
     owners, _qs = row_owners(names, n)
     for name, kind in columns:
         d = dim_for(name)
-        if d is not None and d[0] == table:
+        if name == own_key_of(table) or (d is not None and d[0] == table):
             out[name] = [key_base + i for i in range(n)]            # own PK
         elif d is not None and d[0] == "date_dim":
             prov = {}
@@ -1343,7 +1363,28 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
     if need:
         dim_hi_cache.update(load_dim_hi(cat, namespace, need, verbose=verbose))
     kb = 1
+    # A DIMENSION'S OWN KEY IS NOT A FACT COLUMN. dim_for() resolves FACT
+    # columns by suffix (cs_bill_hdemo_sk -> household_demographics), and the
+    # dimension's own key does not carry that suffix: "hd_demo_sk" ends in
+    # "_demo_sk", not "hdemo_sk", so dim_for("hd_demo_sk") is None. keycol was
+    # therefore None for household_demographics and customer_demographics, the
+    # whole bounds block below was skipped — including the scan_dim_hi fallback
+    # and its SystemExit guard — and kb stayed 1, so EVERY tick re-issued keys
+    # from 1. Dims whose own key does match a suffix (i_item_sk, w_warehouse_sk,
+    # d_date_sk) were never affected, which is why only the two *demo dims show
+    # it.
+    #
+    # Measured on the node (2026-09-21): household_demographics held 62,320 rows
+    # over 7,200 distinct hd_demo_sk (8.66x duplication, max never past 7200),
+    # customer_demographics 1,979,760 over 1,920,800. A re-used key IS reachable
+    # from pre-append facts, so the RI-prune gate must refuse the dim delta —
+    # q72's merge then scanned catalog_sales x inventory for 785 delta rows and
+    # took 95-170 s. Look the key up by VALUE, the way load_dim_hi already does.
     keycol = next((c for c, _ in columns if (dim_for(c) or ("",))[0] == table), None)
+    if keycol is None:
+        own = own_key_of(table)
+        if own and any(c == own for c, _ in columns):
+            keycol = own
     if keycol:
         _, mx = catalog_bounds(cat, namespace, table, keycol)
         if mx is None:

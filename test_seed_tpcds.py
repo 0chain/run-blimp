@@ -1159,3 +1159,67 @@ class TestEndToEndQueryTextToAppendedRows(PoolSeedingCase):
         cols = self.gen("catalog_sales", n=1000)
         win = set(pools["queries"][0]["date_by_col"]["cs_sold_date_sk"])
         self.assertEqual(sum(1 for d in cols["cs_sold_date_sk"] if d in win), 0)
+
+
+class DimOwnKeyResolvesTest(unittest.TestCase):
+    """A dimension's own surrogate key must be found when appending to it.
+
+    dim_for() resolves FACT columns by suffix, and a dimension's own key does
+    not carry that suffix ("hd_demo_sk" ends in "_demo_sk", not "hdemo_sk").
+    When append_table() could not name the key it skipped the whole bounds
+    block and issued keys from 1, so every tick re-used existing keys: measured
+    on the node 2026-09-21, household_demographics held 62,320 rows over 7,200
+    distinct hd_demo_sk. A re-used key is reachable from pre-append facts, so
+    the RI-prune gate refuses the dim delta and the merge pays a fact scan.
+    """
+
+    def _keycol(self, table, columns):
+        keycol = next((c for c, _ in columns if (S.dim_for(c) or ("",))[0] == table), None)
+        if keycol is None:
+            own = S.own_key_of(table)
+            if own and any(c == own for c, _ in columns):
+                keycol = own
+        return keycol
+
+    def test_demographics_dims_resolve_their_own_key(self):
+        for table, key in (("household_demographics", "hd_demo_sk"),
+                           ("customer_demographics", "cd_demo_sk")):
+            cols = [(key, "int"), ("x_other", "string")]
+            self.assertIsNone(S.dim_for(key), f"{key} should not resolve as a fact column")
+            self.assertEqual(self._keycol(table, cols), key,
+                             f"{table}: own key not resolved — appends would re-issue keys from 1")
+
+    def test_suffix_matching_dims_still_resolve(self):
+        for table, key in (("item", "i_item_sk"), ("warehouse", "w_warehouse_sk"),
+                           ("date_dim", "d_date_sk")):
+            self.assertEqual(self._keycol(table, [(key, "int")]), key)
+
+    def test_non_dimension_table_has_no_own_key(self):
+        self.assertIsNone(self._keycol("catalog_sales", [("cs_quantity", "int")]))
+
+
+class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
+    """gen_table_cols must fill a dimension's own PK from key_base, not noise.
+
+    The own-PK branch asked dim_for(name), which resolves FACT columns; for
+    hd_demo_sk / cd_demo_sk it returned None, so the PK fell through to the
+    integer-noise branch. Measured on the node 2026-09-21: 6-row household_
+    demographics tick appends carried random hd_demo_sk in 25..943 while the
+    append printed "issuing 7201..7206".
+    """
+
+    def test_own_key_of_resolves_demographics(self):
+        self.assertEqual(S.own_key_of("household_demographics"), "hd_demo_sk")
+        self.assertEqual(S.own_key_of("customer_demographics"), "cd_demo_sk")
+        self.assertEqual(S.own_key_of("item"), "i_item_sk")
+        self.assertIsNone(S.own_key_of("catalog_sales"))
+
+    def test_generated_pk_is_contiguous_from_key_base(self):
+        for table, key in (("household_demographics", "hd_demo_sk"),
+                           ("customer_demographics", "cd_demo_sk"),
+                           ("item", "i_item_sk")):
+            cols = S.gen_table_cols(table, [(key, "i")], 6,
+                                    date_lo=2451180, date_hi=2451544,
+                                    dim_hi={}, key_base=7201)
+            self.assertEqual(cols[key], list(range(7201, 7207)),
+                             f"{table}.{key} not issued from key_base — appends would re-use keys")
