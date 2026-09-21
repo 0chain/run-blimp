@@ -30,7 +30,7 @@ OSZ="${WARP_OBJ_SIZE:-96MiB}"
 #          mlperf resnet50 accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain=34*7
 #   8/1 -> warp-conc 64,
 #          mlperf resnet50 accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain=136*7
-d="${EC%%/*}"
+d="${EC%%/*}"; p="${EC##*/}"; [ "${p:-0}" -gt 0 ] 2>/dev/null || p=1  # data / parity shards
 # WARP CONCURRENCY = GATEWAY vCPUs, IDENTICAL to the panel (run_bench.sh
 # EC_CONC=$_gwcpu), so a CLI number and a UI number on the same box are directly
 # comparable. Was a flat 64 in the CLI, which collapsed PUT to ~153 MiB/s on a
@@ -81,14 +81,19 @@ echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC obj=$OSZ mlperf-accel=$EC_ACCEL r
 # mlperf writes a train set (EC_DATASET_GB) PLUS a ~27% eval set (ntrain 238 /
 # neval 64), so total ≈ EC_DATASET_GB × 1.27. An EC_DATASET_GB that ignores the
 # allocation overruns it mid-generate (e.g. 45 GB train → ~57 GB > a 48 GB alloc).
-# Query the real allocation capacity and cap so train+eval land at ~80% of it.
+# ALSO account for ERASURE-CODING write amplification: every logical GB becomes
+# (d+p)/d physical GB on the blobber disks (EC 2/1 → 1.5×). Capping only against
+# the LOGICAL allocation lets the physical write overrun a small disk even though
+# the guard thinks it left headroom (tester hit disk_full this way). So divide the
+# cap by (d+p)/d as well, so the PHYSICAL footprint lands at ~80% of the disk.
 # (No cap when the query fails — falls back to the EC default.)
 ALLOC_GB=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage?token=${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}" 2>/dev/null \
   | grep -oE '"capacity_bytes":[0-9]+' | head -1 | grep -oE '[0-9]+' | awk '{printf "%d",$1/1073741824}')
 if [ "${ALLOC_GB:-0}" -gt 0 ]; then
-  FIT=$(( ALLOC_GB * 80 / 127 ))   # total=train×1.27 ≤ 80% of alloc → train ≤ alloc×0.63
+  # train ≤ alloc × 0.80/1.27 (train+eval) × d/(d+p) (EC amplification)
+  FIT=$(( ALLOC_GB * 80 * d / 127 / (d + p) ))
   if [ "$FIT" -gt 0 ] && [ "${EC_DATASET_GB:-0}" -gt "$FIT" ]; then
-    echo "[fit] allocation=${ALLOC_GB}GB -> cap EC_DATASET_GB ${EC_DATASET_GB}->${FIT}GB (train+eval ~80% of alloc; was overrunning the disk)"
+    echo "[fit] allocation=${ALLOC_GB}GB EC=${d}/${p} -> cap EC_DATASET_GB ${EC_DATASET_GB}->${FIT}GB (train+eval ×1.27 × EC ×$(( (d+p) ))/${d} ≤ 80% of disk)"
     EC_DATASET_GB=$FIT
   fi
 fi
