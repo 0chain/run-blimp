@@ -1642,14 +1642,32 @@ cmd_query(){
   # to loopback ONLY when loopback actually serves the port, so a genuinely-remote
   # external source is left untouched. Mirrors the --setup fix.
   local Q_S3_ENDPOINT; Q_S3_ENDPOINT="$(endpoint_local "${S3_ENDPOINT:-http://$GW:9000}")"
-  exec env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
-    NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
-    S3_ENDPOINT="$Q_S3_ENDPOINT" MV_S3_ENDPOINT="$Q_S3_ENDPOINT" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
-    QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
-    QNRS="${QNRS:-}" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
-    SQL_FILES="${SQL_FILES:-}" CDC_TICK_CMD="${CDC_TICK_CMD:-}" \
-    ICEBERG_PREFIX="${ICEBERG_PREFIX:-}" ICEBERG_URL_LOCAL="${ICEBERG_URL_LOCAL:-}" \
-    VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
+  run_query_suite(){
+    env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
+      NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
+      S3_ENDPOINT="$Q_S3_ENDPOINT" MV_S3_ENDPOINT="$Q_S3_ENDPOINT" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
+      QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
+      QNRS="$1" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
+      SQL_FILES="${SQL_FILES:-}" CDC_TICK_CMD="${CDC_TICK_CMD:-}" \
+      ICEBERG_PREFIX="${ICEBERG_PREFIX:-}" ICEBERG_URL_LOCAL="${ICEBERG_URL_LOCAL:-}" \
+      VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
+  }
+  # ONE QUERY AT A TIME. A batch runs phase 1 for every query, ONE append, then
+  # phase 3 for every query — so a slow cold author holds every other query's
+  # tick hostage, the append lands in whichever query's window it happens to
+  # hit, and a "tick" line cannot be tied to that query's own merge (q4 reported
+  # incr_query=2ms merge=– in a 12-query batch: nothing merged, 2026-09-22).
+  # Each query now gets its own serve → append → tick. BLIMP_QUERY_BATCH=1
+  # restores the batch; an explicit SUITES or --sql run is left as given.
+  local qs=(${QNRS:-}) q rc=0
+  if [ "${BLIMP_QUERY_BATCH:-0}" = 1 ] || [ -n "${SUITES:-}" ] || [ -n "${SQL_FILES:-}" ] || [ "${#qs[@]}" -le 1 ]; then
+    run_query_suite "${QNRS:-}"; return $?
+  fi
+  for q in "${qs[@]}"; do
+    echo "######## q$q — serve, append, tick (one query at a time; BLIMP_QUERY_BATCH=1 batches) ########"
+    run_query_suite "$q" || rc=$?
+  done
+  return $rc
 }
 
 cmd_bench(){
