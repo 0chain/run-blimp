@@ -1657,14 +1657,14 @@ cmd_query(){
   # tick hostage, the append lands in whichever query's window it happens to
   # hit, and a "tick" line cannot be tied to that query's own merge (q4 reported
   # incr_query=2ms merge=– in a 12-query batch: nothing merged, 2026-09-22).
-  # Each query now gets its own serve → append → tick. BLIMP_QUERY_BATCH=1
-  # restores the batch; an explicit SUITES or --sql run is left as given.
+  # Each query gets its own serve → append → tick. An explicit SUITES or --sql
+  # run is left as given.
   local qs=(${QNRS:-}) q rc=0
-  if [ "${BLIMP_QUERY_BATCH:-0}" = 1 ] || [ -n "${SUITES:-}" ] || [ -n "${SQL_FILES:-}" ] || [ "${#qs[@]}" -le 1 ]; then
+  if [ -n "${SUITES:-}" ] || [ -n "${SQL_FILES:-}" ] || [ "${#qs[@]}" -le 1 ]; then
     run_query_suite "${QNRS:-}"; return $?
   fi
   for q in "${qs[@]}"; do
-    echo "######## q$q — serve, append, tick (one query at a time; BLIMP_QUERY_BATCH=1 batches) ########"
+    echo "######## q$q — serve, append, tick ########"
     run_query_suite "$q" || rc=$?
   done
   return $rc
