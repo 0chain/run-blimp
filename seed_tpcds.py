@@ -788,13 +788,96 @@ def _step(name, t0):
     STEP_T[name] = STEP_T.get(name, 0.0) + (_t.time() - t0)
 
 
+# BOUNDS CACHE, keyed by the table's snapshot. catalog_bounds reads EVERY
+# manifest of the table; the tick calls it for every table on every run, and a
+# table gains one manifest per tick, so the cost grew without bound: 190.7 s of
+# a 322 s tick on node 37 (2026-09-24). The (lo, hi) of a column only moves
+# when rows are added, and the tick itself adds them — so the cache is updated
+# from the appended rows (_bounds_after_append) and stamped with the snapshot
+# that append produced. Any other writer moves the snapshot, which misses the
+# cache and falls back to the manifest read. Integers only (keys, date_sk).
+_BOUNDS_PATH = os.path.expanduser(os.environ.get("SEED_BOUNDS_CACHE", "~/.seed_bounds_cache.json"))
+_BOUNDS = None
+
+
+def _bounds_load():
+    global _BOUNDS
+    if _BOUNDS is None:
+        try:
+            import json as _j
+            _BOUNDS = _j.load(open(_BOUNDS_PATH))
+        except Exception:
+            _BOUNDS = {}
+    return _BOUNDS
+
+
+def _bounds_save():
+    try:
+        import json as _j
+        tmp = _BOUNDS_PATH + ".tmp"
+        _j.dump(_BOUNDS or {}, open(tmp, "w"))
+        os.replace(tmp, _BOUNDS_PATH)
+    except Exception:
+        pass
+
+
+def _snap_id(t):
+    cs = t.current_snapshot()
+    return cs.snapshot_id if cs else None
+
+
 def catalog_bounds(cat, namespace, table, col, min_rows=0):
     import time as _t
     _t0 = _t.time()
     try:
-        return _catalog_bounds(cat, namespace, table, col, min_rows)
+        key = "%s.%s|%s|%d" % (namespace, table, col, min_rows)
+        try:
+            snap = _snap_id(cat.load_table((namespace, table)))
+        except Exception:
+            snap = None
+        c = _bounds_load().get(key)
+        if snap is not None and c and c.get("snap") == snap:
+            STEP_T["catalog_bounds_cached"] = STEP_T.get("catalog_bounds_cached", 0) + 1
+            return c.get("lo"), c.get("hi")
+        lo, hi = _catalog_bounds(cat, namespace, table, col, min_rows)
+        if snap is not None and isinstance(lo, int) and isinstance(hi, int):
+            _bounds_load()[key] = {"snap": snap, "lo": lo, "hi": hi}
+            _bounds_save()
+        return lo, hi
     finally:
         _step("catalog_bounds", _t0)
+
+
+def _bounds_after_append(t, data, n):
+    """Fold the appended rows into every cached bound of this table and stamp
+    the snapshot the append produced, so the next tick hits the cache."""
+    try:
+        import pyarrow.compute as pc
+        ns, tbl = t.name()[-2], t.name()[-1]
+        snap = _snap_id(t)
+        prefix = "%s.%s|" % (ns, tbl)
+        b = _bounds_load()
+        for key, c in list(b.items()):
+            if not key.startswith(prefix):
+                continue
+            _, col, mr = key.split("|")
+            if int(mr) and n < int(mr):
+                c["snap"] = snap      # a small file is ignored by this bound
+                continue
+            if col not in data.column_names:
+                del b[key]
+                continue
+            mm = pc.min_max(data.column(col)).as_py()
+            lo, hi = mm.get("min"), mm.get("max")
+            if not isinstance(lo, int) or not isinstance(hi, int):
+                del b[key]
+                continue
+            c["lo"] = lo if c.get("lo") is None else min(c["lo"], lo)
+            c["hi"] = hi if c.get("hi") is None else max(c["hi"], hi)
+            c["snap"] = snap
+        _bounds_save()
+    except Exception:
+        pass
 
 
 def _catalog_bounds(cat, namespace, table, col, min_rows=0):
@@ -1132,6 +1215,7 @@ def _write_and_add(fs, t, data, n, label, strict=True):
     # table to prove that, once per table per tick — O(ticks) and growing.
     t.add_files(file_paths=[key], check_duplicate_files=False); _step("add_files", _t0); _t0 = _t.time()
     t.refresh(); _step("refresh", _t0)
+    _bounds_after_append(t, data, n)
     print(f"{label}: +{n} rows, {data.num_columns} cols, 0 nulls "
           f"-> snapshot {t.current_snapshot().snapshot_id}")
     return key
