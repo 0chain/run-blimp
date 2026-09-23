@@ -1596,14 +1596,26 @@ def main():
                 pre_snap[tbl]=cs.snapshot_id if cs else None
             except Exception:
                 pre_snap[tbl]=None   # table doesn't exist yet — created this tick
+        import time as _time
+        _tt0=_time.time(); _tt=[]
         try:
             for x in extras:
+                _t=_time.time()
                 append_table(cat,fs,a.namespace,x,xrows[x],date_lo=date_lo,date_hi=date_hi,
                              dim_hi_cache=dim_hi_cache,strict=strict)
+                _tt.append((x,_time.time()-_t))
+            _t=_time.time()
             geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
+            _tt.append(("geo_pairs",_time.time()-_t))
             for sf,sn,rf,rn in plan:
+                _t=_time.time()
                 append_fact(cat,fs,a.namespace,sf,sn,date_lo=date_lo,date_hi=date_hi,
                             dim_hi_cache=dim_hi_cache,returns_rows=rn,strict=strict,geo=geo)
+                _tt.append((sf,_time.time()-_t))
+            # WHERE THE TICK'S TIME GOES — measured per table, so the slowest
+            # step is named instead of guessed (the tick was ~80-95 s, 2026-09-24).
+            print("== tick timing: total %.1fs | %s"%(_time.time()-_tt0,
+                  ", ".join("%s %.1fs"%(k,v) for k,v in sorted(_tt,key=lambda kv:-kv[1]))))
         except Exception as tick_err:
             import sys as _sys
             print(f"!! CDC tick FAILED ({tick_err}) — rolling back partial appends "
