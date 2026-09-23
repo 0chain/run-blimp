@@ -104,7 +104,7 @@ usage(){
                      (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
   blimp --update     Update software ON THE NODE (via its :9401 helper, bearer = CLUSTER_TOKEN):
                        blimp --update status                 what is running (images, rclone, tools)
-                       blimp --update all                    zs3 gateway, eblobbers, nessie, gotenberg, rclone
+                       blimp --update all                    zs3 gateway, eblobbers, nessie, gotenberg, rclone, feldera
                        blimp --update zs3,rclone             only these
                        blimp --update zs3 --tag zs3=latest-abc123 --tag rclone=1.73.5
                        blimp --update all --dry-run          show the plan, change nothing
@@ -1986,7 +1986,7 @@ cmd_update(){
       --dry-run) dry=1 ;;
       --tag)     tags="${tags:+$tags,}${1:?--tag needs svc=tag}"; shift ;;
       --tag=*)   tags="${tags:+$tags,}${a#--tag=}" ;;
-      status|all|zs3*|eblobber*|nessie*|gotenberg*|rclone*) what="$a" ;;
+      status|all|zs3*|eblobber*|nessie*|gotenberg*|rclone*|feldera*|agent*) what="$a" ;;
       *) die "unknown --update argument: $a (see blimp --help)" ;;
     esac
   done

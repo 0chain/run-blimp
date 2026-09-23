@@ -601,6 +601,22 @@ except Exception: print(-1)' 2>/dev/null)
       if [ "$mh" = "${MV_HASH_OLD[$n]}" ]; then hint=" base=untouched"; else hint=" base=rewritten"; fi
     fi
     echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint}"
+    # THE TICK, one format for every query: the post-append request's own
+    # phase totals (gateway PhaseTotals — the parts sum to its wall time), so a
+    # companion refresh or a stitch's branch merges report a merge too, and the
+    # MV's current size from the same response.
+    echo "$R" | "$PY3" -c '
+import json,sys
+n=sys.argv[1]
+try: d=json.loads(sys.stdin.read() or "{}")
+except Exception: d={}
+p=d.get("phases") or {}
+m=int(p.get("merge_ms") or 0); s=int(p.get("serve_ms") or 0)
+rows=d.get("mv_rows") or sys.argv[2] or "?"; cols=d.get("mv_cols") or sys.argv[3] or "?"
+tbl=(d.get("mv_table") or "").split(".")[-1] or "none"
+if not p: print("   %s: tick: ? (no phase totals in the response — gateway predates them)" % n)
+else: print("   %s: tick: %.2f seconds  merge: %d ms, serve: %d ms  MV: %s rows x %s cols (%s)" % (n,(m+s)/1000.0,m,s,rows,cols,tbl))
+' "$n" "${MV_ROWS[$n]:-}" "${MV_COLS[$n]:-}"
   done
 
   # ---- THE DELTA GATE, part 2: how many rows did each merge actually fold? ---
