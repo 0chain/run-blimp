@@ -780,7 +780,24 @@ def parse_ratios(s):
 # ===========================================================================
 # Catalog-facing code below (needs pyiceberg / pyarrow).
 # ===========================================================================
+STEP_T = {}   # step -> seconds, summed over the tick (printed in the tick timing line)
+
+
+def _step(name, t0):
+    import time as _t
+    STEP_T[name] = STEP_T.get(name, 0.0) + (_t.time() - t0)
+
+
 def catalog_bounds(cat, namespace, table, col, min_rows=0):
+    import time as _t
+    _t0 = _t.time()
+    try:
+        return _catalog_bounds(cat, namespace, table, col, min_rows)
+    finally:
+        _step("catalog_bounds", _t0)
+
+
+def _catalog_bounds(cat, namespace, table, col, min_rows=0):
     """(min, max) of `col` read from ICEBERG MANIFEST STATISTICS — no data scan.
 
     Measured on test2 SF1000 (2026-08-04): 0.01-0.22s per table even for the
@@ -813,6 +830,15 @@ def catalog_bounds(cat, namespace, table, col, min_rows=0):
 
 
 def scan_dim_hi(cat, namespace, table, col):
+    import time as _t
+    _t0 = _t.time()
+    try:
+        return _scan_dim_hi(cat, namespace, table, col)
+    finally:
+        _step("scan_dim_hi", _t0)
+
+
+def _scan_dim_hi(cat, namespace, table, col):
     """max(col) read from the DATA, for when manifest statistics are missing.
 
     Iceberg only records lower/upper bounds when the parquet files carry column
@@ -1095,10 +1121,14 @@ def _write_and_add(fs, t, data, n, label, strict=True):
     if DRY_RUN:
         print(f"{label}: DRY RUN — built {n} rows, {data.num_columns} cols, 0 nulls; nothing written")
         return None
+    import time as _t
+    _t0 = _t.time()
     with fs.open(key.replace("s3://", "", 1), "wb") as f:
         pq.write_table(data, f, store_decimal_as_integer=True,
                        write_statistics=stat_cols)
-    t.add_files(file_paths=[key]); t.refresh()
+    _step("write_parquet", _t0); _t0 = _t.time()
+    t.add_files(file_paths=[key]); _step("add_files", _t0); _t0 = _t.time()
+    t.refresh(); _step("refresh", _t0)
     print(f"{label}: +{n} rows, {data.num_columns} cols, 0 nulls "
           f"-> snapshot {t.current_snapshot().snapshot_id}")
     return key
@@ -1616,6 +1646,7 @@ def main():
             # step is named instead of guessed (the tick was ~80-95 s, 2026-09-24).
             print("== tick timing: total %.1fs | %s"%(_time.time()-_tt0,
                   ", ".join("%s %.1fs"%(k,v) for k,v in sorted(_tt,key=lambda kv:-kv[1]))))
+            print("== tick steps: %s"%", ".join("%s %.1fs"%(k,v) for k,v in sorted(STEP_T.items(),key=lambda kv:-kv[1])))
         except Exception as tick_err:
             import sys as _sys
             print(f"!! CDC tick FAILED ({tick_err}) — rolling back partial appends "
