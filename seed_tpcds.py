@@ -1127,7 +1127,10 @@ def _write_and_add(fs, t, data, n, label, strict=True):
         pq.write_table(data, f, store_decimal_as_integer=True,
                        write_statistics=stat_cols)
     _step("write_parquet", _t0); _t0 = _t.time()
-    t.add_files(file_paths=[key]); _step("add_files", _t0); _t0 = _t.time()
+    # The key is seed-<uuid4>.parquet, written just above: it cannot already be
+    # in the table. pyiceberg's duplicate check reads EVERY manifest of the
+    # table to prove that, once per table per tick — O(ticks) and growing.
+    t.add_files(file_paths=[key], check_duplicate_files=False); _step("add_files", _t0); _t0 = _t.time()
     t.refresh(); _step("refresh", _t0)
     print(f"{label}: +{n} rows, {data.num_columns} cols, 0 nulls "
           f"-> snapshot {t.current_snapshot().snapshot_id}")
