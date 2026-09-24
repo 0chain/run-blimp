@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 240" font-family="-apple-system,Segoe UI,Roboto,sans-serif" style="display:block;width:100%;height:auto;max-width:640px;margin:10px 0 16px" role="img" aria-label="Retrieval time for a 20-step agent loop: Blimp 17 seconds, leading engine 464 seconds">
+  <rect x="0.5" y="0.5" width="759" height="239" rx="14" fill="#ffffff" stroke="#e6e3dc"/>
+  <text x="34" y="46" font-size="19" font-weight="700" fill="#1a1b22">Retrieval time for a 20-step agent loop</text>
+
+  <text x="150" y="105" text-anchor="end" font-size="14" fill="#6b7280">Blimp</text>
+  <rect x="166" y="89" width="480" height="22" rx="5" fill="#efece6"/>
+  <rect x="166" y="89" width="18" height="22" rx="5" fill="#ff5a1f"/>
+  <text x="660" y="106" font-size="15" font-weight="700" fill="#1a1b22">17 s</text>
+
+  <text x="150" y="153" text-anchor="end" font-size="14" fill="#6b7280">Leading engine</text>
+  <rect x="166" y="137" width="480" height="22" rx="5" fill="#9aa0ad"/>
+  <text x="660" y="154" font-size="15" font-weight="700" fill="#1a1b22">464 s</text>
+
+  <text x="34" y="205" font-size="13" font-style="italic" fill="#6b7280">Illustrative: measured TPC-DS Q09 latency (23.2 s vs 0.83 s) &#215; 20 iterations.</text>
+</svg>

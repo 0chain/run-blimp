@@ -19,6 +19,8 @@ Three symptoms, one cause: the data layer was never built for AI, or to sit wher
 - Blimp stops scanning: views are authored once and refreshed in proportion to new data, not the table. Cost per answer stays flat as data grows.
 - And the LLM receives only the data it needs — lower latency, fewer tokens.
 
+![Retrieval time for a 20-step agent loop: 17 s on Blimp against 464 s on a leading engine](docs/retrieval-loop.svg)
+
 Retrieval time for a 20-step agent loop: **464 s** on a leading engine against **17 s** on Blimp. Illustrative, from measured TPC-DS Q09 latency (23.2 s vs 0.83 s) over 20 iterations.
 
 ### Security — distributed ledger zero-trust
