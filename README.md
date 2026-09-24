@@ -2,7 +2,37 @@
 
 ## Blimp
 
-Blimp is an ACID cache and autonomous materialized view — an efficient per-core cache engine that keeps your CPU/GPU utilization high and AI/ML context fresh with delta change queries in 1-2s. Launch a scalable Blimp node on any server, cloud instance, container or function runtime to optimize your existing pipeline → [blimp.software](https://blimp.software)
+AI storage. AI queries. One platform. Blimp is an ACID cache that feeds GPUs at TB/s, and an autonomous query engine that answers in a second with RAG data. Launch a scalable Blimp node on any server, cloud instance, container or function runtime beside your existing pipeline — nothing migrates, cost drops → [blimp.software](https://blimp.software)
+
+### The problem — AI runs on data it can't reach fast enough
+
+- **GPUs starve** — training and inference read the datasets from object storage. Accelerators sit idle waiting for data, the most expensive waste in an AI budget.
+- **Retrieval is the bottleneck** — agents reason in loops and call the data layer many times per answer. Inference returns in under a second; the lakehouse query behind it takes 20+ s, and that cost compounds on every iteration.
+- **Split across two clouds** — GPUs run on a neocloud while RAG analytics and big data sit at a hyperscaler. You pay egress every time data crosses, so performance is hard to scale and cost hard to control.
+
+Three symptoms, one cause: the data layer was never built for AI, or to sit where the GPUs are.
+
+### The insight — everyone optimizes inference. We optimize retrieval inside the loop.
+
+- Agents reason in loops — multi-shot queries and reinforcement-learning steps hit the data layer again and again before reaching the right answer.
+- A faster engine still rescans the full table on every call, so latency and cost climb as data grows.
+- Blimp stops scanning: views are authored once and refreshed in proportion to new data, not the table. Cost per answer stays flat as data grows.
+- And the LLM receives only the data it needs — lower latency, fewer tokens.
+
+Retrieval time for a 20-step agent loop: **464 s** on a leading engine against **17 s** on Blimp. Illustrative, from measured TPC-DS Q09 latency (23.2 s vs 0.83 s) over 20 iterations.
+
+### Security — distributed ledger zero-trust
+
+Identity is cryptographic rather than credential-based, so nothing in the pipeline is trusted by default.
+
+- **Ledger-anchored identity** — every gateway, storage node and client holds a key pair anchored to a distributed ledger, so identity cannot be assumed by holding a stolen API key.
+- **Signed, nonce-bound messages** — every inter-node message is signed and bound to a nonce, blocking replay and man-in-the-middle attacks.
+- **Split-key authorization** — sensitive operations need sequential signatures from the client and an authorization server, so no single compromised key can act alone.
+- **Tamper-evident history** — object version history and access grants are anchored to the ledger, making retroactive changes cryptographically detectable rather than dependent on access controls alone.
+- **Per-node policy** — encryption at rest, ACID guarantees and immutability are set per node. An immutable allocation can be restricted to upload, list, download and share, with delete, rename, move and update disabled.
+
+As autonomous agents gain access to enterprise data, an agent that can impersonate a service or replay a request becomes an attack vector. Per-message signatures and cryptographic identity close that path. Full details: [blimp.software/docs#security](https://blimp.software/docs#security)
+
 
 `run-blimp` connects a **Blimp node** to **your application**, which can use
 it for cache or query engine within your environment.
