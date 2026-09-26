@@ -1198,6 +1198,42 @@ class DimOwnKeyResolvesTest(unittest.TestCase):
         self.assertIsNone(self._keycol("catalog_sales", [("cs_quantity", "int")]))
 
 
+class EveryAppendedDimIssuesFreshKeysTest(unittest.TestCase):
+    """Every dimension bench_cdc.sh appends to must issue its own key above the
+    table's max. income_band's ib_income_band_sk matched no DIM_BY_SUFFIX entry,
+    so own_key_of() was None, append_table() skipped its bounds lookup and
+    gen_table_cols() filled the PK with randint(1, 1000): measured on nodes 37
+    and 144 (2026-09-25) income_band held 56,352 / 10,144 live rows over 1,000
+    distinct keys. The table list is read from bench_cdc.sh's default
+    CDC_EXTRA_TABLES, so a dimension added there is covered here too."""
+
+    def _extra_tables(self):
+        import os, re
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_cdc.sh")).read()
+        m = re.search(r'EXTRA_TABLES="\$\{CDC_EXTRA_TABLES-([^}]*)\}"', src)
+        self.assertIsNotNone(m, "bench_cdc.sh default CDC_EXTRA_TABLES not found")
+        return m.group(1).split()
+
+    def test_every_appended_dimension_has_an_own_key(self):
+        for table in self._extra_tables():
+            if table == "inventory":      # composite key (date, item, warehouse): no surrogate
+                continue
+            with self.subTest(table=table):
+                key = S.own_key_of(table)
+                self.assertIsNotNone(key, f"{table}: no own key — appends re-use existing keys")
+                cols = S.gen_table_cols(table, [(key, "i")], 6, date_lo=2451180,
+                                        date_hi=2451544, dim_hi={}, key_base=5001)
+                self.assertEqual(cols[key], list(range(5001, 5007)))
+
+    def test_income_band_fk_joins_income_band(self):
+        self.assertEqual(S.dim_for("hd_income_band_sk"), ("income_band", "ib_income_band_sk"))
+        cols = S.gen_table_cols("household_demographics",
+                                [("hd_demo_sk", "i"), ("hd_income_band_sk", "i")], 200,
+                                date_lo=2451180, date_hi=2451544,
+                                dim_hi={"income_band": 20}, key_base=1)
+        self.assertLessEqual(max(cols["hd_income_band_sk"]), 20)
+
+
 class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
     """gen_table_cols must fill a dimension's own PK from key_base, not noise.
 

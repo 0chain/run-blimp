@@ -209,6 +209,12 @@ DIM_BY_SUFFIX = [
     ("web_page_sk",     ("web_page", "wp_web_page_sk")),
     ("web_site_sk",     ("web_site", "web_site_sk")),
     ("reason_sk",       ("reason", "r_reason_sk")),
+    # income_band was missing: own_key_of("income_band") returned None, so
+    # append_table() never looked up the max and gen_table_cols() filled
+    # ib_income_band_sk with randint(1, 1000) every tick — 56,352 live rows over
+    # 1,000 distinct keys on node 37 (2026-09-25). hd_income_band_sk (its only
+    # FK) was the same noise, mostly above the real max so it never joined.
+    ("income_band_sk",  ("income_band", "ib_income_band_sk")),
 ]
 
 # LAST-RESORT dimension key ranges, used only when neither the catalog stats nor
@@ -224,7 +230,7 @@ FALLBACK_DIM_HI = {
     "customer_demographics": 1920800, "household_demographics": 7200,
     "customer_address": 6000000, "store": 1002, "promotion": 1500,
     "call_center": 42, "catalog_page": 30000, "ship_mode": 20, "warehouse": 20,
-    "web_page": 3000, "web_site": 54, "reason": 65,
+    "web_page": 3000, "web_site": 54, "reason": 65, "income_band": 20,
 }
 
 # Key pools from query_pools.py (--key-pools). Shape:
