@@ -31,7 +31,7 @@ Identity is cryptographic rather than credential-based, so nothing in the pipeli
 - **Signed, nonce-bound messages** — every inter-node message is signed and bound to a nonce, blocking replay and man-in-the-middle attacks.
 - **Split-key authorization** — sensitive operations need sequential signatures from the client and an authorization server, so no single compromised key can act alone.
 - **Tamper-evident history** — object version history and access grants are anchored to the ledger, making retroactive changes cryptographically detectable rather than dependent on access controls alone.
-- **Per-node policy** — encryption at rest, ACID guarantees and immutability are set per node. An immutable allocation can be restricted to upload, list, download and share, with delete, rename, move and update disabled.
+- **Per-node policy** — encryption at rest, ACID guarantees and immutability are set per node.
 
 As autonomous agents gain access to enterprise data, an agent that can impersonate a service or replay a request becomes an attack vector. Per-message signatures and cryptographic identity close that path. Full details: [blimp.software/docs#security](https://blimp.software/docs#security)
 
