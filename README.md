@@ -6,7 +6,7 @@ AI storage. AI queries. One platform. Blimp is an ACID cache that feeds GPUs at 
 
 ### The problem — AI runs on data it can't reach fast enough
 
-- **GPUs starve** — training and inference read the datasets from object storage. Accelerators sit idle waiting for data, the most expensive waste in an AI budget.
+- **GPUs are underutilized** — training and inference read the datasets from object storage. Accelerators sit idle waiting for data, the most expensive waste in an AI budget.
 - **Retrieval is the bottleneck** — agents reason in loops and call the data layer many times per answer. Inference returns in under a second; the lakehouse query behind it takes 20+ s, and that cost compounds on every iteration.
 - **Split across two clouds** — GPUs run on a neocloud while RAG analytics and big data sit at a hyperscaler. You pay egress every time data crosses, so performance is hard to scale and cost hard to control.
 
