@@ -52,6 +52,19 @@ SOURCE="${SOURCE:-customer}"
 # (test2 node 1788402989672, 2026-09-03).
 QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}}"; HERE="$(cd "$(dirname "$0")" && pwd)"
 PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
+# pool_python: the first interpreter whose duckdb imports (the bench venv, then
+# the system python). Node 37's system python has no duckdb while the venv has
+# 1.5.5, and asking only `python3` made every tick draw keys uniformly
+# (2026-09-28). When neither imports, the venv's duckdb is reinstalled once.
+pool_python(){
+  local p
+  for p in "$PY3" python3; do "$p" -c "import duckdb" 2>/dev/null && { echo "$p"; return 0; }; done
+  if [ -x "$(dirname "$PY3")/pip" ]; then
+    "$(dirname "$PY3")/pip" install -q --force-reinstall --no-deps duckdb >/dev/null 2>&1 || true
+    "$PY3" -c "import duckdb" 2>/dev/null && { echo "$PY3"; return 0; }
+  fi
+  return 1
+}
 J(){ python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('$1',''))
 except: print('')"; }
@@ -501,12 +514,13 @@ except Exception: print(-1)' 2>/dev/null)
       pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query, --sql or TPC-DS
       if [ -z "$pf" ]; then
         echo "   pools: no query SQL loaded — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
-      elif ! python3 -c "import duckdb" 2>/dev/null; then
+      elif ! POOLPY=$(pool_python) || [ -z "$POOLPY" ]; then
         # This used to be a silent `&&` in the if-condition: no duckdb meant no
         # pools, no message, and a whole wave of structurally-noop ticks that
-        # looked like fast merges (q72, 2026-09-19).
-        echo "   pools: python3 has no duckdb module — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
-      elif python3 "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
+        # looked like fast merges (q72, 2026-09-19). pool_python asks the
+        # bench's own venv first.
+        echo "   pools: no python with a working duckdb module ($PY3, python3) — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
+      elif "$POOLPY" "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
              ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} --out /tmp/cdc_pools.json 2>/tmp/cdc_pools.log; then
         POOLS_ARG="--key-pools /tmp/cdc_pools.json"
         # the per-query window lines are the point; -6 truncated them away

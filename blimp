@@ -906,6 +906,12 @@ ensure_deps(){
       BLIMP_PY="$HOME/.blimp_venv/bin/python3"
     fi
   fi
+  # DuckDB for the tick's query-aware key pools (query_pools.py). Without it
+  # every tick draws keys uniformly and date-baked MVs merge 0 rows (node 37's
+  # system python has none, 2026-09-28). Installed into the venv when missing.
+  if [ -x "$BLIMP_PY" ] && ! "$BLIMP_PY" -c 'import duckdb' 2>/dev/null; then
+    "$(dirname "$BLIMP_PY")/pip" install -q --force-reinstall --no-deps duckdb 2>&1 | tail -1 || true
+  fi
   "$BLIMP_PY" -c 'import pyiceberg' 2>/dev/null \
     && bold "  ✓ deps ready (python: $BLIMP_PY)" \
     || { BLIMP_PY=python3; echo "  ! pyiceberg unavailable — register/CDC steps need: pip install 'pyiceberg[s3fs]' pyarrow boto3"; }
