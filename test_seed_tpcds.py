@@ -517,6 +517,31 @@ class TestProportionalTick(unittest.TestCase):
         self.assertEqual([p[1] for p in S.plan_tick(20000)], [20000, 10000, 5000])
 
 
+class TestDerivedDatesStayInsideDateDim(unittest.TestCase):
+    """Ship and return dates derived from a sale near the end of the calendar
+    must name date_dim rows that exist — a key past the max is issued to a later
+    date_dim append that old facts already reference (q94/q95, node 144)."""
+
+    def test_date_after_is_bounded(self):
+        rnd = random.Random(7)
+        for d in range(90, 151):
+            x = S.date_after(d, 2, 90, 150, rnd)
+            self.assertLessEqual(x, 150)
+            self.assertGreaterEqual(x, min(d, 150))
+
+    def test_ship_and_return_dates_bounded(self):
+        rnd = random.Random(3)
+        dmax = 2452640
+        cols = S.gen_fact_cols("web_sales", S.FACT_COLUMNS["web_sales"], 400,
+                               date_lo=dmax - 3, date_hi=dmax, dim_hi={"date_dim": dmax},
+                               key_base=1, rnd=rnd)
+        self.assertLessEqual(max(cols["ws_ship_date_sk"]), dmax)
+        ret = S.gen_referential_returns("web_sales", cols, S.FACT_COLUMNS["web_returns"], 200,
+                                        date_lo=dmax - 3, date_hi=dmax, dim_hi={"date_dim": dmax}, rnd=rnd)
+        self.assertLessEqual(max(ret["wr_returned_date_sk"]), dmax)
+
+
+
 if __name__ == "__main__":
     unittest.main()
 

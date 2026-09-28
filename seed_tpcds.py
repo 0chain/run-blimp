@@ -466,6 +466,22 @@ def _q(x):
     return decimal.Decimal(str(round(float(x), 2)))
 
 
+def date_after(d, lo_gap, hi_gap, date_max, rnd):
+    """A date key `lo_gap`..`hi_gap` days after `d`, never past `date_max`.
+
+    A derived date (ship after sale, return after sale) must name a date_dim
+    row that EXISTS: a key past the table's max is issued to a later tick's
+    date_dim append, so pre-append facts reference it and the RI-prune proof
+    correctly refuses the dimension delta. Unbounded, sold+2..90 put web_sales
+    ship keys up to 2490639 while the next date_dim append started at 2490560,
+    and q94/q95's key-local lane declined into a 46-57 s rebuild every tick
+    (node 144, SF1000, 2026-09-28)."""
+    lo, hi = d + lo_gap, min(d + hi_gap, date_max)
+    if lo > hi:
+        return min(d, date_max)
+    return rnd.randint(lo, hi)
+
+
 def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random):
     """Generate EVERY column of `fact` — no null-filled column, ever again.
 
@@ -534,7 +550,7 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
                     _note(sprov, o["name"] if o and o["date_by_col"].get(name)
                           else "(wave union for this column)", p, x)
                 else:
-                    x = sold[i] + rnd.randint(2, 90)
+                    x = date_after(sold[i], 2, 90, hi("date_dim"), rnd)
                     v.append(x)
                     _note(sprov, "(sale + 2..90 days)", None, x)
             out[name] = v
@@ -695,7 +711,8 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
     if sold_col:
         for rcol in names:
             if rcol.endswith("_returned_date_sk"):
-                out[rcol] = [sales_cols[sold_col][i] + rnd.randint(1, 60) for i in idx]
+                dmax = dim_hi.get("date_dim") or FALLBACK_DIM_HI.get("date_dim")
+                out[rcol] = [date_after(sales_cols[sold_col][i], 1, 60, dmax, rnd) for i in idx]
                 if out[rcol]:
                     DATE_REPORTS.append(
                         "   %s.%s: parent sale date + 1..60 days (%d..%d) — a query "
@@ -1469,6 +1486,24 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
     return out
 
 
+def fact_fk_max(cat, namespace, dim):
+    """The highest key of `dim` any fact column references, from the facts'
+    manifest bounds (metadata only); None when no fact bound is known."""
+    best = None
+    for fact, spec in FACT_COLUMNS.items():
+        for col, _kind in spec:
+            d = dim_for(col)
+            if not d or d[0] != dim:
+                continue
+            try:
+                _, hi = catalog_bounds(cat, namespace, fact, col)
+            except Exception:
+                hi = None
+            if hi is not None and (best is None or hi > best):
+                best = hi
+    return best
+
+
 def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache,
                  strict=True, verbose=True):
     """Append `n` fully-populated rows to any non-sales table that EXISTS in the
@@ -1544,6 +1579,16 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
                 f"referential-integrity premise the delta merge depends on "
                 f"(a re-used key is reachable from pre-append facts). Fix the "
                 f"table's statistics, or exclude it from CDC_EXTRA_TABLES.")
+        # ABOVE EVERY KEY THE FACTS ALREADY REFERENCE, not only above the
+        # dimension's own max: a fact row that referenced a key before its
+        # dimension row existed (an unbounded derived date did, see date_after)
+        # makes the next append re-issue a key old facts reach — the RI prune
+        # then refuses, correctly, and the merge scans the fact.
+        ref = fact_fk_max(cat, namespace, table)
+        if ref is not None and ref > mx:
+            if verbose:
+                print(f"   {table}.{keycol}: facts already reference keys up to {ref} (> table max {mx}) — issuing above them")
+            mx = ref
         kb = mx + 1
         if verbose:
             print(f"   {table}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
