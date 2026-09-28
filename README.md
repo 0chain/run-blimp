@@ -2,26 +2,28 @@
 
 ## Blimp
 
-AI storage. AI queries. One platform. Blimp is an ACID cache that feeds GPUs at TB/s, and an autonomous query engine that answers in a second with RAG data. Launch a scalable Blimp node on any server, cloud instance, container or function runtime beside your existing pipeline — nothing migrates, cost drops → [blimp.software](https://blimp.software)
+AI storage. AI queries. One platform. Blimp is sub-second data for AI agents: it writes the materialized views for your complex queries itself and caches them next to the GPUs. Launch a scalable Blimp node on any server, cloud instance, container or function runtime beside your existing pipeline — nothing migrates, cost drops → [blimp.software](https://blimp.software)
 
-### The problem — AI runs on data it can't reach fast enough
+### The problem — agents wait on data, not on the model
 
-- **GPUs are underutilized** — training and inference read the datasets from object storage. Accelerators sit idle waiting for data, the most expensive waste in an AI budget.
-- **Retrieval is the bottleneck** — agents reason in loops and call the data layer many times per answer. Inference returns in under a second; the lakehouse query behind it takes 20+ s, and that cost compounds on every iteration.
+- **10+ minutes per agent task** — that is what multi-shot agent queries cost OpenAI's own data team (Rows & Columns Summit, Sep 2026). If it happens at OpenAI, it happens at every company putting agents on its data.
+- **Retrieval is the bottleneck** — inference returns in under a second; the complex lakehouse query behind it takes 20+ s. Nested subqueries and multi-way joins rescan the table on every iteration, so 20 steps × 23 s is almost 8 minutes of retrieval.
 - **Split across two clouds** — GPUs run on a neocloud while RAG analytics and big data sit at a hyperscaler. You pay egress every time data crosses, so performance is hard to scale and cost hard to control.
 
-Three symptoms, one cause: the data layer was never built for AI, or to sit where the GPUs are.
+The data layer was built for dashboards a human reads once, not for agents that query the same data in loops.
 
 ### The insight — everyone optimizes inference. We optimize retrieval inside the loop.
 
 - Agents reason in loops — multi-shot queries and reinforcement-learning steps hit the data layer again and again before reaching the right answer.
 - A faster engine still rescans the full table on every call, so latency and cost climb as data grows.
-- Blimp stops scanning: views are authored once and refreshed in proportion to new data, not the table. Cost per answer stays flat as data grows.
-- And the LLM receives only the data it needs — lower latency, fewer tokens.
+- Blimp writes the view itself, builds it once, then merges only new data. Every later call is a sub-second read; cost tracks new data, not the table.
+- Coverage compounds: a new query inside an existing view's branch is served at refresh speed, so the hit rate rises as views accumulate.
+- The LLM receives only the data it needs — fewer round trips, lower latency, fewer tokens.
+- **Only Blimp writes and maintains views for complex queries on its own, for any engine, next to the GPUs.**
 
-![Retrieval time for a 20-step agent loop: 17 s on Blimp against 464 s on a leading engine](docs/retrieval-loop.svg)
+![Retrieval time for a 20-step agent loop: 17 s on Blimp against 464 s on warm Trino](docs/retrieval-loop.svg)
 
-Retrieval time for a 20-step agent loop: **464 s** on a leading engine against **17 s** on Blimp. Illustrative, from measured TPC-DS Q09 latency (23.2 s vs 0.83 s) over 20 iterations.
+Retrieval time for a 20-step agent loop: **464 s** on warm Trino against **17 s** on Blimp. Illustrative, from TPC-DS Q09 latency (23.2 s vs 0.83 s) over 20 iterations, after a one-time view build.
 
 ### Security — distributed ledger zero-trust
 
