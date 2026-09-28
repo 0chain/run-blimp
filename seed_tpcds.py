@@ -1554,19 +1554,51 @@ def fact_fk_max(cat, namespace, dim):
     if (namespace, dim) in _FACT_FK_MAX:
         return _FACT_FK_MAX[(namespace, dim)]
     best = None
-    for fact, spec in FACT_COLUMNS.items():
-        for col, _kind in spec:
-            d = dim_for(col)
-            if not d or d[0] != dim:
-                continue
-            try:
-                _, hi = catalog_bounds(cat, namespace, fact, col)
-            except Exception:
-                hi = None
-            if hi is not None and (best is None or hi > best):
-                best = hi
+    refs = [(fact, col) for fact, spec in FACT_COLUMNS.items() for col, _k in spec]
+    # EVERY REFERENCING TABLE, not only the facts: household_demographics
+    # references income_band (hd_income_band_sk) and customer references the
+    # demographics/address dims. Issuing income_band keys above the FACTS'
+    # max left old hd rows reaching the "new" keys, so the gateway's RI prune
+    # refused income_band on every q84 tick (node 37, SF1000, 2026-09-28).
+    for t, cols in _namespace_columns(cat, namespace).items():
+        if t != dim and t not in FACT_COLUMNS:
+            refs += [(t, c) for c in cols]
+    for table, col in refs:
+        d = dim_for(col)
+        if not d or d[0] != dim or col == own_key_of(dim):
+            continue
+        try:
+            _, hi = catalog_bounds(cat, namespace, table, col)
+        except Exception:
+            hi = None
+        if hi is not None and (best is None or hi > best):
+            best = hi
     _FACT_FK_MAX[(namespace, dim)] = best
     return best
+
+
+def _namespace_columns(cat, namespace):
+    """{table: [column names]} for the namespace, persisted in the bounds cache
+    (a schema changes far less often than a snapshot) so a tick lists the
+    catalog once, not once per table per tick."""
+    key = "schema|%s" % namespace
+    b = _bounds_load()
+    if isinstance(b.get(key), dict) and b[key]:
+        return b[key]
+    out = {}
+    try:
+        for ident in cat.list_tables(namespace):
+            name = ident[-1]
+            try:
+                out[name] = [f.name for f in cat.load_table((namespace, name)).schema().fields]
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    if out:
+        b[key] = out
+        _bounds_save()
+    return out
 
 
 def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache,

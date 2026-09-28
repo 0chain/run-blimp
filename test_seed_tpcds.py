@@ -1343,3 +1343,23 @@ class TestBoundsFoldOnlyOntoParentSnapshot(unittest.TestCase):
         self.assertEqual(cache["ns.store_sales|ss_sold_date_sk|0"], {"snap": 11, "lo": 5, "hi": 70})
         self.assertNotIn("ns.store_sales|ss_item_sk|0", cache,
                          "a bound stamped before another writer's append must be re-read, not folded")
+
+
+class TestFactFkMaxCountsDimensionReferences(unittest.TestCase):
+    """income_band keys must be issued above household_demographics'
+    hd_income_band_sk too, not only above the facts (node 37, 2026-09-28)."""
+
+    def test_dimension_reference_raises_the_floor(self):
+        saved = (S._namespace_columns, S.catalog_bounds, dict(S._FACT_FK_MAX))
+        S._FACT_FK_MAX.clear()
+        S._namespace_columns = lambda cat, ns: {"household_demographics": ["hd_demo_sk", "hd_income_band_sk"], "income_band": ["ib_income_band_sk"]}
+        def bounds(cat, ns, table, col, min_rows=0):
+            if (table, col) == ("household_demographics", "hd_income_band_sk"):
+                return 1, 87
+            return None, None
+        S.catalog_bounds = bounds
+        try:
+            self.assertEqual(S.fact_fk_max(None, "ns", "income_band"), 87)
+        finally:
+            S._namespace_columns, S.catalog_bounds = saved[0], saved[1]
+            S._FACT_FK_MAX.clear(); S._FACT_FK_MAX.update(saved[2])
