@@ -1271,9 +1271,12 @@ class EveryAppendedDimIssuesFreshKeysTest(unittest.TestCase):
             with self.subTest(table=table):
                 key = S.own_key_of(table)
                 self.assertIsNotNone(key, f"{table}: no own key — appends re-use existing keys")
+                # date_dim's key is a Julian day (date_dim_row derives the
+                # calendar from it), so its keys start at a real date.
+                base = 2451545 if table == "date_dim" else 5001
                 cols = S.gen_table_cols(table, [(key, "i")], 6, date_lo=2451180,
-                                        date_hi=2451544, dim_hi={}, key_base=5001)
-                self.assertEqual(cols[key], list(range(5001, 5007)))
+                                        date_hi=2451544, dim_hi={}, key_base=base)
+                self.assertEqual(cols[key], list(range(base, base + 6)))
 
     def test_income_band_fk_joins_income_band(self):
         self.assertEqual(S.dim_for("hd_income_band_sk"), ("income_band", "ib_income_band_sk"))
@@ -1309,3 +1312,34 @@ class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
                                     dim_hi={}, key_base=7201)
             self.assertEqual(cols[key], list(range(7201, 7207)),
                              f"{table}.{key} not issued from key_base — appends would re-use keys")
+
+
+class TestBoundsFoldOnlyOntoParentSnapshot(unittest.TestCase):
+    """A cached bound folds an append only when it was stamped at the append's
+    parent snapshot; otherwise another writer's files are missing from it and
+    it must be dropped (node 65, 2026-09-28: hi=2490119 cached vs 2494785)."""
+
+    def _table(self, snap, parent):
+        class Snap:  # minimal pyiceberg snapshot
+            snapshot_id, parent_snapshot_id = snap, parent
+        class T:
+            def name(self):
+                return ("ns", "store_sales")
+            def current_snapshot(self):
+                return Snap()
+        return T()
+
+    def test_fold_and_drop(self):
+        import pyarrow as pa
+        saved = (S._bounds_load, S._bounds_save)
+        cache = {"ns.store_sales|ss_sold_date_sk|0": {"snap": 10, "lo": 5, "hi": 50},
+                 "ns.store_sales|ss_item_sk|0": {"snap": 9, "lo": 1, "hi": 9}}
+        S._bounds_load, S._bounds_save = (lambda: cache), (lambda: None)
+        try:
+            data = pa.table({"ss_sold_date_sk": [70, 60], "ss_item_sk": [3, 4]})
+            S._bounds_after_append(self._table(11, 10), data, 2)
+        finally:
+            S._bounds_load, S._bounds_save = saved
+        self.assertEqual(cache["ns.store_sales|ss_sold_date_sk|0"], {"snap": 11, "lo": 5, "hi": 70})
+        self.assertNotIn("ns.store_sales|ss_item_sk|0", cache,
+                         "a bound stamped before another writer's append must be re-read, not folded")

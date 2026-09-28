@@ -819,7 +819,7 @@ def _step(name, t0):
 # from the appended rows (_bounds_after_append) and stamped with the snapshot
 # that append produced. Any other writer moves the snapshot, which misses the
 # cache and falls back to the manifest read. Integers only (keys, date_sk).
-_BOUNDS_PATH = os.path.expanduser(os.environ.get("SEED_BOUNDS_CACHE", "~/.seed_bounds_cache.json"))
+_BOUNDS_PATH = os.path.expanduser(os.environ.get("SEED_BOUNDS_CACHE", "~/.seed_bounds_cache.v2.json"))
 _BOUNDS = None
 
 
@@ -878,10 +878,24 @@ def _bounds_after_append(t, data, n):
         import pyarrow.compute as pc
         ns, tbl = t.name()[-2], t.name()[-1]
         snap = _snap_id(t)
+        cs = t.current_snapshot()
+        parent = getattr(cs, "parent_snapshot_id", None) if cs else None
         prefix = "%s.%s|" % (ns, tbl)
         b = _bounds_load()
         for key, c in list(b.items()):
             if not key.startswith(prefix):
+                continue
+            # FOLD ONLY ONTO THE SNAPSHOT THIS APPEND EXTENDS. A cached bound
+            # stamped at an older snapshot misses whatever another writer
+            # appended in between; folding this append into it and stamping
+            # the new snapshot made the miss permanent. On node 65 the cache
+            # held store_sales.ss_sold_date_sk hi=2490119 while the manifests
+            # reached 2494785, so fact_fk_max() under-read, date_dim keys were
+            # issued from 2490328 (below keys old facts already reference)
+            # and every q51 tick's RI prune fell to a probe (2026-09-28).
+            # Dropped here, the bound is re-read from the manifests next time.
+            if parent is None or c.get("snap") != parent:
+                del b[key]
                 continue
             _, col, mr = key.split("|")
             if int(mr) and n < int(mr):
