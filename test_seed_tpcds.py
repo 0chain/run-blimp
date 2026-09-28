@@ -542,6 +542,31 @@ class TestDerivedDatesStayInsideDateDim(unittest.TestCase):
 
 
 
+class TestDateDimRowFromKey(unittest.TestCase):
+    """Appended date_dim rows take their calendar from the key (Julian day),
+    matching the real SF10 rows read from the node (2026-09-28)."""
+
+    def test_matches_real_rows(self):
+        real = {
+            2451180: ("1999-01-01", 1188, 5166, 5, 1, "1999Q1", "Friday", 2451180, 2450815, 2451088),
+            2451545: ("2000-01-01", 1200, 5218, 6, 1, "2000Q1", "Saturday", 2451545, 2451180, 2451453),
+            2452275: ("2001-12-31", 1223, 5322, 1, 4, "2001Q4", "Monday", 2452245, 2451910, 2452183),
+        }
+        for k, (d, mseq, wseq, dow, qoy, qn, dn, fdom, ly, lq) in real.items():
+            r = S.date_dim_row(k)
+            got = (str(r["d_date"]), r["d_month_seq"], r["d_week_seq"], r["d_dow"], r["d_qoy"],
+                   r["d_quarter_name"], r["d_day_name"], r["d_first_dom"], r["d_same_day_ly"], r["d_same_day_lq"])
+            self.assertEqual(got, (d, mseq, wseq, dow, qoy, qn, dn, fdom, ly, lq), k)
+
+    def test_appended_rows_fall_after_the_calendar(self):
+        cols = [("d_date_sk", "i"), ("d_date", "t"), ("d_year", "i"), ("d_quarter_name", "s")]
+        out = S.gen_table_cols("date_dim", cols, 3, date_lo=2451545, date_hi=2452640,
+                               dim_hi={}, key_base=2488071, rnd=random.Random(1))
+        self.assertEqual([str(x) for x in out["d_date"]], ["2100-01-02", "2100-01-03", "2100-01-04"])
+        self.assertEqual(out["d_year"], [2100, 2100, 2100])
+        self.assertEqual(out["d_quarter_name"], ["2100Q1"] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
 

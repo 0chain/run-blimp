@@ -1481,9 +1481,48 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
             out[name] = [rnd.randint(1, 10**9) for _ in range(n)]
         else:
             out[name] = [rnd.randint(1, 1000) for _ in range(n)]
+    if table == "date_dim" and "d_date_sk" in out:
+        # A DATE ROW IS ITS KEY'S DAY. Random calendar values on appended keys
+        # made a query's date window (d_date range, d_quarter_name '2001Q1',
+        # d_year 2001) match synthetic keys far past the calendar, so every
+        # date-bound prune spanned them: q82's inventory read kept 922 of
+        # 1,104 files, q17's bound reached key 2489578 (node 65/37, 2026-09-28).
+        rows = [date_dim_row(k) for k in out["d_date_sk"]]
+        for c in names:
+            if c in rows[0] and c != "d_date_sk":
+                out[c] = [r[c] for r in rows]
     missing = [c for c in names if c not in out]
     assert not missing, f"{table}: generator left {missing} unset"
     return out
+
+
+_DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+
+def date_dim_row(jdn):
+    """TPC-DS date_dim columns for d_date_sk = `jdn` (the Julian day number:
+    2451545 is 2000-01-01), computed the way dsdgen lays out the calendar."""
+    import datetime
+    d = datetime.date.fromordinal(jdn - 1721425)
+    q = (d.month - 1) // 3 + 1
+    dow = (d.isoweekday() % 7)                       # 0 = Sunday
+    first = d.replace(day=1)
+    nxt = (first + datetime.timedelta(days=32)).replace(day=1)
+    to_jdn = lambda x: x.toordinal() + 1721425
+    week_seq = (jdn - 2415018) // 7                 # dsdgen: 2451545 -> 5218, 2452275 -> 5322
+    return {
+        "d_date_id": "AAAAAAAA%08d" % jdn, "d_date": d,
+        "d_month_seq": (d.year - 1900) * 12 + d.month - 1,
+        "d_week_seq": week_seq, "d_quarter_seq": (d.year - 1900) * 4 + q,
+        "d_year": d.year, "d_dow": dow, "d_moy": d.month, "d_dom": d.day, "d_qoy": q,
+        "d_fy_year": d.year, "d_fy_quarter_seq": (d.year - 1900) * 4 + q, "d_fy_week_seq": week_seq,
+        "d_day_name": _DAY_NAMES[dow], "d_quarter_name": "%dQ%d" % (d.year, q),
+        "d_holiday": "N", "d_weekend": "Y" if dow in (0, 6) else "N", "d_following_holiday": "N",
+        "d_first_dom": to_jdn(first), "d_last_dom": to_jdn(nxt) - 1,
+        "d_same_day_ly": jdn - 365, "d_same_day_lq": jdn - 92,
+        "d_current_day": "N", "d_current_week": "N", "d_current_month": "N",
+        "d_current_quarter": "N", "d_current_year": "N",
+    }
 
 
 # Facts can reference a dimension key before its row exists — derived dates
