@@ -1486,21 +1486,18 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
     return out
 
 
-# Dimensions whose keys the seeder DERIVES by arithmetic (a ship or return date
-# is a sale date plus days) rather than drawing from 1..max of the table. Only
-# these can be referenced by a fact before their row exists, so only these need
-# the facts' referenced max. Asking it for every dimension read ~50 manifest
-# bounds per tick: 186 s of a 294 s tick on node 65 (2026-09-28).
-DERIVED_KEY_DIMS = {"date_dim"}
+# Facts can reference a dimension key before its row exists — derived dates
+# (sale + days) did for date_dim, and web_sales ship-address keys reached past
+# customer_address's max too (node 144, 2026-09-28) — so every dimension asks.
+# The bounds are cached per table snapshot and advanced by each append
+# (catalog_bounds / _bounds_after_append): the cost is one cold fill per node
+# (186 s on node 65), then ~3 s a tick.
 _FACT_FK_MAX = {}
 
 
 def fact_fk_max(cat, namespace, dim):
     """The highest key of `dim` any fact column references, from the facts'
-    manifest bounds (metadata only); None when no fact bound is known or the
-    seeder never derives this dimension's keys (DERIVED_KEY_DIMS)."""
-    if dim not in DERIVED_KEY_DIMS:
-        return None
+    manifest bounds (metadata only); None when no fact bound is known."""
     if (namespace, dim) in _FACT_FK_MAX:
         return _FACT_FK_MAX[(namespace, dim)]
     best = None
