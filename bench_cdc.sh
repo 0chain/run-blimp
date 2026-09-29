@@ -631,7 +631,12 @@ except Exception: print(-1)' 2>/dev/null)
       # so this is informational — the delta gate below is what decides.
       if [ "$mh" = "${MV_HASH_OLD[$n]}" ]; then hint=" base=untouched"; else hint=" base=rewritten"; fi
     fi
-    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint}"
+    # THE TICK'S RESULT IDENTITY: status, rows and the result md5 the gateway
+    # computed, so a caller can compare the served tick against the original
+    # query over the same data (full99's base run). A tick that errored or
+    # returned 0 rows used to print only timings (q51: status=error rows=0,
+    # reported as a 6 s tick; node 37, 2026-09-29).
+    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint} status=$(echo "$R" | J status) rows=$(echo "$R" | J rows) md5=$(echo "$R" | J md5)"
     # THE TICK, one format for every query: the post-append request's own
     # phase totals (gateway PhaseTotals — the parts sum to its wall time), so a
     # companion refresh or a stitch's branch merges report a merge too, and the
