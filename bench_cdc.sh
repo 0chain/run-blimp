@@ -636,7 +636,7 @@ except Exception: print(-1)' 2>/dev/null)
     # query over the same data (full99's base run). A tick that errored or
     # returned 0 rows used to print only timings (q51: status=error rows=0,
     # reported as a 6 s tick; node 37, 2026-09-29).
-    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint} status=$(echo "$R" | J status) rows=$(echo "$R" | J rows) md5=$(echo "$R" | J md5)"
+    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint} status=$(echo "$R" | J status) rows=$(echo "$R" | J rows) md5=$(echo "$R" | J md5) md5r=$(echo "$R" | J md5_rounded)"
     # THE TICK, one format for every query: the post-append request's own
     # phase totals (gateway PhaseTotals — the parts sum to its wall time), so a
     # companion refresh or a stitch's branch merges report a merge too, and the
