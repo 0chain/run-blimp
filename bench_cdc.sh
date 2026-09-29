@@ -319,12 +319,18 @@ print('')" "$1" 2>/dev/null; }
 # recipe kept). Two-tier answers regenerate from their chart MV the moment the
 # answer is evicted, so evict-and-rematch until the matcher returns nothing.
 evict_query(){ # evict_query <sql> <name>
-  local rounds=0 busy=0 m t ns e ok rg e2
+  local rounds=0 busy=0 m t ns e ok rg e2 last=
   while :; do
     m=$(curl -s -m 600 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[3],"label":sys.argv[2]+":match","match_only":True,"skip_verify":True,"skip_passthrough":True}))' "$1" "$2" "$SOURCE")")
     t=$(echo "$m" | J mv_table); t="${t##*.}"; ns=$(echo "$m" | J mv_namespace)
     [ -n "$t" ] || break
+    # The SAME table matching right after it was evicted is its kept recipe
+    # (keep_recipe: data dropped, name banked), not data: the gateway logs
+    # "only DATALESS candidates" and phase 1 rebuilds from base (q90: CTAS over
+    # 720M rows, 2026-09-29). A regenerating answer is caught by
+    # regenerates_from below, so stop here instead of re-evicting 8 times.
+    [ "$t" = "$last" ] && { echo "   $2: $t matches only as its kept recipe (data evicted) — cold"; break; }
     e=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "{\"namespace\":\"${ns:-$MV_NAMESPACE}\",\"table\":\"$t\",\"keep_recipe\":true,\"force\":true}")
     ok=$(echo "$e" | J evicted)
@@ -346,6 +352,7 @@ evict_query(){ # evict_query <sql> <name>
       busy=$((busy+1)); [ "$busy" -ge 30 ] && { echo "   WARN $2: $t stayed busy for $busy rounds — NOT evicted, phase 1 serves warm"; break; }
       sleep 20; continue
     fi
+    last=$t
     rounds=$((rounds+1))
     [ "$rounds" -ge 8 ] && { echo "   WARN $2 still matches after $rounds evictions (two-tier answer regenerating from a companion the API cannot reach)"; break; }
   done
