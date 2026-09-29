@@ -319,7 +319,7 @@ print('')" "$1" 2>/dev/null; }
 # recipe kept). Two-tier answers regenerate from their chart MV the moment the
 # answer is evicted, so evict-and-rematch until the matcher returns nothing.
 evict_query(){ # evict_query <sql> <name>
-  local rounds=0 busy=0 m t ns e ok
+  local rounds=0 busy=0 m t ns e ok rg e2
   while :; do
     m=$(curl -s -m 600 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[3],"label":sys.argv[2]+":match","match_only":True,"skip_verify":True,"skip_passthrough":True}))' "$1" "$2" "$SOURCE")")
@@ -329,6 +329,16 @@ evict_query(){ # evict_query <sql> <name>
       -d "{\"namespace\":\"${ns:-$MV_NAMESPACE}\",\"table\":\"$t\",\"keep_recipe\":true,\"force\":true}")
     ok=$(echo "$e" | J evicted)
     echo "   $2: evict ${ns:-$MV_NAMESPACE}.$t evicted=$ok $(echo "$e" | J error)"
+    # An ANSWER row regenerates from its chart on the next touch, so evicting it
+    # alone never makes the query cold (the loop used to re-evict the same answer
+    # 8 times and run phase 1 warm: q12/q90, 2026-09-29). The gateway names the
+    # chart in regenerates_from — evict it too.
+    rg=$(echo "$e" | J regenerates_from)
+    if [ "$ok" = "True" ] && [ -n "$rg" ]; then
+      e2=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"namespace\":\"${rg%%.*}\",\"table\":\"${rg#*.}\",\"keep_recipe\":true,\"force\":true}")
+      echo "   $2: evict $rg (chart the answer regenerates from) evicted=$(echo "$e2" | J evicted) $(echo "$e2" | J error)"
+    fi
     if [ "$ok" != "True" ]; then
       # mid-merge / mid-serve (the match probe itself wakes a stale MV's refresh):
       # wait for the flight to land, then retry — up to ~10 min, like the
