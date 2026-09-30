@@ -2,7 +2,7 @@
 
 ## Blimp
 
-AI storage. AI queries. One platform. Blimp is sub-second data for AI agents: it writes the materialized views for your complex queries itself and caches them next to the GPUs. Launch a scalable Blimp node on any server, cloud instance, container or function runtime beside your existing pipeline — nothing migrates, cost drops → [blimp.software](https://blimp.software)
+Sub-second data for AI agents. Retrieval is the bottleneck, not the model: Blimp writes the materialized views for your complex queries itself and caches them next to the GPUs, so every later call is a sub-second read. Launch a scalable Blimp node on any server, cloud instance, container or function runtime beside your existing pipeline — nothing migrates, cost drops → [blimp.software](https://blimp.software)
 
 ### The problem — agents wait on data, not on the model
 
