@@ -321,6 +321,26 @@ evict_query(){ # evict_query <sql> <name>
     m=$(curl -s -m 600 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[3],"label":sys.argv[2]+":match","match_only":True,"skip_verify":True,"skip_passthrough":True}))' "$1" "$2" "$SOURCE")")
     t=$(echo "$m" | J mv_table); t="${t##*.}"; ns=$(echo "$m" | J mv_namespace)
+    # BRANCH MVs. A query the gateway serves by REASSEMBLING branch MVs names
+    # none of them in mv_table, so evicting mv_table alone left q33's and q80's
+    # branch MVs in place and "cold" phase 1 served them warm (q33 reused a
+    # branch built before its partner-prune fix, node 65, 2026-09-30). The
+    # probe's own trace names them; evict every one.
+    for b in $(echo "$m" | "$PY3" -c '
+import json,re,sys
+try: d=json.loads(sys.stdin.read() or "{}")
+except Exception: d={}
+seen=set()
+for s in d.get("author_trace") or []:
+    if s.get("phase") in ("reassemble","reassemble_partial","reassemble_branch_mv","reassemble_branch_sig","branch_match","reassemble_branch_own_bank"):
+        for x in re.findall(r"\b(mv_[a-z0-9_]{8,})\b", str(s.get("detail") or "")):
+            if x not in seen: seen.add(x); print(x)
+' 2>/dev/null); do
+      [ "$b" = "$t" ] && continue
+      eb=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"namespace\":\"$MV_NAMESPACE\",\"table\":\"$b\",\"keep_recipe\":true,\"force\":true}")
+      echo "   $2: evict branch $MV_NAMESPACE.$b evicted=$(echo "$eb" | J evicted) $(echo "$eb" | J error)"
+    done
     [ -n "$t" ] || break
     # The SAME table matching right after it was evicted is its kept recipe
     # (keep_recipe: data dropped, name banked), not data: the gateway logs
