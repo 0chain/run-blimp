@@ -93,13 +93,9 @@ usage(){
                                          --queries token
                      --append-rows N     CDC tick base rows (default 5000)
                      Add --evict to start COLD (evict each MV, re-author from the
-                     recipe library). There is NO --verify flag: correctness is
-                     gated by the AUTHOR's row-hash before an MV can bank, which
-                     runs on every author regardless. The old flag only added a
-                     phase-4 re-verification of the merged MV against the source
-                     — a full original scan per query (42 min on q72's 7.79M-row
-                     MV) that proved nothing a bench run needs — and it was the
-                     dominant cost of every iteration until it was removed.
+                     recipe library). Add --verify to compare each tick's
+                     served result (md5) with the ORIGINAL query run over base
+                     on the same data: MATCH / MATCH(float) / MISMATCH per query.
   blimp --bench      Bench: author / materialize / delta-merge timing profile
                      (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
   blimp --update     Update software ON THE NODE (via its :9401 helper, bearer = CLUSTER_TOKEN):
@@ -1699,10 +1695,9 @@ cmd_bench(){
   return $rc
 }
 
-# Flags may follow the command: `blimp --query --evict`. There is no --verify:
-# a run is always the PRODUCTION path — the gateway does no verification while
-# serving, so a run measures what customers actually get. Correctness is gated
-# at AUTHOR time by the row-hash an MV must pass before it banks.
+# Flags may follow the command: `blimp --query --evict --verify`. The gateway
+# does no verification while serving; --verify checks each tick's served result
+# against the original query afterwards (bench_cdc.sh phase 4).
 # LIBRARY MODE: `BLIMP_LIB_ONLY=1 . ./blimp` defines every function and then
 # stops, without parsing argv or running a command. test_setup_options.sh uses
 # this to unit-test the setup choices; nothing else should set it.
@@ -1718,17 +1713,10 @@ for f in "$@"; do
     printf -v "$pending" '%s' "$f"; export "$pending"; pending=""; continue
   fi
   case "$f" in
-    # --verify is GONE (2026-09-19). It set VERIFY=1, whose only effect was
-    # bench_cdc.sh's phase 4, "verify the merged MV against the source": a full
-    # original scan per query, measured at 42 min on q72 and the single biggest
-    # cost in every fix-and-prove cycle. The verification that actually gates
-    # correctness is the author's row-hash before banking, which is unaffected.
-    # Refuse it loudly rather than ignore it, so a stale script is fixed and not
-    # silently slowed.
-    --verify)
-      echo "blimp: --verify was removed — verification happens at AUTHOR time and always runs." >&2
-      echo "       The flag only added a phase-4 re-verify of the merged MV against source (tens of minutes per query)." >&2
-      exit 2 ;;
+    # --verify: after each measured tick, run the ORIGINAL query over base and
+    # compare its result md5 with the tick's served result (bench_cdc.sh phase
+    # 4). One original-query run per query; VERIFY_CAP_S caps it (default 1800).
+    --verify)       VERIFY=1; export VERIFY ;;
     --force-author) FORCE_AUTHOR=1; export FORCE_AUTHOR ;;
     # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
     # before phase 1 so it re-authors from the recipe library. force_author was

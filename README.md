@@ -151,7 +151,8 @@ TPC-DS seeder appends (test set only).
 (the gateway calls it `customer`): phase 1 authors an MV from it and verifies
 it, phase 2 appends rows to it (`seed_tpcds.py --tick`) and fires
 `/admin/source/snapshot_changed`, phase 3 re-runs the query so the gateway
-delta-merges the appended rows into the MV, phase 4 verifies the merged MV.
+delta-merges the appended rows into the MV, phase 4 (`--verify`) runs the
+original query over base and compares its result md5 with the tick's.
 `--evict` forces a cold author first; `--verify` turns verification on (off by
 default — that is the production path). Every phase shows up as a run on the
 node panel's Query tab. `BLIMP_INGEST=1` additionally copies the namespace
@@ -414,7 +415,7 @@ not part of production operation (production is your pipeline + the
 | 1 | run the query → the node authors an MV from your source | `author_ms`, `materialize_ms`, `verify_ms`, `cold_serve` |
 | 2 | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
 | 3 | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
-| 4 (with `--verify`) | re-check the merged MV against the source | `verify_status` |
+| 4 (with `--verify`) | run the original query over base, compare with the tick's served result | `verify: MATCH / MATCH(float) / MISMATCH` |
 
 ```
 blimp --query                                  # the default batch, 10 queries

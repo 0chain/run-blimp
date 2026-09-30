@@ -207,7 +207,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R V_RESULT MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # EVERY call passes skip_verify, and that is the PRODUCTION path: the gateway
@@ -220,11 +220,8 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # still logged `[mv-authoring][row_hash] MATCH n=130340916`. That line is the
   # proof to quote.
   #
-  # What used to live here was VERIFY=1 (the old --verify flag) turning on a
-  # phase-4 re-verification of the MERGED MV against the source. It was a full
-  # original scan per query — 42 min on q72's 7.79M-row MV — and it dominated
-  # every fix-and-prove cycle while proving nothing a bench run needs. Removed
-  # 2026-09-19 along with the flag.
+  # VERIFY=1 (--verify) no longer touches the author: it adds phase 4, which
+  # compares each tick's served result with the original query over base.
   #
   # force_author is NO LONGER implied by arg3. A forced author is not what
   # production does: a real query arrives, the matcher finds (or does not find) an
@@ -612,6 +609,8 @@ except Exception: print(-1)' 2>/dev/null)
     # Lazy CDC model: snapshot_changed only MARKS the MV stale; the delta-merge
     # happens ON this query and is reported inline as merge_ms.
     I_MERGE[$n]=$(echo "$R" | J merge_ms)
+    I_STATUS[$n]=$(echo "$R" | J status); I_ROWS[$n]=$(echo "$R" | J rows)
+    I_MD5[$n]=$(echo "$R" | J md5); I_MD5R[$n]=$(echo "$R" | J md5_rounded)
     # Take the MV's dimensions AND content hash from the MERGE response. Phase 1
     # only reports them on a COLD author, so once the MVs exist every later run
     # printed "?x?" — and with no hash there was no way to tell a merge that
@@ -681,28 +680,30 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
-  # ---- phase 4: REMOVED (2026-09-19) -----------------------------------------
-  # It re-verified the MERGED MV against the source: a full original scan per
-  # query, because an append invalidates the 24h original-hash cache. Measured
-  # 36 s for q9, 1m27s for q23, and 42 MINUTES for q72's 7.79M-row MV, and it
-  # was the dominant cost of every fix-and-prove cycle.
-  #
-  # What it covered, honestly: a wrong DELTA would be served, because phase 3
-  # passes skip_verify and the gateway does no verification in the serving
-  # path. A wrong AUTHOR cannot bank — the row-hash gate rejects it — so that
-  # half is still covered, for free, on every run.
-  #
-  # Delta correctness now belongs to the DELTA GATE below (mv content signature
-  # + row counts, which tells a merge that changed the MV from one that did
-  # nothing) and to the gateway's own background sampler. If you ever need the
-  # full re-scan back for one query, run that query by hand against the source;
-  # do not put it back in the suite's hot path.
-  # PHASE 4 IS GONE (2026-09-19). It re-verified the merged MV against the
-  # source — a full original scan per query, 42 min on q72's 7.79M-row MV —
-  # and it was the dominant cost of every fix-and-prove cycle while proving
-  # nothing the run needs. Correctness is gated at AUTHOR time: an MV cannot
-  # bank until its row-hash matches the original. Read that verdict from the
-  # author's log/trace line, not from a second full scan here.
+  # ---- phase 4 (--verify): the tick's served result vs the ORIGINAL query ---
+  # One plain comparison: run each query's original SQL over base (no_mv, same
+  # data — nothing is appended between the tick above and this run) and compare
+  # the gateway's result md5 with the tick's. Equal md5 = same rows. md5r
+  # (float-rounded) equal = same rows up to float summation order. Anything
+  # else is a wrong answer served by the tick. This replaces the old phase 4,
+  # which re-verified the merged MV (not the served answer) against source.
+  # Cost: one original-query run per query; capped by VERIFY_CAP_S.
+  if [ "${VERIFY:-0}" = 1 ]; then
+    echo ">> phase 4: verify — tick result vs original query over base"
+    for n in $FNAMES; do
+      B=$(curl -s -m "${VERIFY_CAP_S:-1800}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True}))' "${SQL[$n]}" "$SOURCE" "$n:verify")")
+      bst=$(echo "$B" | J status); brows=$(echo "$B" | J rows); bmd5=$(echo "$B" | J md5); bmd5r=$(echo "$B" | J md5_rounded)
+      tmd5="${I_MD5[$n]:-}"; [ "$tmd5" = null ] && tmd5=""; [ "$bmd5" = null ] && bmd5=""
+      if [ -z "$tmd5" ] || [ -z "$bmd5" ]; then v="UNCHECKED"
+      elif [ "$tmd5" = "$bmd5" ]; then v="MATCH"
+      elif [ -n "${I_MD5R[$n]:-}" ] && [ "${I_MD5R[$n]}" != null ] && [ "${I_MD5R[$n]}" = "$bmd5r" ]; then v="MATCH(float)"
+      else v="MISMATCH"; fi
+      V_RESULT[$n]="$v"
+      echo "   $n: verify: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
+    done
+  fi
 done
 sleep 4
 
