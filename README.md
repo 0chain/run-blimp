@@ -450,8 +450,9 @@ q1     store_returns      177924x5         4270     19216  incremental     329  
 The `verify` column is `MATCH` / `MATCH(float)` / `MISMATCH` with `--verify`,
 `(no --verify)` without it. Under the table each query prints the tick's result
 (status, rows, md5) and two links the node hosts — the same pages the node
-panel's Query tab opens: `mv:` the MV table, `result:` this tick's result, both
-paginated in the browser.
+panel's Query tab opens: `mv:` the MV table, `result:` this tick's result, and
+with `--verify` `base:` the original query's answer over base, all paginated in
+the browser — so a MISMATCH can be inspected side by side.
 
 `merge_ms` only counts when `delta_verdict` is `merged` — `UNCHANGED` or
 `EMPTY` mean the append produced no delta for that MV and the number measured

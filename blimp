@@ -1717,7 +1717,7 @@ for f in "$@"; do
   case "$f" in
     # --verify: after each measured tick, run the ORIGINAL query over base and
     # compare its result md5 with the tick's served result (bench_cdc.sh phase
-    # 4). One original-query run per query; VERIFY_CAP_S caps it (default 1800).
+    # 4). One original-query run per query; VERIFY_CAP_S caps it (default 3600).
     --verify)       VERIFY=1; export VERIFY ;;
     # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
     # before phase 1 so it re-authors from the recipe library. force_author was

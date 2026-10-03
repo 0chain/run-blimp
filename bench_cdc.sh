@@ -206,7 +206,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL V_RESULT MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL V_RESULT V_RESURL MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # EVERY call passes skip_verify, and that is the PRODUCTION path: the gateway
@@ -711,16 +711,16 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
   if [ "${VERIFY:-0}" = 1 ]; then
     echo ">> phase 4: verify — tick result vs original query over base"
     for n in $FNAMES; do
-      B=$(curl -s -m "${VERIFY_CAP_S:-1800}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
+      B=$(curl -s -m "${VERIFY_CAP_S:-3600}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
-        -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True}))' "${SQL[$n]}" "$SOURCE" "$n:verify")")
+        -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True,"persist_result":True}))' "${SQL[$n]}" "$SOURCE" "$n:verify")")
       bst=$(echo "$B" | J status); brows=$(echo "$B" | J rows); bmd5=$(echo "$B" | J md5); bmd5r=$(echo "$B" | J md5_rounded)
       tmd5="${I_MD5[$n]:-}"; [ "$tmd5" = null ] && tmd5=""; [ "$bmd5" = null ] && bmd5=""
       if [ -z "$tmd5" ] || [ -z "$bmd5" ]; then v="UNCHECKED"
       elif [ "$tmd5" = "$bmd5" ]; then v="MATCH"
       elif [ -n "${I_MD5R[$n]:-}" ] && [ "${I_MD5R[$n]}" != null ] && [ "${I_MD5R[$n]}" = "$bmd5r" ]; then v="MATCH(float)"
       else v="MISMATCH"; fi
-      V_RESULT[$n]="$v"
+      V_RESULT[$n]="$v"; V_RESURL[$n]=$(echo "$B" | J result_url)
       echo "   $n: verify: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
     done
   fi
@@ -790,6 +790,7 @@ for n in "${NAMES[@]}"; do
   echo "  $n: tick result: status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${I_MD5[$n]:-?}  verify=${V_RESULT[$n]:-(no --verify)}"
   echo "      mv:     $(u "${I_MVURL[$n]:-}" "none (served from base)")"
   echo "      result: $(u "${I_RESURL[$n]:-}" "not persisted for this run")"
+  [ -n "${V_RESULT[$n]:-}" ] && echo "      base:   $(u "${V_RESURL[$n]:-}" "not persisted (gateway without persist_result)")"
 done
 echo "=============================================================================="
 echo "mode=incremental → delta-merged (merge_ms, reads |MV|+|delta|); fallback/no-delta"
