@@ -1911,7 +1911,10 @@ def main():
             # facts after dimensions, since they reference the new dimension
             # keys (dim_hi_cache). A failure still raises into the rollback.
             from concurrent.futures import ThreadPoolExecutor
-            workers=int(os.environ.get("SEED_PARALLEL","8"))
+            # Opt-in: measured on nodes 37/65 (2026-10-03) the per-table commits
+            # serialize on the catalog — 8 threads took each append from ~5 s
+            # to ~36-75 s and the wall time did not move. SEED_PARALLEL=N.
+            workers=int(os.environ.get("SEED_PARALLEL","1"))
             def _dim(x):
                 _t=_time.time()
                 append_table(cat,fs,a.namespace,x,xrows[x],date_lo=date_lo,date_hi=date_hi,

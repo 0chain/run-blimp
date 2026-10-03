@@ -523,6 +523,21 @@ except Exception: print(-1)' 2>/dev/null)
   # prune gate relies on is unchanged: seed_tpcds.py issues each dimension's own
   # surrogate key as max(existing)+1 and appends dimensions BEFORE the facts.
   EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer customer_address customer_demographics date_dim household_demographics item income_band promotion reason ship_mode store time_dim warehouse web_page web_site call_center catalog_page}"
+  # QUERY-SCOPED EXTRAS (default; CDC_EXTRA_SCOPE=all appends every table). A
+  # table no query of this run reads cannot reach any MV the run measures (the
+  # gateway diffs only the tables an MV reads), yet each costs an Iceberg commit:
+  # the tick was ~90-200 s, nearly all of it ~22 sequential commits. Only the
+  # extras some loaded query names are appended; every query's own dimensions
+  # still move, so its dim-delta and RI-prune lanes stay exercised.
+  if [ -z "${CDC_EXTRA_TABLES+x}" ] && [ "${CDC_EXTRA_SCOPE:-query}" != "all" ]; then
+    scoped=""
+    for t in $EXTRA_TABLES; do
+      for n in "${NAMES[@]}"; do
+        if printf '%s' "${SQL[$n]}" | grep -qiw "$t"; then scoped="$scoped $t"; break; fi
+      done
+    done
+    EXTRA_TABLES="${scoped# }"
+  fi
   NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns $EXTRA_TABLES"
   # With --sql the tables to notify are the ones the queries actually read (derived
   # above from the SQL + catalog), not a fixed list: snapshot_changed for each of
