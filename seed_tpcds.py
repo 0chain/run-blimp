@@ -834,14 +834,21 @@ def _bounds_load():
     return _BOUNDS
 
 
+import threading as _threading
+_BOUNDS_LOCK = _threading.Lock()
+
+
 def _bounds_save():
-    try:
-        import json as _j
-        tmp = _BOUNDS_PATH + ".tmp"
-        _j.dump(_BOUNDS or {}, open(tmp, "w"))
-        os.replace(tmp, _BOUNDS_PATH)
-    except Exception:
-        pass
+    # appends run in parallel (one thread per table): one writer at a time
+    with _BOUNDS_LOCK:
+        try:
+            import json as _j
+            tmp = _BOUNDS_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                _j.dump(dict(_BOUNDS or {}), f)
+            os.replace(tmp, _BOUNDS_PATH)
+        except Exception:
+            pass
 
 
 def _snap_id(t):
@@ -1040,7 +1047,40 @@ def load_dim_hi(cat, namespace, dimtables, verbose=True):
     return out
 
 
+_GEO_CACHE = os.path.expanduser(os.environ.get("SEED_GEO_CACHE", "~/.seed_geo_pairs.%s.pkl"))
+
+
 def load_geo_pairs(cat, namespace, verbose=True):
+    """Cached across ticks: the scan below reads all of customer (12M rows at
+    SF1000) and took ~28 s of every ~200 s tick. The pairs only steer which
+    (customer, store) a new sale is drawn from; pairs from earlier ticks stay
+    valid (rows are never deleted), so a cached set is reused and the scan runs
+    only when no cache exists. SEED_GEO_CACHE_REFRESH=1 forces a rescan."""
+    import pickle
+    path = _GEO_CACHE % namespace
+    if os.environ.get("SEED_GEO_CACHE_REFRESH") != "1":
+        try:
+            with open(path, "rb") as f:
+                got = pickle.load(f)
+            if got and verbose:
+                print(f"   geo-correlated pairs: {len(got[0])} from the cache ({path})")
+            if got:
+                return got
+        except Exception:
+            pass
+    got = _load_geo_pairs_scan(cat, namespace, verbose)
+    if got:
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(got, f)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+    return got
+
+
+def _load_geo_pairs_scan(cat, namespace, verbose=True):
     """(customer_sk, addr_sk, store_sk) triples where the STORE IS IN THE
     CUSTOMER'S OWN ZIP — i.e. people shop near where they live.
 
@@ -1864,19 +1904,38 @@ def main():
         import time as _time
         _tt0=_time.time(); _tt=[]
         try:
-            for x in extras:
+            # PARALLEL BY TABLE. Each append is one Iceberg commit on its own
+            # table (~10 s each, ~24 of them: the tick was ~200 s, almost all
+            # of it these commits in sequence). Different tables commit
+            # independently, so dimensions run together, then facts together —
+            # facts after dimensions, since they reference the new dimension
+            # keys (dim_hi_cache). A failure still raises into the rollback.
+            from concurrent.futures import ThreadPoolExecutor
+            workers=int(os.environ.get("SEED_PARALLEL","8"))
+            def _dim(x):
                 _t=_time.time()
                 append_table(cat,fs,a.namespace,x,xrows[x],date_lo=date_lo,date_hi=date_hi,
                              dim_hi_cache=dim_hi_cache,strict=strict)
-                _tt.append((x,_time.time()-_t))
-            _t=_time.time()
-            geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
-            _tt.append(("geo_pairs",_time.time()-_t))
-            for sf,sn,rf,rn in plan:
+                return (x,_time.time()-_t)
+            def _geo():
+                _t=_time.time()
+                g=None if a.no_geo else load_geo_pairs(cat,a.namespace)
+                return g,("geo_pairs",_time.time()-_t)
+            with ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
+                gf=ex.submit(_geo)
+                for r in list(ex.map(_dim,extras)):
+                    _tt.append(r)
+                geo,gt=gf.result()
+                _tt.append(gt)
+            def _fact(p):
+                sf,sn,rf,rn=p
                 _t=_time.time()
                 append_fact(cat,fs,a.namespace,sf,sn,date_lo=date_lo,date_hi=date_hi,
                             dim_hi_cache=dim_hi_cache,returns_rows=rn,strict=strict,geo=geo)
-                _tt.append((sf,_time.time()-_t))
+                return (sf,_time.time()-_t)
+            with ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
+                for r in list(ex.map(_fact,plan)):
+                    _tt.append(r)
             # WHERE THE TICK'S TIME GOES — measured per table, so the slowest
             # step is named instead of guessed (the tick was ~80-95 s, 2026-09-24).
             print("== tick timing: total %.1fs | %s"%(_time.time()-_tt0,
