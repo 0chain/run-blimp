@@ -1462,6 +1462,29 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
     scols = [c for c, k in columns if k == "s"]
     if t is None or not scols:
         return {}
+    # CACHED ACROSS TICKS. A categorical domain does not move when the appends
+    # draw from it, but sampling it re-planned a scan over every manifest of the
+    # table (one per tick, ~1,000 now): date_dim's 8-row append took 6.9 s and
+    # store's 1-row append 6.7 s (node 144, SF1000, 2026-10-03).
+    # SEED_STRDOM_REFRESH=1 re-samples.
+    import json as _j
+    try:
+        tname = ".".join(t.name()[-2:])
+    except Exception:
+        tname = ""
+    cpath = os.path.expanduser("~/.seed_strdom.%s.json" % tname) if tname else ""
+    ckey = ",".join(sorted(scols))
+    if cpath and os.environ.get("SEED_STRDOM_REFRESH") != "1":
+        try:
+            with open(cpath) as f:
+                c = _j.load(f)
+            if c.get("cols") == ckey:
+                if verbose and c.get("out"):
+                    print("   string domains (cached): "
+                          + ", ".join(f"{k}={len(v)}" for k, v in sorted(c["out"].items())))
+                return c.get("out") or {}
+        except Exception:
+            pass
     try:
         arr = t.scan(selected_fields=tuple(scols), limit=sample_rows).to_arrow()
     except Exception as e:
@@ -1485,6 +1508,13 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
     if verbose and out:
         print("   string domains from the live table (categorical): "
               + ", ".join(f"{c}={len(v)}" for c, v in sorted(out.items())))
+    if cpath:
+        try:
+            with open(cpath + ".tmp", "w") as f:
+                _j.dump({"cols": ckey, "out": out}, f, default=str)
+            os.replace(cpath + ".tmp", cpath)
+        except Exception:
+            pass
     return out
 
 
