@@ -98,7 +98,7 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 ```
 blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
-blimp --query         prove authoring + CDC delta-merge on the TPC-DS queries
+blimp --query         prove authoring + CDC delta-merge (a TPC-DS query with --tpc, your own SQL with --sql)
 blimp --storage       storage suite: TTFB, warp PUT/GET, MLPerf resnet50
 blimp --acid          ACID / linearizability check of both data paths
 blimp --bench         author / materialize / delta-merge timing profile
@@ -414,6 +414,7 @@ not part of production operation (production is your pipeline + the
 is whether the MV is rebuilt and whether the tick's answer is checked:
 
 ```
+blimp --query --sql ./my_query.sql          # the same three ways work with your own SQL file in place of --tpc
 blimp --query --tpc 3                      # 1. as-is: serve the MV the node already has (authors only if none), append, tick
 blimp --query --tpc 3 --evict              # 2. cold: evict the MV, re-author it (+ author verify), append, tick
 blimp --query --tpc 3 --evict --verify     # 3. cold + post-verify: as 2, then the tick's answer vs the original query over base
@@ -422,9 +423,17 @@ blimp --query --tpc 3 --evict --verify     # 3. cold + post-verify: as 2, then t
 ```
 blimp --query                                  # the default batch, 10 queries
 blimp --query --tpc "3 7 19"                   # pick TPC-DS queries
+blimp --query --sql ./my_query.sql             # YOUR SQL file
+blimp --query --sql ./queries/                 # a directory of .sql files
 blimp --query --evict --verify                 # cold start + correctness check
 blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
 ```
+
+With `--sql` the tables a query reads are parsed from its `FROM`/`JOIN`
+clauses and checked against the catalog, and the **fact** is the referenced
+table with the most rows (the node's own rule), so `snapshot_changed` fires for
+exactly the tables the query touches. The phase-2 append is the TPC-DS seeder,
+so the query must read TPC-DS tables.
 
 **Reading the result.** One row per query, e.g.:
 
