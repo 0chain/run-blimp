@@ -1644,10 +1644,17 @@ cmd_query(){
   # to loopback ONLY when loopback actually serves the port, so a genuinely-remote
   # external source is left untouched. Mirrors the --setup fix.
   local Q_S3_ENDPOINT; Q_S3_ENDPOINT="$(endpoint_local "${S3_ENDPOINT:-http://$GW:9000}")"
+  # The MV parts (tpcds-mv/<mv>/parts.json, delta-*.parquet, data.parquet) live
+  # on the GATEWAY's store, not the source: passing the source endpoint here made
+  # the delta gate read an empty bucket before AND after every tick, so every
+  # merge reported NO-BASELINE / 0 rows while the trace said DELTA-MERGED
+  # (nodes 37/144: :9002 lists nothing, 127.0.0.1:9000 lists both delta parts,
+  # 2026-10-03). bench_cdc.sh pairs this endpoint with GW_AK/GW_SK.
+  local Q_MV_S3_ENDPOINT; Q_MV_S3_ENDPOINT="$(endpoint_local "${MV_S3_ENDPOINT:-http://$GW:9000}")"
   run_query_suite(){
     env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
       NAMESPACE="${NAMESPACE:-tpcds}" REGION="${REGION:-ap-south-1}" \
-      S3_ENDPOINT="$Q_S3_ENDPOINT" MV_S3_ENDPOINT="$Q_S3_ENDPOINT" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
+      S3_ENDPOINT="$Q_S3_ENDPOINT" MV_S3_ENDPOINT="$Q_MV_S3_ENDPOINT" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
       QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
       QNRS="$1" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
       SQL_FILES="${SQL_FILES:-}" \

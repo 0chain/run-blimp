@@ -638,8 +638,13 @@ except Exception: print(-1)' 2>/dev/null)
     # EXISTING groups and the row count does not move even when the content does.
     t="${MVTBL[$n]##*.}"
     if [ -n "$t" ]; then
-      read mr mc <<<"$(mv_dims "$t")"
-      [ -n "${mr:-}" ] && MV_ROWS[$n]="$mr"; [ -n "${mc:-}" ] && MV_COLS[$n]="$mc"
+      # The merge response's own mv_rows/mv_cols first (what the tick line
+      # prints); /admin/mv/list's row_count is 0 for a merged MV, which printed
+      # mv=0x5 beside "MV: 2696291 rows x 5 cols" (q1, node 37, 2026-10-03).
+      mr=$(echo "$R" | J mv_rows); mc=$(echo "$R" | J mv_cols)
+      case "$mr" in ''|0|None|null) read mr mc2 <<<"$(mv_dims "$t")"; mc="${mc:-$mc2}";; esac
+      case "$mr" in ''|0|None|null) ;; *) MV_ROWS[$n]="$mr";; esac
+      case "$mc" in ''|0|None|null) ;; *) MV_COLS[$n]="$mc";; esac
       MV_HASH_NEW[$n]=$(mv_etag "$t")
     fi
     echo "   $n: phase-3 wall: request $(awk "BEGIN{printf \"%.1f\", $_p3r-$_p3}")s, dims+etag $(awk "BEGIN{printf \"%.1f\", $(date +%s.%N)-$_p3r}")s"
