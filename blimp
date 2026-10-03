@@ -79,27 +79,23 @@ usage(){
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
-                     --sql <file|dir>    run YOUR SQL (any dataset): tables + fact are
-                                         derived from the SQL and the catalog
-                     --tick-cmd '<cmd>'  your streamer appends in phase 2 (default:
-                                         the TPC-DS seeder, test set only)
-                     --queries "3 7 19"  which TPC-DS queries (default: --first-10)
+                     --sql <file|dir>    send the query in YOUR .sql file(s); any table
+                                         registered in the Iceberg catalog. The tick's
+                                         append is the TPC-DS seeder, so only TPC-DS
+                                         tables change between author and tick
+                     --tpc "3 7 19"      which TPC-DS queries (default: --first-10)
                      --second-40 | --third-30 | --fourth-19 | --all
                                          run a batch from suites/: --first-10 (the 10
                                          proven queries) is the DEFAULT; then the rest of
                                          the release-50, then the remaining 49 split
                                          30/19; --all = every TPC-DS query 1-99. Flags
                                          stack, and a batch name also works as a
-                                         --queries token
+                                         --tpc token
                      --append-rows N     CDC tick base rows (default 5000)
                      Add --evict to start COLD (evict each MV, re-author from the
-                     recipe library). There is NO --verify flag: correctness is
-                     gated by the AUTHOR's row-hash before an MV can bank, which
-                     runs on every author regardless. The old flag only added a
-                     phase-4 re-verification of the merged MV against the source
-                     — a full original scan per query (42 min on q72's 7.79M-row
-                     MV) that proved nothing a bench run needs — and it was the
-                     dominant cost of every iteration until it was removed.
+                     recipe library). Add --verify to compare each tick's
+                     served result (md5) with the ORIGINAL query run over base
+                     on the same data: MATCH / MATCH(float) / MISMATCH per query.
   blimp --bench      Bench: author / materialize / delta-merge timing profile
                      (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
   blimp --update     Update software ON THE NODE (via its :9401 helper, bearer = CLUSTER_TOKEN):
@@ -906,6 +902,12 @@ ensure_deps(){
       BLIMP_PY="$HOME/.blimp_venv/bin/python3"
     fi
   fi
+  # DuckDB for the tick's query-aware key pools (query_pools.py). Without it
+  # every tick draws keys uniformly and date-baked MVs merge 0 rows (node 37's
+  # system python has none, 2026-09-28). Installed into the venv when missing.
+  if [ -x "$BLIMP_PY" ] && ! "$BLIMP_PY" -c 'import duckdb' 2>/dev/null; then
+    "$(dirname "$BLIMP_PY")/pip" install -q --force-reinstall --no-deps duckdb 2>&1 | tail -1 || true
+  fi
   "$BLIMP_PY" -c 'import pyiceberg' 2>/dev/null \
     && bold "  ✓ deps ready (python: $BLIMP_PY)" \
     || { BLIMP_PY=python3; echo "  ! pyiceberg unavailable — register/CDC steps need: pip install 'pyiceberg[s3fs]' pyarrow boto3"; }
@@ -1648,9 +1650,9 @@ cmd_query(){
       S3_ENDPOINT="$Q_S3_ENDPOINT" MV_S3_ENDPOINT="$Q_S3_ENDPOINT" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
       QAPI="${QAPI:-}" TOKEN="${TOKEN:-}" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" SOURCE="${SOURCE:-}" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" \
       QNRS="$1" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
-      SQL_FILES="${SQL_FILES:-}" CDC_TICK_CMD="${CDC_TICK_CMD:-}" \
+      SQL_FILES="${SQL_FILES:-}" \
       ICEBERG_PREFIX="${ICEBERG_PREFIX:-}" ICEBERG_URL_LOCAL="${ICEBERG_URL_LOCAL:-}" \
-      VERIFY="${VERIFY:-0}" FORCE_AUTHOR="${FORCE_AUTHOR:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
+      VERIFY="${VERIFY:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
   }
   # ONE QUERY AT A TIME. A batch runs phase 1 for every query, ONE append, then
   # phase 3 for every query — so a slow cold author holds every other query's
@@ -1678,7 +1680,7 @@ cmd_bench(){
   # delta_merge_ms + materialize_ms (min/median/avg/max). Tune ITERS / AUTHOR_ITERS
   # / CDC_ROWS to size the sweep and the delta.
   # One bench_incremental.sh run per query of the selected batch (default
-  # --first-10; --second-40/--third-30/--fourth-19/--all/--queries stack). An
+  # --first-10; --second-40/--third-30/--fourth-19/--all/--tpc stack). An
   # explicit BENCH_QNR=<n> in the env still benches that single query.
   local q rc=0
   for q in ${BENCH_QNR:-$QNRS}; do
@@ -1693,17 +1695,18 @@ cmd_bench(){
   return $rc
 }
 
-# Flags may follow the command: `blimp --query --evict`. There is no --verify:
-# a run is always the PRODUCTION path — the gateway does no verification while
-# serving, so a run measures what customers actually get. Correctness is gated
-# at AUTHOR time by the row-hash an MV must pass before it banks.
+# Flags may follow the command: `blimp --query --evict --verify`. Two different
+# verifications exist: the AUTHOR's row-hash (the node proves every new MV
+# against the original query before banking it — always on, not a flag), and
+# --verify, which runs the original query over base after the tick and compares
+# its result md5 with the tick's served answer (bench_cdc.sh phase 4).
 # LIBRARY MODE: `BLIMP_LIB_ONLY=1 . ./blimp` defines every function and then
 # stops, without parsing argv or running a command. test_setup_options.sh uses
 # this to unit-test the setup choices; nothing else should set it.
 if [ "${BLIMP_LIB_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
 CMD="${1:-}"; shift 2>/dev/null || true
-pending=""   # name of the variable the NEXT argument fills (--queries "3 7 19")
+pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
 for f in "$@"; do
   # --update / --update-log take their own sub-arguments (service lists,
   # --tag svc=tag, --dry-run, an update id); cmd_update validates them.
@@ -1712,37 +1715,27 @@ for f in "$@"; do
     printf -v "$pending" '%s' "$f"; export "$pending"; pending=""; continue
   fi
   case "$f" in
-    # --verify is GONE (2026-09-19). It set VERIFY=1, whose only effect was
-    # bench_cdc.sh's phase 4, "verify the merged MV against the source": a full
-    # original scan per query, measured at 42 min on q72 and the single biggest
-    # cost in every fix-and-prove cycle. The verification that actually gates
-    # correctness is the author's row-hash before banking, which is unaffected.
-    # Refuse it loudly rather than ignore it, so a stale script is fixed and not
-    # silently slowed.
-    --verify)
-      echo "blimp: --verify was removed — verification happens at AUTHOR time and always runs." >&2
-      echo "       The flag only added a phase-4 re-verify of the merged MV against source (tens of minutes per query)." >&2
-      exit 2 ;;
-    --force-author) FORCE_AUTHOR=1; export FORCE_AUTHOR ;;
+    # --verify: after each measured tick, run the ORIGINAL query over base and
+    # compare its result md5 with the tick's served result (bench_cdc.sh phase
+    # 4). One original-query run per query; VERIFY_CAP_S caps it (default 3600).
+    --verify)       VERIFY=1; export VERIFY ;;
     # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
     # before phase 1 so it re-authors from the recipe library. force_author was
     # removed from the gateway (2026-07-31); this is the only real cold path.
     --evict)        EVICT=1; export EVICT ;;
-    # --queries "3 7 19": the TPC-DS query numbers to run (default: the proven
+    # --tpc "3 7 19": the TPC-DS query numbers to run (default: the proven
     # delta-merge set). --append-rows N: base rows for the CDC tick (default 5000).
-    --queries)      pending=QNRS ;;
-    # --sql <file|dir>: run ANY SQL against the wired source (author → verify →
+    --tpc)          pending=QNRS ;;
+    # --sql <file|dir>: run YOUR SQL against the wired source (author → verify →
     # append → merge → serve); the query's tables and fact are derived from the
-    # SQL + catalog. --tick-cmd '<cmd>': your own streamer does the phase-2
-    # append (default: the TPC-DS seeder for the test set).
+    # SQL + catalog; any registered Iceberg table. The phase-2 append is the
+    # TPC-DS seeder, so only TPC-DS tables change between author and tick.
     --sql)          pending=SQL_FILES ;;
     --sql=*)        SQL_FILES="${f#--sql=}"; export SQL_FILES ;;
-    --tick-cmd)     pending=CDC_TICK_CMD ;;
-    --tick-cmd=*)   CDC_TICK_CMD="${f#--tick-cmd=}"; export CDC_TICK_CMD ;;
     --first-10|--second-40|--third-30|--fourth-19)
                     QNRS="${QNRS:+$QNRS }${f#--}"; export QNRS ;;
     --all)          QNRS="$(seq -s ' ' 1 99)"; export QNRS ;;
-    --queries=*)    QNRS="${f#--queries=}"; export QNRS ;;
+    --tpc=*)        QNRS="${f#--tpc=}"; export QNRS ;;
     --append-rows)  pending=CDC_ROWS ;;
     --append-rows=*) CDC_ROWS="${f#--append-rows=}"; export CDC_ROWS ;;
     # Positional sub-arg for --encryption / --immutable (on|off|status); consumed
@@ -1753,7 +1746,7 @@ for f in "$@"; do
 done
 [ -z "$pending" ] || { echo "flag --${pending,,} needs a value"; exit 2; }
 
-# Named suites: a --queries token (or --first-10/--second-40/--third-30/--fourth-19)
+# Named suites: a --tpc token (or --first-10/--second-40/--third-30/--fourth-19)
 # that names a file under suites/ expands to the numbers in that file, so a release
 # list lives in the repo once instead of being retyped on every box.
 resolve_suite_names(){
@@ -1765,7 +1758,7 @@ resolve_suite_names(){
   done
   QNRS="$(echo $out)"; export QNRS
 }
-# Default batch for a query run is first-10 (a --queries/batch flag overrides).
+# Default batch for a query run is first-10 (a --tpc/batch flag overrides).
 case "$CMD" in --query|query|--bench|bench) [ -n "${QNRS:-}" ] || QNRS=first-10 ;; esac
 [ -z "${QNRS:-}" ] || resolve_suite_names
 

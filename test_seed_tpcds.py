@@ -517,6 +517,56 @@ class TestProportionalTick(unittest.TestCase):
         self.assertEqual([p[1] for p in S.plan_tick(20000)], [20000, 10000, 5000])
 
 
+class TestDerivedDatesStayInsideDateDim(unittest.TestCase):
+    """Ship and return dates derived from a sale near the end of the calendar
+    must name date_dim rows that exist — a key past the max is issued to a later
+    date_dim append that old facts already reference (q94/q95, node 144)."""
+
+    def test_date_after_is_bounded(self):
+        rnd = random.Random(7)
+        for d in range(90, 151):
+            x = S.date_after(d, 2, 90, 150, rnd)
+            self.assertLessEqual(x, 150)
+            self.assertGreaterEqual(x, min(d, 150))
+
+    def test_ship_and_return_dates_bounded(self):
+        rnd = random.Random(3)
+        dmax = 2452640
+        cols = S.gen_fact_cols("web_sales", S.FACT_COLUMNS["web_sales"], 400,
+                               date_lo=dmax - 3, date_hi=dmax, dim_hi={"date_dim": dmax},
+                               key_base=1, rnd=rnd)
+        self.assertLessEqual(max(cols["ws_ship_date_sk"]), dmax)
+        ret = S.gen_referential_returns("web_sales", cols, S.FACT_COLUMNS["web_returns"], 200,
+                                        date_lo=dmax - 3, date_hi=dmax, dim_hi={"date_dim": dmax}, rnd=rnd)
+        self.assertLessEqual(max(ret["wr_returned_date_sk"]), dmax)
+
+
+
+class TestDateDimRowFromKey(unittest.TestCase):
+    """Appended date_dim rows take their calendar from the key (Julian day),
+    matching the real SF10 rows read from the node (2026-09-28)."""
+
+    def test_matches_real_rows(self):
+        real = {
+            2451180: ("1999-01-01", 1188, 5166, 5, 1, "1999Q1", "Friday", 2451180, 2450815, 2451088),
+            2451545: ("2000-01-01", 1200, 5218, 6, 1, "2000Q1", "Saturday", 2451545, 2451180, 2451453),
+            2452275: ("2001-12-31", 1223, 5322, 1, 4, "2001Q4", "Monday", 2452245, 2451910, 2452183),
+        }
+        for k, (d, mseq, wseq, dow, qoy, qn, dn, fdom, ly, lq) in real.items():
+            r = S.date_dim_row(k)
+            got = (str(r["d_date"]), r["d_month_seq"], r["d_week_seq"], r["d_dow"], r["d_qoy"],
+                   r["d_quarter_name"], r["d_day_name"], r["d_first_dom"], r["d_same_day_ly"], r["d_same_day_lq"])
+            self.assertEqual(got, (d, mseq, wseq, dow, qoy, qn, dn, fdom, ly, lq), k)
+
+    def test_appended_rows_fall_after_the_calendar(self):
+        cols = [("d_date_sk", "i"), ("d_date", "t"), ("d_year", "i"), ("d_quarter_name", "s")]
+        out = S.gen_table_cols("date_dim", cols, 3, date_lo=2451545, date_hi=2452640,
+                               dim_hi={}, key_base=2488071, rnd=random.Random(1))
+        self.assertEqual([str(x) for x in out["d_date"]], ["2100-01-02", "2100-01-03", "2100-01-04"])
+        self.assertEqual(out["d_year"], [2100, 2100, 2100])
+        self.assertEqual(out["d_quarter_name"], ["2100Q1"] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1198,6 +1248,45 @@ class DimOwnKeyResolvesTest(unittest.TestCase):
         self.assertIsNone(self._keycol("catalog_sales", [("cs_quantity", "int")]))
 
 
+class EveryAppendedDimIssuesFreshKeysTest(unittest.TestCase):
+    """Every dimension bench_cdc.sh appends to must issue its own key above the
+    table's max. income_band's ib_income_band_sk matched no DIM_BY_SUFFIX entry,
+    so own_key_of() was None, append_table() skipped its bounds lookup and
+    gen_table_cols() filled the PK with randint(1, 1000): measured on nodes 37
+    and 144 (2026-09-25) income_band held 56,352 / 10,144 live rows over 1,000
+    distinct keys. The table list is read from bench_cdc.sh's default
+    CDC_EXTRA_TABLES, so a dimension added there is covered here too."""
+
+    def _extra_tables(self):
+        import os, re
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_cdc.sh")).read()
+        m = re.search(r'EXTRA_TABLES="\$\{CDC_EXTRA_TABLES-([^}]*)\}"', src)
+        self.assertIsNotNone(m, "bench_cdc.sh default CDC_EXTRA_TABLES not found")
+        return m.group(1).split()
+
+    def test_every_appended_dimension_has_an_own_key(self):
+        for table in self._extra_tables():
+            if table == "inventory":      # composite key (date, item, warehouse): no surrogate
+                continue
+            with self.subTest(table=table):
+                key = S.own_key_of(table)
+                self.assertIsNotNone(key, f"{table}: no own key — appends re-use existing keys")
+                # date_dim's key is a Julian day (date_dim_row derives the
+                # calendar from it), so its keys start at a real date.
+                base = 2451545 if table == "date_dim" else 5001
+                cols = S.gen_table_cols(table, [(key, "i")], 6, date_lo=2451180,
+                                        date_hi=2451544, dim_hi={}, key_base=base)
+                self.assertEqual(cols[key], list(range(base, base + 6)))
+
+    def test_income_band_fk_joins_income_band(self):
+        self.assertEqual(S.dim_for("hd_income_band_sk"), ("income_band", "ib_income_band_sk"))
+        cols = S.gen_table_cols("household_demographics",
+                                [("hd_demo_sk", "i"), ("hd_income_band_sk", "i")], 200,
+                                date_lo=2451180, date_hi=2451544,
+                                dim_hi={"income_band": 20}, key_base=1)
+        self.assertLessEqual(max(cols["hd_income_band_sk"]), 20)
+
+
 class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
     """gen_table_cols must fill a dimension's own PK from key_base, not noise.
 
@@ -1223,3 +1312,54 @@ class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
                                     dim_hi={}, key_base=7201)
             self.assertEqual(cols[key], list(range(7201, 7207)),
                              f"{table}.{key} not issued from key_base — appends would re-use keys")
+
+
+class TestBoundsFoldOnlyOntoParentSnapshot(unittest.TestCase):
+    """A cached bound folds an append only when it was stamped at the append's
+    parent snapshot; otherwise another writer's files are missing from it and
+    it must be dropped (node 65, 2026-09-28: hi=2490119 cached vs 2494785)."""
+
+    def _table(self, snap, parent):
+        class Snap:  # minimal pyiceberg snapshot
+            snapshot_id, parent_snapshot_id = snap, parent
+        class T:
+            def name(self):
+                return ("ns", "store_sales")
+            def current_snapshot(self):
+                return Snap()
+        return T()
+
+    def test_fold_and_drop(self):
+        import pyarrow as pa
+        saved = (S._bounds_load, S._bounds_save)
+        cache = {"ns.store_sales|ss_sold_date_sk|0": {"snap": 10, "lo": 5, "hi": 50},
+                 "ns.store_sales|ss_item_sk|0": {"snap": 9, "lo": 1, "hi": 9}}
+        S._bounds_load, S._bounds_save = (lambda: cache), (lambda: None)
+        try:
+            data = pa.table({"ss_sold_date_sk": [70, 60], "ss_item_sk": [3, 4]})
+            S._bounds_after_append(self._table(11, 10), data, 2)
+        finally:
+            S._bounds_load, S._bounds_save = saved
+        self.assertEqual(cache["ns.store_sales|ss_sold_date_sk|0"], {"snap": 11, "lo": 5, "hi": 70})
+        self.assertNotIn("ns.store_sales|ss_item_sk|0", cache,
+                         "a bound stamped before another writer's append must be re-read, not folded")
+
+
+class TestFactFkMaxCountsDimensionReferences(unittest.TestCase):
+    """income_band keys must be issued above household_demographics'
+    hd_income_band_sk too, not only above the facts (node 37, 2026-09-28)."""
+
+    def test_dimension_reference_raises_the_floor(self):
+        saved = (S._namespace_columns, S.catalog_bounds, dict(S._FACT_FK_MAX))
+        S._FACT_FK_MAX.clear()
+        S._namespace_columns = lambda cat, ns: {"household_demographics": ["hd_demo_sk", "hd_income_band_sk"], "income_band": ["ib_income_band_sk"]}
+        def bounds(cat, ns, table, col, min_rows=0):
+            if (table, col) == ("household_demographics", "hd_income_band_sk"):
+                return 1, 87
+            return None, None
+        S.catalog_bounds = bounds
+        try:
+            self.assertEqual(S.fact_fk_max(None, "ns", "income_band"), 87)
+        finally:
+            S._namespace_columns, S.catalog_bounds = saved[0], saved[1]
+            S._FACT_FK_MAX.clear(); S._FACT_FK_MAX.update(saved[2])

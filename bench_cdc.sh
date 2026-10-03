@@ -10,15 +10,14 @@
 # and AVG/CTE queries are NOT here — they fall back to full re-author by design.
 #
 # Every call is labeled (<name>:author / <name>:incr). Verification follows the
-# product's own model: the cold author (force_author) IS verified — that is the
+# product's own model: the cold author IS verified (its row-hash) — that is the
 # one point where an MV's values are proven against the source — and the merge
 # calls pass skip_verify, because a delta-merge re-verify is another full source
-# scan per query and a merge that goes wrong falls back to force_author (which
-# verifies) on its own. It also EVICTS these MVs first so `snapshot_changed`
+# scan per query. --verify (phase 4) checks the tick's served answer instead. It also EVICTS these MVs first so `snapshot_changed`
 # only wakes them, not a herd of stale multi-fact MVs from earlier runs.
 #
 # Env: GW CLUSTER_ID ICEBERG_URL WAREHOUSE [NAMESPACE=tpcds] [REGION=ap-south-1]
-#      [CDC_ROWS=5000] [FORCE_AUTHOR=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
+#      [CDC_ROWS=5000] [EVICT=0] [VERIFY=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
 #      runs on the gateway; set the gateway's duckdb threads there to change it.)
 set -u
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
@@ -52,6 +51,19 @@ SOURCE="${SOURCE:-customer}"
 # (test2 node 1788402989672, 2026-09-03).
 QAPI="${QAPI:-http://$GW:9000}"; TOKEN="${TOKEN:-${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}}"; HERE="$(cd "$(dirname "$0")" && pwd)"
 PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3="$HOME/venv_ib/bin/python3"; [ -x "$PY3" ] || PY3=python3
+# pool_python: the first interpreter whose duckdb imports (the bench venv, then
+# the system python). Node 37's system python has no duckdb while the venv has
+# 1.5.5, and asking only `python3` made every tick draw keys uniformly
+# (2026-09-28). When neither imports, the venv's duckdb is reinstalled once.
+pool_python(){
+  local p
+  for p in "$PY3" python3; do "$p" -c "import duckdb" 2>/dev/null && { echo "$p"; return 0; }; done
+  if [ -x "$(dirname "$PY3")/pip" ]; then
+    "$(dirname "$PY3")/pip" install -q --force-reinstall --no-deps duckdb >/dev/null 2>&1 || true
+    "$PY3" -c "import duckdb" 2>/dev/null && { echo "$PY3"; return 0; }
+  fi
+  return 1
+}
 J(){ python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('$1',''))
 except: print('')"; }
@@ -194,7 +206,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL V_RESULT V_RESURL MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # EVERY call passes skip_verify, and that is the PRODUCTION path: the gateway
@@ -207,18 +219,9 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # still logged `[mv-authoring][row_hash] MATCH n=130340916`. That line is the
   # proof to quote.
   #
-  # What used to live here was VERIFY=1 (the old --verify flag) turning on a
-  # phase-4 re-verification of the MERGED MV against the source. It was a full
-  # original scan per query — 42 min on q72's 7.79M-row MV — and it dominated
-  # every fix-and-prove cycle while proving nothing a bench run needs. Removed
-  # 2026-09-19 along with the flag.
+  # VERIFY=1 (--verify) no longer touches the author: it adds phase 4, which
+  # compares each tick's served result with the original query over base.
   #
-  # force_author is NO LONGER implied by arg3. A forced author is not what
-  # production does: a real query arrives, the matcher finds (or does not find) an
-  # MV, and CDC merges lazily before serving. Forcing made phase 1 rebuild MVs that
-  # already existed — measured on test2 2026-07-30, q64 spent 497s re-authoring an
-  # MV it already had (mv_h_95a7b7fa888f, 300k rows) before the append it was
-  # supposed to be measuring. Set FORCE_AUTHOR=1 only to deliberately rebuild.
   # AUTHOR_TIMEOUT: graft-primary cold authors probe + materialize the WIDEST
   # feasible candidate first with cap-backoff — several full-fact CTAS attempts
   # can exceed 400s at SF1000; a shorter curl -m SIGKILLs the in-flight CTAS
@@ -228,7 +231,7 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":True,"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":True}))' "$1" "$2" "${3:-0}" "" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
 }
 
 # ---- MV content signature + THE DELTA GATE -----------------------------------
@@ -300,22 +303,57 @@ for m in (d if isinstance(d,list) else d.get('mvs',[])):
 print('')" "$1" 2>/dev/null; }
 
 # ---- phase 0 (opt-in, EVICT=1 / blimp --query --evict): GENUINE cold state ---
-# force_author was REMOVED from the gateway (2026-07-31): a plain query can no
-# longer ask to rebuild an MV it already has, so FORCE_AUTHOR above is a no-op on
-# current images. The only real cold state is an evicted MV (POST /admin/mv/evict,
-# recipe kept). Two-tier answers regenerate from their chart MV the moment the
+# A query cannot ask the node to rebuild an MV it already has (force_author was
+# removed from the gateway, 2026-07-31). The only real cold state is an evicted
+# MV (POST /admin/mv/evict, recipe kept). Two-tier answers regenerate from their chart MV the moment the
 # answer is evicted, so evict-and-rematch until the matcher returns nothing.
 evict_query(){ # evict_query <sql> <name>
-  local rounds=0 busy=0 m t ns e ok
+  local rounds=0 busy=0 m t ns e ok rg e2 last=
   while :; do
     m=$(curl -s -m 600 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[3],"label":sys.argv[2]+":match","match_only":True,"skip_verify":True,"skip_passthrough":True}))' "$1" "$2" "$SOURCE")")
     t=$(echo "$m" | J mv_table); t="${t##*.}"; ns=$(echo "$m" | J mv_namespace)
+    # BRANCH MVs. A query the gateway serves by REASSEMBLING branch MVs names
+    # none of them in mv_table, so evicting mv_table alone left q33's and q80's
+    # branch MVs in place and "cold" phase 1 served them warm (q33 reused a
+    # branch built before its partner-prune fix, node 65, 2026-09-30). The
+    # probe's own trace names them; evict every one.
+    for b in $(echo "$m" | "$PY3" -c '
+import json,re,sys
+try: d=json.loads(sys.stdin.read() or "{}")
+except Exception: d={}
+seen=set()
+for s in d.get("author_trace") or []:
+    if s.get("phase") in ("reassemble","reassemble_partial","reassemble_branch_mv","reassemble_branch_sig","branch_match","reassemble_branch_own_bank"):
+        for x in re.findall(r"\b(mv_[a-z0-9_]{8,})\b", str(s.get("detail") or "")):
+            if x not in seen: seen.add(x); print(x)
+' 2>/dev/null); do
+      [ "$b" = "$t" ] && continue
+      eb=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"namespace\":\"$MV_NAMESPACE\",\"table\":\"$b\",\"keep_recipe\":true,\"force\":true}")
+      echo "   $2: evict branch $MV_NAMESPACE.$b evicted=$(echo "$eb" | J evicted) $(echo "$eb" | J error)"
+    done
     [ -n "$t" ] || break
+    # The SAME table matching right after it was evicted is its kept recipe
+    # (keep_recipe: data dropped, name banked), not data: the gateway logs
+    # "only DATALESS candidates" and phase 1 rebuilds from base (q90: CTAS over
+    # 720M rows, 2026-09-29). A regenerating answer is caught by
+    # regenerates_from below, so stop here instead of re-evicting 8 times.
+    [ "$t" = "$last" ] && { echo "   $2: $t matches only as its kept recipe (data evicted) — cold"; break; }
     e=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "{\"namespace\":\"${ns:-$MV_NAMESPACE}\",\"table\":\"$t\",\"keep_recipe\":true,\"force\":true}")
     ok=$(echo "$e" | J evicted)
     echo "   $2: evict ${ns:-$MV_NAMESPACE}.$t evicted=$ok $(echo "$e" | J error)"
+    # An ANSWER row regenerates from its chart on the next touch, so evicting it
+    # alone never makes the query cold (the loop used to re-evict the same answer
+    # 8 times and run phase 1 warm: q12/q90, 2026-09-29). The gateway names the
+    # chart in regenerates_from — evict it too.
+    rg=$(echo "$e" | J regenerates_from)
+    if [ "$ok" = "True" ] && [ -n "$rg" ]; then
+      e2=$(curl -s -m 120 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"namespace\":\"${rg%%.*}\",\"table\":\"${rg#*.}\",\"keep_recipe\":true,\"force\":true}")
+      echo "   $2: evict $rg (chart the answer regenerates from) evicted=$(echo "$e2" | J evicted) $(echo "$e2" | J error)"
+    fi
     if [ "$ok" != "True" ]; then
       # mid-merge / mid-serve (the match probe itself wakes a stale MV's refresh):
       # wait for the flight to land, then retry — up to ~10 min, like the
@@ -323,6 +361,7 @@ evict_query(){ # evict_query <sql> <name>
       busy=$((busy+1)); [ "$busy" -ge 30 ] && { echo "   WARN $2: $t stayed busy for $busy rounds — NOT evicted, phase 1 serves warm"; break; }
       sleep 20; continue
     fi
+    last=$t
     rounds=$((rounds+1))
     [ "$rounds" -ge 8 ] && { echo "   WARN $2 still matches after $rounds evictions (two-tier answer regenerating from a companion the API cannot reach)"; break; }
   done
@@ -368,7 +407,10 @@ except Exception: print(-1)' 2>/dev/null)
         echo "   WARN: $what still busy ($act) after ${el}s — continuing anyway"
         return 0
       fi
-      sleep 10
+      # Two quiet polls 10 s apart made every drain cost 10-20 s even when the
+      # gateway was idle at once — twice per query, ~30 s of a ~90 s query
+      # cycle (node 144, 2026-10-03). DRAIN_POLL_SEC (default 2).
+      sleep "${DRAIN_POLL_SEC:-2}"
     done
   }
 
@@ -476,6 +518,21 @@ except Exception: print(-1)' 2>/dev/null)
   # prune gate relies on is unchanged: seed_tpcds.py issues each dimension's own
   # surrogate key as max(existing)+1 and appends dimensions BEFORE the facts.
   EXTRA_TABLES="${CDC_EXTRA_TABLES-inventory customer customer_address customer_demographics date_dim household_demographics item income_band promotion reason ship_mode store time_dim warehouse web_page web_site call_center catalog_page}"
+  # QUERY-SCOPED EXTRAS (default; CDC_EXTRA_SCOPE=all appends every table). A
+  # table no query of this run reads cannot reach any MV the run measures (the
+  # gateway diffs only the tables an MV reads), yet each costs an Iceberg commit:
+  # the tick was ~90-200 s, nearly all of it ~22 sequential commits. Only the
+  # extras some loaded query names are appended; every query's own dimensions
+  # still move, so its dim-delta and RI-prune lanes stay exercised.
+  if [ -z "${CDC_EXTRA_TABLES+x}" ] && [ "${CDC_EXTRA_SCOPE:-query}" != "all" ]; then
+    scoped=""
+    for t in $EXTRA_TABLES; do
+      for n in "${NAMES[@]}"; do
+        if printf '%s' "${SQL[$n]}" | grep -qiw "$t"; then scoped="$scoped $t"; break; fi
+      done
+    done
+    EXTRA_TABLES="${scoped# }"
+  fi
   NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns $EXTRA_TABLES"
   # With --sql the tables to notify are the ones the queries actually read (derived
   # above from the SQL + catalog), not a fixed list: snapshot_changed for each of
@@ -501,12 +558,13 @@ except Exception: print(-1)' 2>/dev/null)
       pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query, --sql or TPC-DS
       if [ -z "$pf" ]; then
         echo "   pools: no query SQL loaded — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
-      elif ! python3 -c "import duckdb" 2>/dev/null; then
+      elif ! POOLPY=$(pool_python) || [ -z "$POOLPY" ]; then
         # This used to be a silent `&&` in the if-condition: no duckdb meant no
         # pools, no message, and a whole wave of structurally-noop ticks that
-        # looked like fast merges (q72, 2026-09-19).
-        echo "   pools: python3 has no duckdb module — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
-      elif python3 "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
+        # looked like fast merges (q72, 2026-09-19). pool_python asks the
+        # bench's own venv first.
+        echo "   pools: no python with a working duckdb module ($PY3, python3) — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
+      elif "$POOLPY" "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
              ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} --out /tmp/cdc_pools.json 2>/tmp/cdc_pools.log; then
         POOLS_ARG="--key-pools /tmp/cdc_pools.json"
         # the per-query window lines are the point; -6 truncated them away
@@ -515,19 +573,6 @@ except Exception: print(-1)' 2>/dev/null)
         echo "   pools: derivation failed (UNIFORM draws) — $(tail -1 /tmp/cdc_pools.log)"
       fi
     fi
-    # THE APPEND IS PLUGGABLE. A customer's own streamer does the append in
-    # production; the suite only needs SOMETHING to land new rows between phase 1
-    # and phase 3, then it fires snapshot_changed for the queries' tables and
-    # measures merge + serve. CDC_TICK_CMD (blimp --query --tick-cmd '<cmd>') runs
-    # that command here — NAMESPACE / ICEBERG_URL / WAREHOUSE / S3_* are in its env
-    # — and the built-in seed_tpcds.py tick is the default for the TPC-DS test set
-    # (it fails loudly on any other schema).
-    if [ -n "${CDC_TICK_CMD:-}" ]; then
-      echo "   tick: running your streamer: $CDC_TICK_CMD"
-      seed_out=$(NAMESPACE="$NAMESPACE" ICEBERG_URL="${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" WAREHOUSE="$WAREHOUSE" \
-        S3_ENDPOINT="${S3_ENDPOINT:-}" AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
-        bash -c "$CDC_TICK_CMD" 2>&1); seed_rc=$?
-    else
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
       "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
       --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG \
@@ -536,7 +581,6 @@ except Exception: print(-1)' 2>/dev/null)
       --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
       ${CDC_YEARS:+--years "$CDC_YEARS"} ${CDC_STREAM_DAYS:+--stream-days "$CDC_STREAM_DAYS"} \
       ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1); seed_rc=$?
-    fi
     if [ "$seed_rc" -ne 0 ]; then
       echo "   !! CDC TICK FAILED (exit $seed_rc) — no rows added, so EVERY merge"
       echo "   !! measured below is against UNCHANGED data. Full output:"
@@ -577,10 +621,15 @@ except Exception: print(-1)' 2>/dev/null)
 
   echo ">> phase 3: re-run all (incremental)"
   for n in $FNAMES; do
+    _p3=$(date +%s.%N)
     R=$(run "${SQL[$n]}" "$n:incr"); I_QMS[$n]=$(echo "$R" | J query_ms)
+    _p3r=$(date +%s.%N)
     # Lazy CDC model: snapshot_changed only MARKS the MV stale; the delta-merge
     # happens ON this query and is reported inline as merge_ms.
     I_MERGE[$n]=$(echo "$R" | J merge_ms)
+    I_STATUS[$n]=$(echo "$R" | J status); I_ROWS[$n]=$(echo "$R" | J rows)
+    I_MD5[$n]=$(echo "$R" | J md5); I_MD5R[$n]=$(echo "$R" | J md5_rounded)
+    I_MVURL[$n]=$(echo "$R" | J mv_url); I_RESURL[$n]=$(echo "$R" | J result_url)
     # Take the MV's dimensions AND content hash from the MERGE response. Phase 1
     # only reports them on a COLD author, so once the MVs exist every later run
     # printed "?x?" — and with no hash there was no way to tell a merge that
@@ -593,6 +642,7 @@ except Exception: print(-1)' 2>/dev/null)
       [ -n "${mr:-}" ] && MV_ROWS[$n]="$mr"; [ -n "${mc:-}" ] && MV_COLS[$n]="$mc"
       MV_HASH_NEW[$n]=$(mv_etag "$t")
     fi
+    echo "   $n: phase-3 wall: request $(awk "BEGIN{printf \"%.1f\", $_p3r-$_p3}")s, dims+etag $(awk "BEGIN{printf \"%.1f\", $(date +%s.%N)-$_p3r}")s"
     mh="${MV_HASH_NEW[$n]:-}"
     hint=""
     if [ -n "$mh" ] && [ -n "${MV_HASH_OLD[$n]:-}" ]; then
@@ -600,7 +650,12 @@ except Exception: print(-1)' 2>/dev/null)
       # so this is informational — the delta gate below is what decides.
       if [ "$mh" = "${MV_HASH_OLD[$n]}" ]; then hint=" base=untouched"; else hint=" base=rewritten"; fi
     fi
-    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint}"
+    # THE TICK'S RESULT IDENTITY: status, rows and the result md5 the gateway
+    # computed, so a caller can compare the served tick against the original
+    # query over the same data (full99's base run). A tick that errored or
+    # returned 0 rows used to print only timings (q51: status=error rows=0,
+    # reported as a 6 s tick; node 37, 2026-09-29).
+    echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint} status=$(echo "$R" | J status) rows=$(echo "$R" | J rows) md5=$(echo "$R" | J md5) md5r=$(echo "$R" | J md5_rounded)"
     # THE TICK, one format for every query: the post-append request's own
     # phase totals (gateway PhaseTotals — the parts sum to its wall time), so a
     # companion refresh or a stitch's branch merges report a merge too, and the
@@ -612,10 +667,15 @@ try: d=json.loads(sys.stdin.read() or "{}")
 except Exception: d={}
 p=d.get("phases") or {}
 m=int(p.get("merge_ms") or 0); s=int(p.get("serve_ms") or 0)
+b=int(p.get("build_ms") or 0); a=int(p.get("author_ms") or 0); t=int(p.get("total_ms") or 0)
+# THE TICK IS THE REQUEST WALL TIME. merge+serve alone reported 0.00 s for a
+# tick whose MV could not be merged and was REBUILT from base inside the same
+# request (q8/q69 at SF10: a ~2 s CTAS under build_ms, 2026-09-27).
+tick=max(t, m+s)
 rows=d.get("mv_rows") or sys.argv[2] or "?"; cols=d.get("mv_cols") or sys.argv[3] or "?"
 tbl=(d.get("mv_table") or "").split(".")[-1] or "none"
 if not p: print("   %s: tick: ? (no phase totals in the response — gateway predates them)" % n)
-else: print("   %s: tick: %.2f seconds  merge: %d ms, serve: %d ms  MV: %s rows x %s cols (%s)" % (n,(m+s)/1000.0,m,s,rows,cols,tbl))
+else: print("   %s: tick: %.2f seconds  merge: %d ms, serve: %d ms, build: %d ms, author: %d ms, other: %d ms  MV: %s rows x %s cols (%s)" % (n,tick/1000.0,m,s,b,a,max(0,tick-m-s-b-a),rows,cols,tbl))
 ' "$n" "${MV_ROWS[$n]:-}" "${MV_COLS[$n]:-}"
   done
 
@@ -640,28 +700,30 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
-  # ---- phase 4: REMOVED (2026-09-19) -----------------------------------------
-  # It re-verified the MERGED MV against the source: a full original scan per
-  # query, because an append invalidates the 24h original-hash cache. Measured
-  # 36 s for q9, 1m27s for q23, and 42 MINUTES for q72's 7.79M-row MV, and it
-  # was the dominant cost of every fix-and-prove cycle.
-  #
-  # What it covered, honestly: a wrong DELTA would be served, because phase 3
-  # passes skip_verify and the gateway does no verification in the serving
-  # path. A wrong AUTHOR cannot bank — the row-hash gate rejects it — so that
-  # half is still covered, for free, on every run.
-  #
-  # Delta correctness now belongs to the DELTA GATE below (mv content signature
-  # + row counts, which tells a merge that changed the MV from one that did
-  # nothing) and to the gateway's own background sampler. If you ever need the
-  # full re-scan back for one query, run that query by hand against the source;
-  # do not put it back in the suite's hot path.
-  # PHASE 4 IS GONE (2026-09-19). It re-verified the merged MV against the
-  # source — a full original scan per query, 42 min on q72's 7.79M-row MV —
-  # and it was the dominant cost of every fix-and-prove cycle while proving
-  # nothing the run needs. Correctness is gated at AUTHOR time: an MV cannot
-  # bank until its row-hash matches the original. Read that verdict from the
-  # author's log/trace line, not from a second full scan here.
+  # ---- phase 4 (--verify): the tick's served result vs the ORIGINAL query ---
+  # One plain comparison: run each query's original SQL over base (no_mv, same
+  # data — nothing is appended between the tick above and this run) and compare
+  # the gateway's result md5 with the tick's. Equal md5 = same rows. md5r
+  # (float-rounded) equal = same rows up to float summation order. Anything
+  # else is a wrong answer served by the tick. This replaces the old phase 4,
+  # which re-verified the merged MV (not the served answer) against source.
+  # Cost: one original-query run per query; capped by VERIFY_CAP_S.
+  if [ "${VERIFY:-0}" = 1 ]; then
+    echo ">> phase 4: verify — tick result vs original query over base"
+    for n in $FNAMES; do
+      B=$(curl -s -m "${VERIFY_CAP_S:-3600}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True,"persist_result":True}))' "${SQL[$n]}" "$SOURCE" "$n:verify")")
+      bst=$(echo "$B" | J status); brows=$(echo "$B" | J rows); bmd5=$(echo "$B" | J md5); bmd5r=$(echo "$B" | J md5_rounded)
+      tmd5="${I_MD5[$n]:-}"; [ "$tmd5" = null ] && tmd5=""; [ "$bmd5" = null ] && bmd5=""
+      if [ -z "$tmd5" ] || [ -z "$bmd5" ]; then v="UNCHECKED"
+      elif [ "$tmd5" = "$bmd5" ]; then v="MATCH"
+      elif [ -n "${I_MD5R[$n]:-}" ] && [ "${I_MD5R[$n]}" != null ] && [ "${I_MD5R[$n]}" = "$bmd5r" ]; then v="MATCH(float)"
+      else v="MISMATCH"; fi
+      V_RESULT[$n]="$v"; V_RESURL[$n]=$(echo "$B" | J result_url)
+      echo "   $n: verify: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
+    done
+  fi
 done
 sleep 4
 
@@ -711,15 +773,24 @@ cc(){ local n="$1"
   [ -z "${MV_HASH_NEW[$n]:-}" ] && { printf '?'; return; }
   [ -z "${MV_HASH_OLD[$n]:-}" ] && { printf 'n/a'; return; }
   [ "${MV_HASH_NEW[$n]}" = "${MV_HASH_OLD[$n]}" ] && printf 'UNCHANGED' || printf 'changed'; }
-printf '%-10s %-14s %16s %11s %10s %8s %9s %-11s %10s %-12s\n' query fact 'mv_rows x cols' author_ms merge_ms mode incr_ms content delta_rows delta_verdict
-printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s\n' ---------- -------------- ---------------- ----------- ---------- -------- --------- ----------- ---------- ------------
+printf '%-10s %-14s %16s %11s %10s %8s %9s %-11s %10s %-12s %-12s\n' query fact 'mv_rows x cols' author_ms merge_ms mode incr_ms content delta_rows delta_verdict verify
+printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s %-12s\n' ---------- -------------- ---------------- ----------- ---------- -------- --------- ----------- ---------- ------------ ------------
 for n in "${NAMES[@]}"; do
   # author time = shape+materialize; when phase-1 reused a warm MV, author_ms is
   # blank — fall back to materialize_ms so the cold-build cost is still shown.
   au="${A_MS[$n]}"; [ -z "$au" -o "$au" = "0" ] && au="${M_MS[$n]:-?}"
-  printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s\n' \
+  printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s %-12s\n' \
     "$n" "${FACT[$n]}" "${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}" "$au" "${MERGE[$n]:-?}" "${MODE[$n]:-?}" "${I_QMS[$n]:-?}" "$(cc "$n")" \
-    "${DELTA_ROWS[$n]:-?}" "${DELTA_VERDICT[$n]:-?}"
+    "${DELTA_ROWS[$n]:-?}" "${DELTA_VERDICT[$n]:-?}" "${V_RESULT[$n]:-(no --verify)}"
+done
+# The tick's MV and result as the node hosts them (the same viewer pages the
+# node panel links: mv_url / result_url of the tick's /admin/query/run).
+for n in "${NAMES[@]}"; do
+  u() { [ -n "$1" ] && [ "$1" != null ] && printf '%s' "$1" || printf '%s' "$2"; }
+  echo "  $n: tick result: status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${I_MD5[$n]:-?}  verify=${V_RESULT[$n]:-(no --verify)}"
+  echo "      mv:     $(u "${I_MVURL[$n]:-}" "none (served from base)")"
+  echo "      result: $(u "${I_RESURL[$n]:-}" "not persisted for this run")"
+  [ -n "${V_RESULT[$n]:-}" ] && echo "      base:   $(u "${V_RESURL[$n]:-}" "not persisted (gateway without persist_result)")"
 done
 echo "=============================================================================="
 echo "mode=incremental → delta-merged (merge_ms, reads |MV|+|delta|); fallback/no-delta"

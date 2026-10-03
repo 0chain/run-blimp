@@ -209,6 +209,12 @@ DIM_BY_SUFFIX = [
     ("web_page_sk",     ("web_page", "wp_web_page_sk")),
     ("web_site_sk",     ("web_site", "web_site_sk")),
     ("reason_sk",       ("reason", "r_reason_sk")),
+    # income_band was missing: own_key_of("income_band") returned None, so
+    # append_table() never looked up the max and gen_table_cols() filled
+    # ib_income_band_sk with randint(1, 1000) every tick — 56,352 live rows over
+    # 1,000 distinct keys on node 37 (2026-09-25). hd_income_band_sk (its only
+    # FK) was the same noise, mostly above the real max so it never joined.
+    ("income_band_sk",  ("income_band", "ib_income_band_sk")),
 ]
 
 # LAST-RESORT dimension key ranges, used only when neither the catalog stats nor
@@ -224,7 +230,7 @@ FALLBACK_DIM_HI = {
     "customer_demographics": 1920800, "household_demographics": 7200,
     "customer_address": 6000000, "store": 1002, "promotion": 1500,
     "call_center": 42, "catalog_page": 30000, "ship_mode": 20, "warehouse": 20,
-    "web_page": 3000, "web_site": 54, "reason": 65,
+    "web_page": 3000, "web_site": 54, "reason": 65, "income_band": 20,
 }
 
 # Key pools from query_pools.py (--key-pools). Shape:
@@ -405,17 +411,6 @@ def date_window_report(table, col, vals, prov):
     return "   %s.%s: %s" % (table, col, "; ".join(parts) or "no rows")
 
 
-# DEPRECATED shims — the generator now uses draw_dim / draw_dates with a row
-# OWNER so a row's keys all come from one query. These keep the pre-2026-09-19
-# signatures working for an external tick script (CDC_TICK_CMD) that imported
-# them; they can only ever produce the union behaviour.
-def pool_pick(dimtbl, n, lo, hi, rnd):
-    """n keys for dimtbl: from its pool when one exists, else uniform in [lo, hi]."""
-    return draw_dim(dimtbl, n, [None] * n, lo, hi, rnd)
-
-def pool_dates(n, date_lo, date_hi, rnd):
-    return draw_dates("", n, [None] * n, date_lo, date_hi, rnd)
-
 def dim_for(col):
     """(dimension_table, key_column) a fact column references, or None."""
     if not col.endswith("_sk"):
@@ -458,6 +453,22 @@ def dims_needed(columns):
 def _q(x):
     """Round to decimal(7,2) — the physical type of every TPC-DS fact measure."""
     return decimal.Decimal(str(round(float(x), 2)))
+
+
+def date_after(d, lo_gap, hi_gap, date_max, rnd):
+    """A date key `lo_gap`..`hi_gap` days after `d`, never past `date_max`.
+
+    A derived date (ship after sale, return after sale) must name a date_dim
+    row that EXISTS: a key past the table's max is issued to a later tick's
+    date_dim append, so pre-append facts reference it and the RI-prune proof
+    correctly refuses the dimension delta. Unbounded, sold+2..90 put web_sales
+    ship keys up to 2490639 while the next date_dim append started at 2490560,
+    and q94/q95's key-local lane declined into a 46-57 s rebuild every tick
+    (node 144, SF1000, 2026-09-28)."""
+    lo, hi = d + lo_gap, min(d + hi_gap, date_max)
+    if lo > hi:
+        return min(d, date_max)
+    return rnd.randint(lo, hi)
 
 
 def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random):
@@ -528,7 +539,7 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
                     _note(sprov, o["name"] if o and o["date_by_col"].get(name)
                           else "(wave union for this column)", p, x)
                 else:
-                    x = sold[i] + rnd.randint(2, 90)
+                    x = date_after(sold[i], 2, 90, hi("date_dim"), rnd)
                     v.append(x)
                     _note(sprov, "(sale + 2..90 days)", None, x)
             out[name] = v
@@ -689,7 +700,8 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
     if sold_col:
         for rcol in names:
             if rcol.endswith("_returned_date_sk"):
-                out[rcol] = [sales_cols[sold_col][i] + rnd.randint(1, 60) for i in idx]
+                dmax = dim_hi.get("date_dim") or FALLBACK_DIM_HI.get("date_dim")
+                out[rcol] = [date_after(sales_cols[sold_col][i], 1, 60, dmax, rnd) for i in idx]
                 if out[rcol]:
                     DATE_REPORTS.append(
                         "   %s.%s: parent sale date + 1..60 days (%d..%d) — a query "
@@ -796,7 +808,7 @@ def _step(name, t0):
 # from the appended rows (_bounds_after_append) and stamped with the snapshot
 # that append produced. Any other writer moves the snapshot, which misses the
 # cache and falls back to the manifest read. Integers only (keys, date_sk).
-_BOUNDS_PATH = os.path.expanduser(os.environ.get("SEED_BOUNDS_CACHE", "~/.seed_bounds_cache.json"))
+_BOUNDS_PATH = os.path.expanduser(os.environ.get("SEED_BOUNDS_CACHE", "~/.seed_bounds_cache.v2.json"))
 _BOUNDS = None
 
 
@@ -811,14 +823,21 @@ def _bounds_load():
     return _BOUNDS
 
 
+import threading as _threading
+_BOUNDS_LOCK = _threading.Lock()
+
+
 def _bounds_save():
-    try:
-        import json as _j
-        tmp = _BOUNDS_PATH + ".tmp"
-        _j.dump(_BOUNDS or {}, open(tmp, "w"))
-        os.replace(tmp, _BOUNDS_PATH)
-    except Exception:
-        pass
+    # appends run in parallel (one thread per table): one writer at a time
+    with _BOUNDS_LOCK:
+        try:
+            import json as _j
+            tmp = _BOUNDS_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                _j.dump(dict(_BOUNDS or {}), f)
+            os.replace(tmp, _BOUNDS_PATH)
+        except Exception:
+            pass
 
 
 def _snap_id(t):
@@ -855,10 +874,24 @@ def _bounds_after_append(t, data, n):
         import pyarrow.compute as pc
         ns, tbl = t.name()[-2], t.name()[-1]
         snap = _snap_id(t)
+        cs = t.current_snapshot()
+        parent = getattr(cs, "parent_snapshot_id", None) if cs else None
         prefix = "%s.%s|" % (ns, tbl)
         b = _bounds_load()
         for key, c in list(b.items()):
             if not key.startswith(prefix):
+                continue
+            # FOLD ONLY ONTO THE SNAPSHOT THIS APPEND EXTENDS. A cached bound
+            # stamped at an older snapshot misses whatever another writer
+            # appended in between; folding this append into it and stamping
+            # the new snapshot made the miss permanent. On node 65 the cache
+            # held store_sales.ss_sold_date_sk hi=2490119 while the manifests
+            # reached 2494785, so fact_fk_max() under-read, date_dim keys were
+            # issued from 2490328 (below keys old facts already reference)
+            # and every q51 tick's RI prune fell to a probe (2026-09-28).
+            # Dropped here, the bound is re-read from the manifests next time.
+            if parent is None or c.get("snap") != parent:
+                del b[key]
                 continue
             _, col, mr = key.split("|")
             if int(mr) and n < int(mr):
@@ -1003,7 +1036,40 @@ def load_dim_hi(cat, namespace, dimtables, verbose=True):
     return out
 
 
+_GEO_CACHE = os.path.expanduser(os.environ.get("SEED_GEO_CACHE", "~/.seed_geo_pairs.%s.pkl"))
+
+
 def load_geo_pairs(cat, namespace, verbose=True):
+    """Cached across ticks: the scan below reads all of customer (12M rows at
+    SF1000) and took ~28 s of every ~200 s tick. The pairs only steer which
+    (customer, store) a new sale is drawn from; pairs from earlier ticks stay
+    valid (rows are never deleted), so a cached set is reused and the scan runs
+    only when no cache exists. SEED_GEO_CACHE_REFRESH=1 forces a rescan."""
+    import pickle
+    path = _GEO_CACHE % namespace
+    if os.environ.get("SEED_GEO_CACHE_REFRESH") != "1":
+        try:
+            with open(path, "rb") as f:
+                got = pickle.load(f)
+            if got and verbose:
+                print(f"   geo-correlated pairs: {len(got[0])} from the cache ({path})")
+            if got:
+                return got
+        except Exception:
+            pass
+    got = _load_geo_pairs_scan(cat, namespace, verbose)
+    if got:
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(got, f)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+    return got
+
+
+def _load_geo_pairs_scan(cat, namespace, verbose=True):
     """(customer_sk, addr_sk, store_sk) triples where the STORE IS IN THE
     CUSTOMER'S OWN ZIP — i.e. people shop near where they live.
 
@@ -1385,6 +1451,29 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
     scols = [c for c, k in columns if k == "s"]
     if t is None or not scols:
         return {}
+    # CACHED ACROSS TICKS. A categorical domain does not move when the appends
+    # draw from it, but sampling it re-planned a scan over every manifest of the
+    # table (one per tick, ~1,000 now): date_dim's 8-row append took 6.9 s and
+    # store's 1-row append 6.7 s (node 144, SF1000, 2026-10-03).
+    # SEED_STRDOM_REFRESH=1 re-samples.
+    import json as _j
+    try:
+        tname = ".".join(t.name()[-2:])
+    except Exception:
+        tname = ""
+    cpath = os.path.expanduser("~/.seed_strdom.%s.json" % tname) if tname else ""
+    ckey = ",".join(sorted(scols))
+    if cpath and os.environ.get("SEED_STRDOM_REFRESH") != "1":
+        try:
+            with open(cpath) as f:
+                c = _j.load(f)
+            if c.get("cols") == ckey:
+                if verbose and c.get("out"):
+                    print("   string domains (cached): "
+                          + ", ".join(f"{k}={len(v)}" for k, v in sorted(c["out"].items())))
+                return c.get("out") or {}
+        except Exception:
+            pass
     try:
         arr = t.scan(selected_fields=tuple(scols), limit=sample_rows).to_arrow()
     except Exception as e:
@@ -1408,6 +1497,13 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
     if verbose and out:
         print("   string domains from the live table (categorical): "
               + ", ".join(f"{c}={len(v)}" for c, v in sorted(out.items())))
+    if cpath:
+        try:
+            with open(cpath + ".tmp", "w") as f:
+                _j.dump({"cols": ckey, "out": out}, f, default=str)
+            os.replace(cpath + ".tmp", cpath)
+        except Exception:
+            pass
     return out
 
 
@@ -1458,8 +1554,109 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
             out[name] = [rnd.randint(1, 10**9) for _ in range(n)]
         else:
             out[name] = [rnd.randint(1, 1000) for _ in range(n)]
+    if table == "date_dim" and "d_date_sk" in out:
+        # A DATE ROW IS ITS KEY'S DAY. Random calendar values on appended keys
+        # made a query's date window (d_date range, d_quarter_name '2001Q1',
+        # d_year 2001) match synthetic keys far past the calendar, so every
+        # date-bound prune spanned them: q82's inventory read kept 922 of
+        # 1,104 files, q17's bound reached key 2489578 (node 65/37, 2026-09-28).
+        rows = [date_dim_row(k) for k in out["d_date_sk"]]
+        for c in names:
+            if c in rows[0] and c != "d_date_sk":
+                out[c] = [r[c] for r in rows]
     missing = [c for c in names if c not in out]
     assert not missing, f"{table}: generator left {missing} unset"
+    return out
+
+
+_DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+
+def date_dim_row(jdn):
+    """TPC-DS date_dim columns for d_date_sk = `jdn` (the Julian day number:
+    2451545 is 2000-01-01), computed the way dsdgen lays out the calendar."""
+    import datetime
+    d = datetime.date.fromordinal(jdn - 1721425)
+    q = (d.month - 1) // 3 + 1
+    dow = (d.isoweekday() % 7)                       # 0 = Sunday
+    first = d.replace(day=1)
+    nxt = (first + datetime.timedelta(days=32)).replace(day=1)
+    to_jdn = lambda x: x.toordinal() + 1721425
+    week_seq = (jdn - 2415018) // 7                 # dsdgen: 2451545 -> 5218, 2452275 -> 5322
+    return {
+        "d_date_id": "AAAAAAAA%08d" % jdn, "d_date": d,
+        "d_month_seq": (d.year - 1900) * 12 + d.month - 1,
+        "d_week_seq": week_seq, "d_quarter_seq": (d.year - 1900) * 4 + q,
+        "d_year": d.year, "d_dow": dow, "d_moy": d.month, "d_dom": d.day, "d_qoy": q,
+        "d_fy_year": d.year, "d_fy_quarter_seq": (d.year - 1900) * 4 + q, "d_fy_week_seq": week_seq,
+        "d_day_name": _DAY_NAMES[dow], "d_quarter_name": "%dQ%d" % (d.year, q),
+        "d_holiday": "N", "d_weekend": "Y" if dow in (0, 6) else "N", "d_following_holiday": "N",
+        "d_first_dom": to_jdn(first), "d_last_dom": to_jdn(nxt) - 1,
+        "d_same_day_ly": jdn - 365, "d_same_day_lq": jdn - 92,
+        "d_current_day": "N", "d_current_week": "N", "d_current_month": "N",
+        "d_current_quarter": "N", "d_current_year": "N",
+    }
+
+
+# Facts can reference a dimension key before its row exists — derived dates
+# (sale + days) did for date_dim, and web_sales ship-address keys reached past
+# customer_address's max too (node 144, 2026-09-28) — so every dimension asks.
+# The bounds are cached per table snapshot and advanced by each append
+# (catalog_bounds / _bounds_after_append): the cost is one cold fill per node
+# (186 s on node 65), then ~3 s a tick.
+_FACT_FK_MAX = {}
+
+
+def fact_fk_max(cat, namespace, dim):
+    """The highest key of `dim` any fact column references, from the facts'
+    manifest bounds (metadata only); None when no fact bound is known."""
+    if (namespace, dim) in _FACT_FK_MAX:
+        return _FACT_FK_MAX[(namespace, dim)]
+    best = None
+    refs = [(fact, col) for fact, spec in FACT_COLUMNS.items() for col, _k in spec]
+    # EVERY REFERENCING TABLE, not only the facts: household_demographics
+    # references income_band (hd_income_band_sk) and customer references the
+    # demographics/address dims. Issuing income_band keys above the FACTS'
+    # max left old hd rows reaching the "new" keys, so the gateway's RI prune
+    # refused income_band on every q84 tick (node 37, SF1000, 2026-09-28).
+    for t, cols in _namespace_columns(cat, namespace).items():
+        if t != dim and t not in FACT_COLUMNS:
+            refs += [(t, c) for c in cols]
+    for table, col in refs:
+        d = dim_for(col)
+        if not d or d[0] != dim or col == own_key_of(dim):
+            continue
+        try:
+            _, hi = catalog_bounds(cat, namespace, table, col)
+        except Exception:
+            hi = None
+        if hi is not None and (best is None or hi > best):
+            best = hi
+    _FACT_FK_MAX[(namespace, dim)] = best
+    return best
+
+
+def _namespace_columns(cat, namespace):
+    """{table: [column names]} for the namespace, persisted in the bounds cache
+    (a schema changes far less often than a snapshot) so a tick lists the
+    catalog once, not once per table per tick."""
+    key = "schema|%s" % namespace
+    b = _bounds_load()
+    if isinstance(b.get(key), dict) and b[key]:
+        return b[key]
+    out = {}
+    try:
+        for ident in cat.list_tables(namespace):
+            name = ident[-1]
+            try:
+                out[name] = [f.name for f in cat.load_table((namespace, name)).schema().fields]
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    if out:
+        b[key] = out
+        _bounds_save()
     return out
 
 
@@ -1538,6 +1735,16 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
                 f"referential-integrity premise the delta merge depends on "
                 f"(a re-used key is reachable from pre-append facts). Fix the "
                 f"table's statistics, or exclude it from CDC_EXTRA_TABLES.")
+        # ABOVE EVERY KEY THE FACTS ALREADY REFERENCE, not only above the
+        # dimension's own max: a fact row that referenced a key before its
+        # dimension row existed (an unbounded derived date did, see date_after)
+        # makes the next append re-issue a key old facts reach — the RI prune
+        # then refuses, correctly, and the merge scans the fact.
+        ref = fact_fk_max(cat, namespace, table)
+        if ref is not None and ref > mx:
+            if verbose:
+                print(f"   {table}.{keycol}: facts already reference keys up to {ref} (> table max {mx}) — issuing above them")
+            mx = ref
         kb = mx + 1
         if verbose:
             print(f"   {table}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
@@ -1716,19 +1923,41 @@ def main():
         import time as _time
         _tt0=_time.time(); _tt=[]
         try:
-            for x in extras:
+            # PARALLEL BY TABLE. Each append is one Iceberg commit on its own
+            # table (~10 s each, ~24 of them: the tick was ~200 s, almost all
+            # of it these commits in sequence). Different tables commit
+            # independently, so dimensions run together, then facts together —
+            # facts after dimensions, since they reference the new dimension
+            # keys (dim_hi_cache). A failure still raises into the rollback.
+            from concurrent.futures import ThreadPoolExecutor
+            # Opt-in: measured on nodes 37/65 (2026-10-03) the per-table commits
+            # serialize on the catalog — 8 threads took each append from ~5 s
+            # to ~36-75 s and the wall time did not move. SEED_PARALLEL=N.
+            workers=int(os.environ.get("SEED_PARALLEL","1"))
+            def _dim(x):
                 _t=_time.time()
                 append_table(cat,fs,a.namespace,x,xrows[x],date_lo=date_lo,date_hi=date_hi,
                              dim_hi_cache=dim_hi_cache,strict=strict)
-                _tt.append((x,_time.time()-_t))
-            _t=_time.time()
-            geo=None if a.no_geo else load_geo_pairs(cat,a.namespace)
-            _tt.append(("geo_pairs",_time.time()-_t))
-            for sf,sn,rf,rn in plan:
+                return (x,_time.time()-_t)
+            def _geo():
+                _t=_time.time()
+                g=None if a.no_geo else load_geo_pairs(cat,a.namespace)
+                return g,("geo_pairs",_time.time()-_t)
+            with ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
+                gf=ex.submit(_geo)
+                for r in list(ex.map(_dim,extras)):
+                    _tt.append(r)
+                geo,gt=gf.result()
+                _tt.append(gt)
+            def _fact(p):
+                sf,sn,rf,rn=p
                 _t=_time.time()
                 append_fact(cat,fs,a.namespace,sf,sn,date_lo=date_lo,date_hi=date_hi,
                             dim_hi_cache=dim_hi_cache,returns_rows=rn,strict=strict,geo=geo)
-                _tt.append((sf,_time.time()-_t))
+                return (sf,_time.time()-_t)
+            with ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
+                for r in list(ex.map(_fact,plan)):
+                    _tt.append(r)
             # WHERE THE TICK'S TIME GOES — measured per table, so the slowest
             # step is named instead of guessed (the tick was ~80-95 s, 2026-09-24).
             print("== tick timing: total %.1fs | %s"%(_time.time()-_tt0,

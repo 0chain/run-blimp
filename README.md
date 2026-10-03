@@ -98,7 +98,7 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 ```
 blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
-blimp --query         prove authoring + CDC delta-merge (your SQL with --sql)
+blimp --query         prove authoring + CDC delta-merge (a TPC-DS query with --tpc, your own SQL with --sql)
 blimp --storage       storage suite: TTFB, warp PUT/GET, MLPerf resnet50
 blimp --acid          ACID / linearizability check of both data paths
 blimp --bench         author / materialize / delta-merge timing profile
@@ -136,24 +136,18 @@ gateway can only write table metadata into a warehouse *it* has configured,
 which lives on the fleet endpoint, and the source config carries one
 endpoint/key pair.
 
-**Your own SQL and your own streamer.** `blimp --query --sql <file|dir>` runs any
-SQL against the wired source; the tables it reads and its fact table are derived
-from the SQL and the catalog (`query_tables.py`: names from FROM/JOIN, existence
-from the catalog listing, fact = the referenced table with the most rows — the
-gateway's own rule). Nothing about the dataset is assumed. In production your
-streamer does the appends; `--tick-cmd '<cmd>'` runs it in phase 2 (with
-`NAMESPACE`, `ICEBERG_URL`, `WAREHOUSE`, `S3_ENDPOINT` and the S3 keys in its
-environment), after which the suite fires `snapshot_changed` for exactly the
-tables your queries read and measures merge + serve. Without `--tick-cmd` the
-TPC-DS seeder appends (test set only).
-
 **What `--query` measures.** The suite runs against the source `--setup` wired
 (the gateway calls it `customer`): phase 1 authors an MV from it and verifies
 it, phase 2 appends rows to it (`seed_tpcds.py --tick`) and fires
 `/admin/source/snapshot_changed`, phase 3 re-runs the query so the gateway
-delta-merges the appended rows into the MV, phase 4 verifies the merged MV.
-`--evict` forces a cold author first; `--verify` turns verification on (off by
-default — that is the production path). Every phase shows up as a run on the
+delta-merges the appended rows into the MV, phase 4 (`--verify`) runs the
+original query over base and compares its result md5 with the tick's.
+`--evict` forces a cold author first. Two verifications exist and are easy to
+confuse: the **author verify** (the node row-hashes every newly authored MV
+against the original query before banking it — always on, reported as
+`verify_ms`) and **`--verify`** (phase 4: the tick's served answer vs the
+original query over base — off by default, because it costs one full
+original-query run). Every phase shows up as a run on the
 node panel's Query tab. `BLIMP_INGEST=1` additionally copies the namespace
 into the cluster warehouse first (`/prod/ingest`, a full copy); it is not part
 of the measurement.
@@ -414,26 +408,37 @@ not part of production operation (production is your pipeline + the
 | 1 | run the query → the node authors an MV from your source | `author_ms`, `materialize_ms`, `verify_ms`, `cold_serve` |
 | 2 | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
 | 3 | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
-| 4 (with `--verify`) | re-check the merged MV against the source | `verify_status` |
+| 4 (with `--verify`) | run the original query over base, compare with the tick's served result | `verify: MATCH / MATCH(float) / MISMATCH` |
+
+**One query, three ways.** Phases 2-3 (append + tick) always run; what changes
+is whether the MV is rebuilt and whether the tick's answer is checked:
+
+```
+blimp --query --sql ./my_query.sql          # the same three ways work with your own SQL file in place of --tpc
+blimp --query --tpc 3                      # 1. as-is: serve the MV the node already has (authors only if none), append, tick
+blimp --query --tpc 3 --evict              # 2. cold: evict the MV, re-author it (+ author verify), append, tick
+blimp --query --tpc 3 --evict --verify     # 3. cold + post-verify: as 2, then the tick's answer vs the original query over base
+```
 
 ```
 blimp --query                                  # the default batch, 10 queries
-blimp --query --queries "3 7 19"               # pick TPC-DS queries
-blimp --query --sql ./my_query.sql             # YOUR SQL (any dataset)
+blimp --query --tpc "3 7 19"                   # pick TPC-DS queries
+blimp --query --sql ./my_query.sql             # YOUR SQL file
 blimp --query --sql ./queries/                 # a directory of .sql files
-blimp --query --sql q.sql --tick-cmd './my_streamer.sh'   # YOUR appender in phase 2
 blimp --query --evict --verify                 # cold start + correctness check
 blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
 ```
 
-With `--sql` nothing about the dataset is assumed: the tables a query reads are
-parsed out of its `FROM`/`JOIN` clauses, checked against the catalog listing,
-and the **fact** is the referenced table with the most rows (the node's own
-rule) — so `snapshot_changed` fires for exactly the tables your query touches.
-With `--tick-cmd` your own streamer does the phase-2 append (it runs with
-`NAMESPACE`, `ICEBERG_URL`, `WAREHOUSE`, `S3_ENDPOINT` and the S3 keys in its
-environment); without it the built-in TPC-DS seeder appends, which only works
-on the test dataset.
+`--sql` sends the query in your `.sql` file. It can read any table registered
+in the Iceberg catalog — the node's DuckDB loads those tables to author the MV
+and answer the query. The tables are parsed from the query's `FROM`/`JOIN`
+clauses and checked against the catalog, and the **fact** is the referenced
+table with the most rows (the node's own rule), so `snapshot_changed` fires for
+exactly the tables the query touches. Only the phase-2 append (the rows added
+before the tick) is TPC-DS-specific: the built-in seeder writes TPC-DS rows, so
+on other tables phase 2 reports `CDC TICK FAILED`, nothing is appended, and the
+tick measures an unchanged MV. Authoring, the author verify and the serve are
+measured either way.
 
 **Reading the result.** One row per query, e.g.:
 
@@ -441,6 +446,13 @@ on the test dataset.
 query  fact           mv_rows x cols  author_ms  merge_ms      mode  incr_ms  delta_rows  delta_verdict
 q1     store_returns      177924x5         4270     19216  incremental     329          50  merged
 ```
+
+The `verify` column is `MATCH` / `MATCH(float)` / `MISMATCH` with `--verify`,
+`(no --verify)` without it. Under the table each query prints the tick's result
+(status, rows, md5) and two links the node hosts — the same pages the node
+panel's Query tab opens: `mv:` the MV table, `result:` this tick's result, and
+with `--verify` `base:` the original query's answer over base, all paginated in
+the browser — so a MISMATCH can be inspected side by side.
 
 `merge_ms` only counts when `delta_verdict` is `merged` — `UNCHANGED` or
 `EMPTY` mean the append produced no delta for that MV and the number measured
@@ -450,8 +462,9 @@ scanned the source. There is **no PASS/FAIL verdict**: those outcomes are
 judgements, not thresholds. Every phase also appears as a run on the node
 panel's **Query** tab.
 
-`--verify` is off by default because the node runs no verification while
-serving, so an unflagged run measures the production path.
+`--verify` is off by default: the node does not re-check served answers in
+production (the author verify already proved the MV), so an unflagged run
+measures the production path. Use it to prove a tick's answer is correct.
 
 Multi-fact batches still work: `SUITES="store_sales:3 19 43;store_returns:1"`.
 Join-CTE queries (q64-class) only see a delta when the append touches **both**
@@ -504,7 +517,7 @@ so a client-run result sits next to the ones started from the UI.
 Bench = min/median/avg/max author / materialize / delta-merge profile, one run
 per query of the selected batch (`ITERS AUTHOR_ITERS CDC_ROWS` default 3/3/50000;
 the batch defaults to the same `--first-10` as `--query` and takes the same
-`--queries` / batch flags; `BENCH_QNR=64` benches exactly one query from
+`--tpc` / batch flags; `BENCH_QNR=64` benches exactly one query from
 `$Q_DIR/q<N>.sql`; `BENCH_FACT=catalog_sales` appends referentially for
 join-CTE queries).
 
@@ -676,7 +689,7 @@ multi-fact query exercises a multi-fact merge. Live run, SF1 cluster
 ```
 == CDC bench: cluster=1785550395356 gw=10.10.114.87 rows/append=5000 suites=[store_sales:9 88 14 64 4] ==
 ==== fact: store_sales (q9 q88 q14 q64 q4) ====
->> phase 1: serve/author all (force_author=0)
+>> phase 1: serve/author all (evict=0; correctness is the author's row-hash, which always runs)
    q9: author=? materialize=? cold_serve=2826ms mv=?x? (mv_h_0e90d0b63216)
    q88: author=? materialize=? cold_serve=2668ms mv=?x? (mv_h_ae8ceee390cc)
    q14: author=12252 materialize=? cold_serve=3134ms mv=?x? (none)
