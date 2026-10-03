@@ -411,17 +411,6 @@ def date_window_report(table, col, vals, prov):
     return "   %s.%s: %s" % (table, col, "; ".join(parts) or "no rows")
 
 
-# DEPRECATED shims — the generator now uses draw_dim / draw_dates with a row
-# OWNER so a row's keys all come from one query. These keep the pre-2026-09-19
-# signatures working for an external tick script (CDC_TICK_CMD) that imported
-# them; they can only ever produce the union behaviour.
-def pool_pick(dimtbl, n, lo, hi, rnd):
-    """n keys for dimtbl: from its pool when one exists, else uniform in [lo, hi]."""
-    return draw_dim(dimtbl, n, [None] * n, lo, hi, rnd)
-
-def pool_dates(n, date_lo, date_hi, rnd):
-    return draw_dates("", n, [None] * n, date_lo, date_hi, rnd)
-
 def dim_for(col):
     """(dimension_table, key_column) a fact column references, or None."""
     if not col.endswith("_sk"):

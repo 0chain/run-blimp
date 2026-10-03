@@ -10,15 +10,14 @@
 # and AVG/CTE queries are NOT here — they fall back to full re-author by design.
 #
 # Every call is labeled (<name>:author / <name>:incr). Verification follows the
-# product's own model: the cold author (force_author) IS verified — that is the
+# product's own model: the cold author IS verified (its row-hash) — that is the
 # one point where an MV's values are proven against the source — and the merge
 # calls pass skip_verify, because a delta-merge re-verify is another full source
-# scan per query and a merge that goes wrong falls back to force_author (which
-# verifies) on its own. It also EVICTS these MVs first so `snapshot_changed`
+# scan per query. --verify (phase 4) checks the tick's served answer instead. It also EVICTS these MVs first so `snapshot_changed`
 # only wakes them, not a herd of stale multi-fact MVs from earlier runs.
 #
 # Env: GW CLUSTER_ID ICEBERG_URL WAREHOUSE [NAMESPACE=tpcds] [REGION=ap-south-1]
-#      [CDC_ROWS=5000] [FORCE_AUTHOR=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
+#      [CDC_ROWS=5000] [EVICT=0] [VERIFY=0] [MERGE_THREADS=<n>]   (MERGE_THREADS is advisory — the merge
 #      runs on the gateway; set the gateway's duckdb threads there to change it.)
 set -u
 : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
@@ -161,38 +160,7 @@ else
   # gateway. Use SUITES= for that sweep; the default stays the proven five.
   SUITES="${SUITES:-store_sales:47 59 88 13 9}"
 fi
-declare -A SQL FACT QFILE QTABLES; NAMES=()
-# ANY SQL, ANY DATASET (blimp --query --sql <file|dir>): SQL_FILES lists .sql
-# files (a directory expands to its *.sql). The query's tables and its FACT are
-# DERIVED from the SQL text + the catalog (query_tables.py: names from FROM/JOIN,
-# existence from the catalog listing, fact = the referenced table with the most
-# rows, the same rule the gateway uses) — never from a TPC-DS number.
-if [ -n "${SQL_FILES:-}" ]; then
-  SUITE_ARR=()
-  for p in $SQL_FILES; do
-    if [ -d "$p" ]; then for f in "$p"/*.sql; do [ -f "$f" ] && SQL_LIST="${SQL_LIST:-} $f"; done
-    elif [ -f "$p" ]; then SQL_LIST="${SQL_LIST:-} $p"
-    else echo "  skip $p: not a file or directory"; fi
-  done
-  qt_args=""; for f in $SQL_LIST; do qt_args="$qt_args --sql-file $f"; done
-  QT_JSON=$("$PY3" "$HERE/query_tables.py" $qt_args --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" \
-              ${ICEBERG_PREFIX:+--prefix "$ICEBERG_PREFIX"} --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" 2>/tmp/query_tables.err) \
-    || { echo "FATAL: could not derive the queries' tables from the catalog: $(tail -1 /tmp/query_tables.err)"; exit 1; }
-  for f in $SQL_LIST; do
-    n=$(basename "$f" .sql)
-    line=$(printf '%s\n' "$QT_JSON" | python3 -c 'import json,sys
-want=sys.argv[1]
-for l in sys.stdin:
-    d=json.loads(l)
-    if d["file"]==want: print(d["fact"]+" "+" ".join(d["tables"])); break' "$f")
-    fact="${line%% *}"; tabs="${line#* }"
-    [ -n "$fact" ] || { echo "  skip $n: none of its tables exist in $NAMESPACE (refs: $("$PY3" "$HERE/query_tables.py" --sql-file "$f" --list-refs | python3 -c 'import json,sys;print(" ".join(json.load(sys.stdin)["refs"]))'))"; continue; }
-    NAMES+=("$n"); SQL[$n]="$(cat "$f")"; FACT[$n]="$fact"; QFILE[$n]="$f"; QTABLES[$n]="$tabs"
-    printf '%s\n' "${SUITE_ARR[@]}" | grep -qx "$fact:" || SUITE_ARR+=("$fact:")
-    echo "  $n: tables [$tabs] fact=$fact"
-  done
-  [ ${#NAMES[@]} -gt 0 ] || { echo "FATAL: no usable SQL files in $SQL_FILES"; exit 1; }
-else
+declare -A SQL FACT QFILE; NAMES=()
 IFS=';' read -ra SUITE_ARR <<< "$SUITES"
 for su in "${SUITE_ARR[@]}"; do
   fact="${su%%:*}"
@@ -202,7 +170,6 @@ for su in "${SUITE_ARR[@]}"; do
   done
 done
 [ ${#NAMES[@]} -gt 0 ] || { echo "FATAL: no query files in $Q_DIR (generate via duckdb tpcds extension)"; exit 1; }
-fi
 facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
@@ -223,12 +190,6 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # VERIFY=1 (--verify) no longer touches the author: it adds phase 4, which
   # compares each tick's served result with the original query over base.
   #
-  # force_author is NO LONGER implied by arg3. A forced author is not what
-  # production does: a real query arrives, the matcher finds (or does not find) an
-  # MV, and CDC merges lazily before serving. Forcing made phase 1 rebuild MVs that
-  # already existed — measured on test2 2026-07-30, q64 spent 497s re-authoring an
-  # MV it already had (mv_h_95a7b7fa888f, 300k rows) before the append it was
-  # supposed to be measuring. Set FORCE_AUTHOR=1 only to deliberately rebuild.
   # AUTHOR_TIMEOUT: graft-primary cold authors probe + materialize the WIDEST
   # feasible candidate first with cap-backoff — several full-fact CTAS attempts
   # can exceed 400s at SF1000; a shorter curl -m SIGKILLs the in-flight CTAS
@@ -238,7 +199,7 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # author + verify is two full source scans; give it two hours.
   curl -s -m "${AUTHOR_TIMEOUT:-7200}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":True,"force_author":sys.argv[4]=="1"}))' "$1" "$2" "${3:-0}" "${FORCE_AUTHOR:-0}" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":True}))' "$1" "$2" "${3:-0}" "" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
 }
 
 # ---- MV content signature + THE DELTA GATE -----------------------------------
@@ -310,10 +271,9 @@ for m in (d if isinstance(d,list) else d.get('mvs',[])):
 print('')" "$1" 2>/dev/null; }
 
 # ---- phase 0 (opt-in, EVICT=1 / blimp --query --evict): GENUINE cold state ---
-# force_author was REMOVED from the gateway (2026-07-31): a plain query can no
-# longer ask to rebuild an MV it already has, so FORCE_AUTHOR above is a no-op on
-# current images. The only real cold state is an evicted MV (POST /admin/mv/evict,
-# recipe kept). Two-tier answers regenerate from their chart MV the moment the
+# A query cannot ask the node to rebuild an MV it already has (force_author was
+# removed from the gateway, 2026-07-31). The only real cold state is an evicted
+# MV (POST /admin/mv/evict, recipe kept). Two-tier answers regenerate from their chart MV the moment the
 # answer is evicted, so evict-and-rematch until the matcher returns nothing.
 evict_query(){ # evict_query <sql> <name>
   local rounds=0 busy=0 m t ns e ok rg e2 last=
@@ -542,12 +502,6 @@ except Exception: print(-1)' 2>/dev/null)
     EXTRA_TABLES="${scoped# }"
   fi
   NOTIFY_TABLES="store_sales store_returns catalog_sales catalog_returns web_sales web_returns $EXTRA_TABLES"
-  # With --sql the tables to notify are the ones the queries actually read (derived
-  # above from the SQL + catalog), not a fixed list: snapshot_changed for each of
-  # them after the append is what arms the watermark diff → merge → serve.
-  if [ -n "${SQL_FILES:-}" ]; then
-    NOTIFY_TABLES=""; for n in "${NAMES[@]}"; do NOTIFY_TABLES="$NOTIFY_TABLES ${QTABLES[$n]}"; done
-  fi
   SEED_CREDS_AK="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}"; SEED_CREDS_SK="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}"
   # Capture instead of `| tail -1`: the pipe threw away both the traceback AND
   # the seeder's exit status, so an append that failed for EVERY fact printed one
@@ -563,7 +517,7 @@ except Exception: print(-1)' 2>/dev/null)
     # folded q18/q60 to 0 rows every tick (2026-09-06).
     POOLS_ARG=""
     if [ "${CDC_TARGET_POOLS:-1}" != "0" ]; then
-      pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query, --sql or TPC-DS
+      pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query
       if [ -z "$pf" ]; then
         echo "   pools: no query SQL loaded — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
       elif ! POOLPY=$(pool_python) || [ -z "$POOLPY" ]; then
@@ -581,19 +535,6 @@ except Exception: print(-1)' 2>/dev/null)
         echo "   pools: derivation failed (UNIFORM draws) — $(tail -1 /tmp/cdc_pools.log)"
       fi
     fi
-    # THE APPEND IS PLUGGABLE. A customer's own streamer does the append in
-    # production; the suite only needs SOMETHING to land new rows between phase 1
-    # and phase 3, then it fires snapshot_changed for the queries' tables and
-    # measures merge + serve. CDC_TICK_CMD (blimp --query --tick-cmd '<cmd>') runs
-    # that command here — NAMESPACE / ICEBERG_URL / WAREHOUSE / S3_* are in its env
-    # — and the built-in seed_tpcds.py tick is the default for the TPC-DS test set
-    # (it fails loudly on any other schema).
-    if [ -n "${CDC_TICK_CMD:-}" ]; then
-      echo "   tick: running your streamer: $CDC_TICK_CMD"
-      seed_out=$(NAMESPACE="$NAMESPACE" ICEBERG_URL="${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" WAREHOUSE="$WAREHOUSE" \
-        S3_ENDPOINT="${S3_ENDPOINT:-}" AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
-        bash -c "$CDC_TICK_CMD" 2>&1); seed_rc=$?
-    else
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
       "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
       --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG \
@@ -602,7 +543,6 @@ except Exception: print(-1)' 2>/dev/null)
       --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
       ${CDC_YEARS:+--years "$CDC_YEARS"} ${CDC_STREAM_DAYS:+--stream-days "$CDC_STREAM_DAYS"} \
       ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1); seed_rc=$?
-    fi
     if [ "$seed_rc" -ne 0 ]; then
       echo "   !! CDC TICK FAILED (exit $seed_rc) — no rows added, so EVERY merge"
       echo "   !! measured below is against UNCHANGED data. Full output:"
