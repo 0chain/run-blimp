@@ -447,6 +447,12 @@ query  fact           mv_rows x cols  author_ms  merge_ms      mode  incr_ms  de
 q1     store_returns      177924x5         4270     19216  incremental     329          50  merged
 ```
 
+The `verify` column is `MATCH` / `MATCH(float)` / `MISMATCH` with `--verify`,
+`(no --verify)` without it. Under the table each query prints the tick's result
+(status, rows, md5) and two links the node hosts — the same pages the node
+panel's Query tab opens: `mv:` the MV table, `result:` this tick's result, both
+paginated in the browser.
+
 `merge_ms` only counts when `delta_verdict` is `merged` — `UNCHANGED` or
 `EMPTY` mean the append produced no delta for that MV and the number measured
 nothing. `mode=incremental` is the delta-merge fast path; `no-delta` is a full

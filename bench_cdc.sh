@@ -206,7 +206,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R V_RESULT MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL V_RESULT MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # EVERY call passes skip_verify, and that is the PRODUCTION path: the gateway
@@ -629,6 +629,7 @@ except Exception: print(-1)' 2>/dev/null)
     I_MERGE[$n]=$(echo "$R" | J merge_ms)
     I_STATUS[$n]=$(echo "$R" | J status); I_ROWS[$n]=$(echo "$R" | J rows)
     I_MD5[$n]=$(echo "$R" | J md5); I_MD5R[$n]=$(echo "$R" | J md5_rounded)
+    I_MVURL[$n]=$(echo "$R" | J mv_url); I_RESURL[$n]=$(echo "$R" | J result_url)
     # Take the MV's dimensions AND content hash from the MERGE response. Phase 1
     # only reports them on a COLD author, so once the MVs exist every later run
     # printed "?x?" — and with no hash there was no way to tell a merge that
@@ -782,11 +783,13 @@ for n in "${NAMES[@]}"; do
     "$n" "${FACT[$n]}" "${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}" "$au" "${MERGE[$n]:-?}" "${MODE[$n]:-?}" "${I_QMS[$n]:-?}" "$(cc "$n")" \
     "${DELTA_ROWS[$n]:-?}" "${DELTA_VERDICT[$n]:-?}" "${V_RESULT[$n]:-(no --verify)}"
 done
-# Where the MV lives and what the tick returned, one line per query.
+# The tick's MV and result as the node hosts them (the same viewer pages the
+# node panel links: mv_url / result_url of the tick's /admin/query/run).
 for n in "${NAMES[@]}"; do
-  t="${MVTBL[$n]##*.}"
-  if [ -n "$t" ] && [ "$t" != "none" ]; then mvloc="s3://$MV_BUCKET/$t/ (${MV_ROWS[$n]:-?} rows x ${MV_COLS[$n]:-?} cols)"; else mvloc="none (served from base)"; fi
-  echo "  $n: mv=$mvloc  tick result: status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${I_MD5[$n]:-?}  verify=${V_RESULT[$n]:-(no --verify)}"
+  u() { [ -n "$1" ] && [ "$1" != null ] && printf '%s' "$1" || printf '%s' "$2"; }
+  echo "  $n: tick result: status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${I_MD5[$n]:-?}  verify=${V_RESULT[$n]:-(no --verify)}"
+  echo "      mv:     $(u "${I_MVURL[$n]:-}" "none (served from base)")"
+  echo "      result: $(u "${I_RESURL[$n]:-}" "not persisted for this run")"
 done
 echo "=============================================================================="
 echo "mode=incremental → delta-merged (merge_ms, reads |MV|+|delta|); fallback/no-delta"
