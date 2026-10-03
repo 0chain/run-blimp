@@ -429,11 +429,16 @@ blimp --query --evict --verify                 # cold start + correctness check
 blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
 ```
 
-With `--sql` the tables a query reads are parsed from its `FROM`/`JOIN`
+`--sql` sends the query in your `.sql` file. It can read any table registered
+in the Iceberg catalog — the node's DuckDB loads those tables to author the MV
+and answer the query. The tables are parsed from the query's `FROM`/`JOIN`
 clauses and checked against the catalog, and the **fact** is the referenced
 table with the most rows (the node's own rule), so `snapshot_changed` fires for
-exactly the tables the query touches. The phase-2 append is the TPC-DS seeder,
-so the query must read TPC-DS tables.
+exactly the tables the query touches. Only the phase-2 append (the rows added
+before the tick) is TPC-DS-specific: the built-in seeder writes TPC-DS rows, so
+on other tables phase 2 reports `CDC TICK FAILED`, nothing is appended, and the
+tick measures an unchanged MV. Authoring, the author verify and the serve are
+measured either way.
 
 **Reading the result.** One row per query, e.g.:
 

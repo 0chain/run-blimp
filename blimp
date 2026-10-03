@@ -79,10 +79,10 @@ usage(){
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
   blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
-                     --sql <file|dir>    run YOUR SQL: the query's tables + fact are
-                                         derived from the SQL and the catalog (the
-                                         phase-2 append is the TPC-DS seeder, so the
-                                         tables must be TPC-DS tables)
+                     --sql <file|dir>    send the query in YOUR .sql file(s); any table
+                                         registered in the Iceberg catalog. The tick's
+                                         append is the TPC-DS seeder, so only TPC-DS
+                                         tables change between author and tick
                      --tpc "3 7 19"      which TPC-DS queries (default: --first-10)
                      --second-40 | --third-30 | --fourth-19 | --all
                                          run a batch from suites/: --first-10 (the 10
@@ -1728,7 +1728,8 @@ for f in "$@"; do
     --tpc)          pending=QNRS ;;
     # --sql <file|dir>: run YOUR SQL against the wired source (author → verify →
     # append → merge → serve); the query's tables and fact are derived from the
-    # SQL + catalog. The phase-2 append is the TPC-DS seeder.
+    # SQL + catalog; any registered Iceberg table. The phase-2 append is the
+    # TPC-DS seeder, so only TPC-DS tables change between author and tick.
     --sql)          pending=SQL_FILES ;;
     --sql=*)        SQL_FILES="${f#--sql=}"; export SQL_FILES ;;
     --first-10|--second-40|--third-30|--fourth-19)

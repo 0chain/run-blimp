@@ -772,15 +772,21 @@ cc(){ local n="$1"
   [ -z "${MV_HASH_NEW[$n]:-}" ] && { printf '?'; return; }
   [ -z "${MV_HASH_OLD[$n]:-}" ] && { printf 'n/a'; return; }
   [ "${MV_HASH_NEW[$n]}" = "${MV_HASH_OLD[$n]}" ] && printf 'UNCHANGED' || printf 'changed'; }
-printf '%-10s %-14s %16s %11s %10s %8s %9s %-11s %10s %-12s\n' query fact 'mv_rows x cols' author_ms merge_ms mode incr_ms content delta_rows delta_verdict
-printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s\n' ---------- -------------- ---------------- ----------- ---------- -------- --------- ----------- ---------- ------------
+printf '%-10s %-14s %16s %11s %10s %8s %9s %-11s %10s %-12s %-12s\n' query fact 'mv_rows x cols' author_ms merge_ms mode incr_ms content delta_rows delta_verdict verify
+printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s %-12s\n' ---------- -------------- ---------------- ----------- ---------- -------- --------- ----------- ---------- ------------ ------------
 for n in "${NAMES[@]}"; do
   # author time = shape+materialize; when phase-1 reused a warm MV, author_ms is
   # blank — fall back to materialize_ms so the cold-build cost is still shown.
   au="${A_MS[$n]}"; [ -z "$au" -o "$au" = "0" ] && au="${M_MS[$n]:-?}"
-  printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s\n' \
+  printf '%-10s %-14s %16s %11s %10s %8s %9s %-9s %10s %-12s %-12s\n' \
     "$n" "${FACT[$n]}" "${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}" "$au" "${MERGE[$n]:-?}" "${MODE[$n]:-?}" "${I_QMS[$n]:-?}" "$(cc "$n")" \
-    "${DELTA_ROWS[$n]:-?}" "${DELTA_VERDICT[$n]:-?}"
+    "${DELTA_ROWS[$n]:-?}" "${DELTA_VERDICT[$n]:-?}" "${V_RESULT[$n]:-(no --verify)}"
+done
+# Where the MV lives and what the tick returned, one line per query.
+for n in "${NAMES[@]}"; do
+  t="${MVTBL[$n]##*.}"
+  if [ -n "$t" ] && [ "$t" != "none" ]; then mvloc="s3://$MV_BUCKET/$t/ (${MV_ROWS[$n]:-?} rows x ${MV_COLS[$n]:-?} cols)"; else mvloc="none (served from base)"; fi
+  echo "  $n: mv=$mvloc  tick result: status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${I_MD5[$n]:-?}  verify=${V_RESULT[$n]:-(no --verify)}"
 done
 echo "=============================================================================="
 echo "mode=incremental → delta-merged (merge_ms, reads |MV|+|delta|); fallback/no-delta"
