@@ -415,7 +415,10 @@ except Exception: print(-1)' 2>/dev/null)
         echo "   WARN: $what still busy ($act) after ${el}s — continuing anyway"
         return 0
       fi
-      sleep 10
+      # Two quiet polls 10 s apart made every drain cost 10-20 s even when the
+      # gateway was idle at once — twice per query, ~30 s of a ~90 s query
+      # cycle (node 144, 2026-10-03). DRAIN_POLL_SEC (default 2).
+      sleep "${DRAIN_POLL_SEC:-2}"
     done
   }
 
@@ -640,7 +643,9 @@ except Exception: print(-1)' 2>/dev/null)
 
   echo ">> phase 3: re-run all (incremental)"
   for n in $FNAMES; do
+    _p3=$(date +%s.%N)
     R=$(run "${SQL[$n]}" "$n:incr"); I_QMS[$n]=$(echo "$R" | J query_ms)
+    _p3r=$(date +%s.%N)
     # Lazy CDC model: snapshot_changed only MARKS the MV stale; the delta-merge
     # happens ON this query and is reported inline as merge_ms.
     I_MERGE[$n]=$(echo "$R" | J merge_ms)
@@ -658,6 +663,7 @@ except Exception: print(-1)' 2>/dev/null)
       [ -n "${mr:-}" ] && MV_ROWS[$n]="$mr"; [ -n "${mc:-}" ] && MV_COLS[$n]="$mc"
       MV_HASH_NEW[$n]=$(mv_etag "$t")
     fi
+    echo "   $n: phase-3 wall: request $(awk "BEGIN{printf \"%.1f\", $_p3r-$_p3}")s, dims+etag $(awk "BEGIN{printf \"%.1f\", $(date +%s.%N)-$_p3r}")s"
     mh="${MV_HASH_NEW[$n]:-}"
     hint=""
     if [ -n "$mh" ] && [ -n "${MV_HASH_OLD[$n]:-}" ]; then
