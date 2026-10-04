@@ -1405,11 +1405,36 @@ cmd_query(){
   if [ -n "${SUITES:-}" ] || [ -n "${SQL_FILES:-}" ] || [ "${#qs[@]}" -le 1 ]; then
     run_query_suite "${QNRS:-}"; return $?
   fi
+  # Each query's output is kept under QUERY_LOG_DIR (default ./blimp_query_logs)
+  # and summarised on one line: author wall (phase 1 → phase 2), the author's
+  # own verify, the tick, and the --verify result. The table is reprinted at the
+  # end and saved as summary.txt.
+  local LD="${QUERY_LOG_DIR:-./blimp_query_logs}" sum
+  mkdir -p "$LD"; sum="$LD/summary.txt"; : > "$sum"
   for q in "${qs[@]}"; do
     echo "######## q$q — serve, append, tick ########"
-    run_query_suite "$q" || rc=$?
+    local t0; t0=$(date +%s)
+    set -o pipefail
+    run_query_suite "$q" 2>&1 | while IFS= read -r l; do printf '%(%s)T %s\n' -1 "$l"; done | tee "$LD/q$q.log" | cut -d' ' -f2- || rc=$?
+    set +o pipefail
+    query_summary_line "$q" "$LD/q$q.log" "$(( $(date +%s) - t0 ))" | tee -a "$sum"
   done
+  echo; bold "== summary (${#qs[@]} queries; logs in $LD) =="; cat "$sum"
   return $rc
+}
+
+# query_summary_line <q> <log> <wall_s>: one line per query from its timestamped
+# bench log. author = wall seconds from phase 1 to phase 2 (the author's own
+# author_ms is not reliable across response paths); verify = the author's
+# row-hash ms; tick = the measured tick; result = the --verify verdict.
+query_summary_line(){
+  local q="$1" f="$2" w="$3" aw av tk res
+  aw=$(awk '/>> phase 1/{a=$1} />> phase 2/{if(a){print $1-a; exit}}' "$f")
+  av=$(grep -m1 -oE "q$q: author=[0-9?]+ materialize=[0-9?]+ verify=[0-9?]+" "$f" | sed 's/.*verify=//')
+  tk=$(grep -oE "q$q: tick: [0-9.]+" "$f" | tail -1 | awk '{print $3}')
+  res=$(grep -oE "q$q: verify: [A-Z()a-z]+" "$f" | tail -1 | awk '{print $3}')
+  [ "$av" = "?" ] || [ -z "$av" ] || av=$(awk -v m="$av" 'BEGIN{printf "%.1f", m/1000}')
+  printf 'q%-3s author=%ss verify=%ss tick=%ss result=%s wall=%ss\n' "$q" "${aw:-?}" "${av:-?}" "${tk:-?}" "${res:-${VERIFY:+?}}" "$w"
 }
 
 # Flags may follow the command: `blimp --query --evict --verify`. Two different
