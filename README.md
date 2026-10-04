@@ -440,10 +440,19 @@ blimp --query --sql ./my_query.sql             # YOUR SQL file
 blimp --query --sql ./queries/                 # a directory of .sql files
 blimp --query --evict --verify                 # cold start + correctness check
 blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
-blimp --query --all                            # all 99 TPC-DS queries
+./tpc_all                                      # all 99, one query at a time (see below)
 blimp --query --second-40                      # named batches: --first-10 (default), --second-40,
                                                #   --third-30, --fourth-19 (together = all 99); they stack
 ```
+
+`./tpc_all` runs TPC-DS queries one at a time, each in two blimp runs: a cold
+run (`--evict-family`: evict the query's MV family, author it with the
+author's row-hash verify, append, tick 1), then a steady-state run
+(`--verify`: append, tick 2, compare the answer with the original query over
+base). It prints one line per query — author seconds, the author's verify
+seconds, tick 1, tick 2, MATCH / MISMATCH — and saves the logs and
+`summary.txt` under `./tpc_all_logs` (`TPC_ALL_OUT` to move them).
+`./tpc_all "3 7 19"` runs a subset.
 
 `--sql` sends the query in your `.sql` file. It can read any table registered
 in the Iceberg catalog — the node's DuckDB loads those tables to author the MV

@@ -75,13 +75,13 @@ usage(){
                                          append is the TPC-DS seeder, so only TPC-DS
                                          tables change between author and tick
                      --tpc "3 7 19"      which TPC-DS queries (default: --first-10)
-                     --second-40 | --third-30 | --fourth-19 | --all
+                     --second-40 | --third-30 | --fourth-19
                                          run a batch from suites/: --first-10 (the 10
                                          proven queries) is the DEFAULT; then the rest of
                                          the release-50, then the remaining 49 split
-                                         30/19; --all = every TPC-DS query 1-99. Flags
-                                         stack, and a batch name also works as a
-                                         --tpc token
+                                         30/19. Flags stack, and a batch name also
+                                         works as a --tpc token. All 99, one query
+                                         at a time with two ticks each: ./tpc_all
                      --append-rows N     CDC tick base rows (default 5000)
                      Add --evict to start COLD (evict each MV, re-author from the
                      recipe library), or --evict-family to evict every MV banked
@@ -1453,7 +1453,6 @@ for f in "$@"; do
     --sql=*)        SQL_FILES="${f#--sql=}"; export SQL_FILES ;;
     --first-10|--second-40|--third-30|--fourth-19)
                     QNRS="${QNRS:+$QNRS }${f#--}"; export QNRS ;;
-    --all)          QNRS="$(seq -s ' ' 1 99)"; export QNRS ;;
     --tpc=*)        QNRS="${f#--tpc=}"; export QNRS ;;
     --append-rows)  pending=CDC_ROWS ;;
     --append-rows=*) CDC_ROWS="${f#--append-rows=}"; export CDC_ROWS ;;
