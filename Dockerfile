@@ -48,7 +48,7 @@ WORKDIR /kit
 # missing path fails the build, so `docker build .` had been broken outright.
 COPY blimp register_tpcds_tables.py seed_tpcds.py standup_data.sh \
      query_tables.py mv_delta_rows.py query_pools.py tfrecord2idx \
-     test_query.sh bench_cdc.sh bench_incremental.sh test_cache.sh \
+     test_query.sh bench_cdc.sh test_cache.sh \
      run_cluster.sh /kit/
 COPY suites/ /kit/suites/
 # acid checker: source (for reference) + the prebuilt binary from the builder

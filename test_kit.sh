@@ -14,29 +14,6 @@ ok(){ PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n     want: %s\n     got:  %s\n' "$1" "$2" "$3"; }
 eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1" "$2" "$3"; }
 
-echo "== bench fact derivation (bench_incremental.sh) =="
-# The append must land on the fact the QUERY reads. A hardcoded default sent
-# every append to store_returns, so q9/q88/q14 — all store_sales MVs — saw no
-# delta, reported delta_merge_ms empty, and looked like a broken delta engine.
-Q_DIR=$(mktemp -d); trap 'rm -rf "$Q_DIR"' EXIT
-query_fact(){
-  local sql="" f
-  [ -n "${QF:-}" ] && [ -f "${QF:-}" ] && sql=$(tr 'A-Z' 'a-z' < "$QF")
-  for f in store_sales catalog_sales web_sales store_returns catalog_returns web_returns inventory; do
-    case "$sql" in *"$f"*) printf '%s' "$f"; return;; esac
-  done
-  printf 'store_sales'
-}
-printf 'SELECT * FROM store_sales WHERE ss_item_sk = 1\n' > "$Q_DIR/q88.sql"
-QF="$Q_DIR/q88.sql"; eq "store_sales query -> store_sales" "store_sales" "$(query_fact)"
-printf 'SELECT * FROM web_sales ws JOIN date_dim d ON 1=1\n' > "$Q_DIR/q12.sql"
-QF="$Q_DIR/q12.sql"; eq "web_sales query -> web_sales"     "web_sales"   "$(query_fact)"
-printf 'WITH cs_ui AS (SELECT * FROM catalog_sales)\nSELECT 1\n' > "$Q_DIR/q64.sql"
-QF="$Q_DIR/q64.sql"; eq "catalog_sales query -> catalog_sales" "catalog_sales" "$(query_fact)"
-QF=""; eq "no query file -> store_sales fallback, never a table it may not read" "store_sales" "$(query_fact)"
-QF="$Q_DIR/does_not_exist.sql"; eq "missing query file does not abort under set -u" "store_sales" "$(query_fact)"
-
-echo
 echo "== origin endpoint plumbing (run_router.sh / test_cache.sh) =="
 # A blank S3_ENDPOINT must mean AWS (no flag). A non-blank one MUST produce the
 # flag: without it every origin call silently went to real AWS and MinIO

@@ -10,8 +10,6 @@
 #                         then prints the values to point the Blimp cluster at.
 #   blimp --storage       TEST: storage suite (warp, mlperf).
 #   blimp --query         TEST: query + CDC suite (author → append → delta-merge).
-#   blimp --bench         BENCH: statistical author / materialize / delta-merge
-#                         timing profile (min/median/avg/max over N iterations).
 #
 # Wiring is saved to ~/.blimp_env (override path with BLIMP_ENV). --setup writes
 # it; --storage/--query read it (and prompt for anything still missing).
@@ -96,8 +94,6 @@ usage(){
                      recipe library). Add --verify to compare each tick's
                      served result (md5) with the ORIGINAL query run over base
                      on the same data: MATCH / MATCH(float) / MISMATCH per query.
-  blimp --bench      Bench: author / materialize / delta-merge timing profile
-                     (min/median/avg/max over N iters; ITERS, AUTHOR_ITERS, CDC_ROWS).
   blimp --update     Update software ON THE NODE (via its :9401 helper, bearer = CLUSTER_TOKEN):
                        blimp --update status                 what is running (images, rclone, tools)
                        blimp --update all                    zs3 gateway, eblobbers, nessie, gotenberg, rclone, feldera
@@ -1679,29 +1675,6 @@ cmd_query(){
   return $rc
 }
 
-cmd_bench(){
-  need_env
-  : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
-  preflight 0 0
-  # statistical profile: one-time author_ms + materialize_ms, and per-append
-  # delta_merge_ms + materialize_ms (min/median/avg/max). Tune ITERS / AUTHOR_ITERS
-  # / CDC_ROWS to size the sweep and the delta.
-  # One bench_incremental.sh run per query of the selected batch (default
-  # --first-10; --second-40/--third-30/--fourth-19/--all/--tpc stack). An
-  # explicit BENCH_QNR=<n> in the env still benches that single query.
-  local q rc=0
-  for q in ${BENCH_QNR:-$QNRS}; do
-  env GW="$GW" GW_AK="${GW_AK:-}" GW_SK="${GW_SK:-}" CLUSTER_ID="$CLUSTER_ID" \
-    ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" NAMESPACE="${NAMESPACE:-tpcds}" \
-    REGION="${REGION:-ap-south-1}" ITERS="${ITERS:-3}" AUTHOR_ITERS="${AUTHOR_ITERS:-3}" \
-    S3_ENDPOINT="${S3_ENDPOINT:-}" S3_KEY="${S3_KEY:-}" S3_SECRET="${S3_SECRET:-}" \
-    BENCH_QNR="$q" Q_DIR="${Q_DIR:-$HOME/tpcds_queries}" \
-    BENCH_FACT="${BENCH_FACT:-}" \
-    CDC_ROWS="${CDC_ROWS:-50000}" bash "$HERE/bench_incremental.sh" || rc=$?
-  done
-  return $rc
-}
-
 # Flags may follow the command: `blimp --query --evict --verify`. Two different
 # verifications exist: the AUTHOR's row-hash (the node proves every new MV
 # against the original query before banking it — always on, not a flag), and
@@ -1766,7 +1739,7 @@ resolve_suite_names(){
   QNRS="$(echo $out)"; export QNRS
 }
 # Default batch for a query run is first-10 (a --tpc/batch flag overrides).
-case "$CMD" in --query|query|--bench|bench) [ -n "${QNRS:-}" ] || QNRS=first-10 ;; esac
+case "$CMD" in --query|query) [ -n "${QNRS:-}" ] || QNRS=first-10 ;; esac
 [ -z "${QNRS:-}" ] || resolve_suite_names
 
 # cmd_acid — linearizability (ACID) check of the node's three data paths.
@@ -2042,7 +2015,6 @@ case "$CMD" in
   --immutable|immutable)   cmd_immutable "${1:-}" ;;
   --gc|gc)            cmd_gc ;;
   --query|query)      cmd_query ;;
-  --bench|bench)      cmd_bench ;;
   ""|-h|--help|help)  usage ;;
   *)                  echo "unknown command: $1"; echo; usage; exit 2 ;;
 esac

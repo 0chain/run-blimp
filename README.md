@@ -101,7 +101,6 @@ blimp --setup         connect a Blimp node to your data (interactive)
 blimp --query         prove authoring + CDC delta-merge (a TPC-DS query with --tpc, your own SQL with --sql)
 blimp --storage       storage suite: TTFB, warp PUT/GET, MLPerf resnet50
 blimp --acid          ACID / linearizability check of both data paths
-blimp --bench         author / materialize / delta-merge timing profile
 blimp --update        update software on the node: status | all | zs3,eblobber,nessie,gotenberg,rclone
                       (--tag svc=tag, --dry-run; runs on the node via its :9401 helper, one at a time)
 ```
@@ -394,7 +393,7 @@ over a per-node `blimp-<node>-0.blimp.software:9443` for anything user-facing.
 
 ## Testing the Blimp node
 
-The `--query`, `--storage`, and `--bench` commands are **testing/validation
+The `--query` and `--storage` commands are **testing/validation
 tools** — they prove the wiring, measure the node, and gate a rollout. They are
 not part of production operation (production is your pipeline + the
 `snapshot_changed` webhook from Step 4).
@@ -542,21 +541,7 @@ the number above measured the link between nodes rather than this node's own
 storage. Each leg also registers itself on the node panel's **Benchmarks** tab,
 so a client-run result sits next to the ones started from the UI.
 
-### C — `./blimp --bench` (timing profile)
-
-Bench = min/median/avg/max author / materialize / delta-merge profile, one run
-per query of the selected batch (`ITERS AUTHOR_ITERS CDC_ROWS` default 3/3/50000;
-the batch defaults to the same `--first-10` as `--query` and takes the same
-`--tpc` / batch flags; `BENCH_QNR=64` benches exactly one query from
-`$Q_DIR/q<N>.sql`; `BENCH_FACT=catalog_sales` appends referentially for
-join-CTE queries).
-
-Check the `n=` on each summary line before quoting it — an append that
-re-materializes instead of merging contributes no `delta_merge_ms`, so `n` can
-be lower than `ITERS`. See the worked example in the walkthrough below for what
-the numbers do and don't mean.
-
-### D — Testing ACID (`blimp --acid`)
+### C — Testing ACID (`blimp --acid`)
 
 A Blimp node is not a single disk — a write is erasure-coded across many
 independent blobbers, and reads are served through several front-ends (the
@@ -636,174 +621,7 @@ cp` md5 checks that pass byte-for-byte with the strict ACID verify on and off.)
 
 ## Reference
 
-- **[WALKTHROUGH.md](WALKTHROUGH.md)** — a full transcript, every command and its
-  real output, on a fresh node. Captured before the A/B/C setup options: the
-  shape is right, the catalog and the default source have changed (see Step 2).
 - **[TESTING.md](TESTING.md)** — testing the kit itself: `./test_kit.sh`,
   `./test_setup_options.sh`, `python3 test_seed_tpcds.py`. All offline.
 - Product docs: [docs.zus.network/zus-docs/webapps/blimp](https://docs.zus.network/zus-docs/webapps/blimp)
   — the optimizer, incremental MVs (CDC), and the Prod-Query & MV API.
-
----
-
-## Verified walkthrough (real commands + output)
-
-A fresh Ubuntu 24.04 cloud VM on the cluster's private network, cluster
-`1784970467881`. Every line below is the actual command and its actual
-output from a live run.
-
-> **Historical transcript (captured before the A/B/C setup options).** It is
-> kept because every line is real output from a live run, but the current
-> `--setup` differs: it asks the three catalog / source / dataset questions
-> shown in Step 2, the local catalog it stands up is **Nessie** (not
-> `tabulario/iceberg-rest`), the default source is the node's own fleet cache
-> layer, and the admin bearer is the node's live token rather than
-> `zus-<cluster-id>`. Follow Step 2 for what a run looks like today.
-
-
-**1. Confirm the node's identity (no keys anywhere).**
-```
-$ whoami; hostname; hostname -I
-ubuntu
-ip-10-10-12-62
-10.10.12.62 172.17.0.1
-
-$ curl -s -H "X-aws-ec2-metadata-token: $TOK" \
-    http://169.254.169.254/latest/meta-data/iam/security-credentials/
-ec2-ssm-role-1784970467881
-```
-
-**2. One command does setup end-to-end** (deps → mode → catalog → wiring).
-`blimp --setup` on the bare box:
-```
-== blimp --setup — connect a Blimp cluster to this node's data ==
-== checking prerequisites ==
-  installing: docker-compose-v2               # ← installs its own missing deps
-  ✓ deps ready (python: /home/ubuntu/.blimp_venv/bin/python3)
-
-network assessment → MODE=vpc (gateway private 10.10.12.249 reachable: yes)
-  gateway → 10.10.12.249 · advertise this node as → 10.10.12.62 · S3 creds → blank (IAM instance role)
-
-standing up an Iceberg REST catalog on :8181 over s3://blimp-tpcds-sf1-aps1/wh3
- Container iceberg-rest  Started
-  Iceberg catalog up — cluster reaches it at http://10.10.12.62:8181
-saved wiring -> /home/ubuntu/.blimp_env
-
-================= POINT THE BLIMP CLUSTER AT THIS SOURCE =================
-  Iceberg REST URL : http://10.10.12.62:8181
-  Warehouse        : s3://blimp-tpcds-sf1-aps1/wh3
-  Namespace        : tpcds_sf1x
-setup done — validate with:  blimp --query   (and  blimp --storage )
-```
-(The `installing: docker-compose-v2` line was later removed — the catalog now
-starts with a plain `docker run`, so the client box needs only the docker
-engine, no compose plugin.)
-
-**3. Register your parquet as Iceberg** (once):
-```
-$ ~/.blimp_venv/bin/python3 register_tpcds_tables.py --catalog http://localhost:8181 \
-    --warehouse s3://my-bucket/wh --source-bucket my-bucket --namespace tpcds_sf1x
-registered 24/24 tables into http://localhost:8181 ns=tpcds_sf1x
-```
-
-### Testing the Blimp node (walkthrough)
-
-The remaining items are the TESTING commands — validation of the wired node,
-not production operation.
-
-**A. `blimp --query` — author + incremental CDC:**
-
-Five queries against a single fact, appending to all five facts each cycle so a
-multi-fact query exercises a multi-fact merge. Live run, SF1 cluster
-`1785550395356`, 2026-08-01:
-```
-== CDC bench: cluster=1785550395356 gw=10.10.114.87 rows/append=5000 suites=[store_sales:9 88 14 64 4] ==
-==== fact: store_sales (q9 q88 q14 q64 q4) ====
->> phase 1: serve/author all (evict=0; correctness is the author's row-hash, which always runs)
-   q9: author=? materialize=? cold_serve=2826ms mv=?x? (mv_h_0e90d0b63216)
-   q88: author=? materialize=? cold_serve=2668ms mv=?x? (mv_h_ae8ceee390cc)
-   q14: author=12252 materialize=? cold_serve=3134ms mv=?x? (none)
-   q64: author=? materialize=? cold_serve=2657ms mv=?x? (mv_h_ad47f860697f)
-   q4: author=45048 materialize=? cold_serve=2971ms mv=?x? (none)
->> phase 2: append +5000 to [store_sales store_returns catalog_sales catalog_returns web_sales] + snapshot_changed
-tpcds.store_sales: +5000 rows -> snapshot 3827416906052195600
-tpcds.store_returns: +5000 rows -> snapshot 686337096249913447
-tpcds.catalog_returns: +1666 referential rows -> snapshot 6382376194974615624
-tpcds.catalog_returns: +5000 rows -> snapshot 7838483972766842389
-tpcds.web_sales: +5000 rows -> snapshot 4945461575749320971
->> phase 3: re-run all (incremental)
-
-============================== CDC CONTRIBUTIONS ==============================
-query      fact             mv_rows x cols   author_ms   merge_ms     mode   incr_ms
-q9         store_sales                 ?x?           ?       5879 incremental      2781
-q88        store_sales                 ?x?           ?       6507 incremental      2693
-q14        store_sales                 ?x?       12252          -        -      3031
-q64        store_sales                 ?x?           ?       8856 incremental      3875
-q4         store_sales                 ?x?       45048          -        -      2959
-  q9: MV mv_h_0e90d0b63216 — delta-merged
-  q88: MV mv_h_ae8ceee390cc — delta-merged
-  q14: no MV — served from base
-  q64: MV mv_h_ad47f860697f — delta-merged
-  q4: no MV — served from base
-```
-How to read it: `mode=incremental` with a `merge_ms` means the MV was refreshed
-by an append-only delta-merge (the O(|MV|+|delta|) fast path). A query with no
-MV serves from base and reports `author_ms` instead — q14 and q4 do that here,
-which is a real gap, not a pass/fail. There is no PASS/FAIL line: the suite
-reports what happened and you judge it.
-
-An append that fails leaves nothing to merge, and phase 3 then measures
-UNCHANGED data while still printing plausible-looking `no-delta` rows. The suite
-now prints the seeder's full traceback and says so explicitly when that happens
-— if you see `APPEND FAILED`, every number below it is meaningless.
-
-**B. Raw stop/start (all 4 instances) → self-heal + re-validate:**
-```
-private IPs unchanged; all 4 public IPs changed
-DNS reconciled by the 60s cron (no touch):
-  zus-1784970467881-0 -> 13.201.26.189   (gateway)
-  zus-1784970467881-1 -> 3.110.120.231   (blobber-1)
-  zus-1784970467881-2 -> 13.127.74.12    (blobber-2)
-  zus-1784970467881-3 -> 3.111.245.151   (blobber-3)
-post-restart q1: merge_ms=5138 mode=incremental   RESULT: PASS
-```
-
-**C. External-cloud host** (a different network, over public DNS):
-```
-network assessment → MODE=external (gateway private unknown reachable: no)
-live query over zus-1784970467881-0.zus.network:9000
-  {status: ok, rows: 1, author_ms: 575, query_ms: 2447, md5: 7a26dcec…}
-```
-
-**D. `blimp --storage` numbers** (2/1 cluster, 5 GB warp set):
-```
-warp   S3 PUT 749 MiB/s · GET 1673 MiB/s   (0 errors)
-```
-
-Those are from a 2/1 cluster on larger instances. Size the benchmark set to
-the cluster — a single 17 MB object measures nothing and reports throughput
-as *slower* than expected purely from per-request overhead.
-
-**E. `blimp --bench` — MV lifecycle timing profile:**
-
-Phase A cold-authors the same query `AUTHOR_ITERS` times (evicting the MV
-between iterations); phase B appends and refreshes `ITERS` times. Live run,
-SF1 cluster `1785550395356`, 2026-08-01:
-```
-== MV lifecycle benchmark v2: cluster 1785550395356 (authors=3, appends=3, upserts=3, rows/cycle=50000) ==
-  author[1] q1 COLD status=ok author_ms=24087 materialize_ms=4024 wall_ms=27393.2 mv=mv_h_aff2e89bc41f
-  author[2] q1 COLD status=ok author_ms=15188 materialize_ms=3773 wall_ms=18415.7 mv=mv_h_aff2e89bc41f
-  author[3] q1 COLD status=ok author_ms=15239 materialize_ms=3705 wall_ms=18522.2 mv=mv_h_aff2e89bc41f
-  append[1] refresh delta_merge_ms=? materialize_ms=3763 query_ms=2955 engine=duckdb wall_ms=21891.6
-  append[2] refresh delta_merge_ms=8321 materialize_ms=? query_ms=3151 engine=duckdb wall_ms=11930.5
-  append[3] refresh delta_merge_ms=6627 materialize_ms=? query_ms=3059 engine=duckdb wall_ms=10051.4
-
-== SUMMARY (q1-scale MV over 50000-row commits) ==
-  one-time author_ms (fresh queries):   n=3 min=15188 median=15239 avg=18171 max=24087 (ms)
-  one-time materialize_ms:              n=3 min=3705 median=3773 avg=3834 max=4024 (ms)
-  one-time wall_ms:                     n=3 min=18416 median=18522 avg=21444 max=27393 (ms)
-  append  delta_merge_ms:               n=2 min=6627 median=7474 avg=7474 max=8321 (ms)
-  append  refresh materialize_ms:       n=1 min=3763 median=3763 avg=3763 max=3763 (ms)
-  append  commit→answer wall_ms:        n=3 min=10051 median=11930 avg=14624 max=21892 (ms)
-```
-
