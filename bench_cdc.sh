@@ -577,7 +577,7 @@ except Exception: print(-1)' 2>/dev/null)
       "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
       --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG \
       ${EXTRA_TABLES:+--extra-tables "$EXTRA_TABLES"} \
-      ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} \
+      ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} ${CDC_DIM_GROWTH:+--dim-growth "$CDC_DIM_GROWTH"} \
       --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
       ${CDC_YEARS:+--years "$CDC_YEARS"} ${CDC_STREAM_DAYS:+--stream-days "$CDC_STREAM_DAYS"} \
       ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1); seed_rc=$?

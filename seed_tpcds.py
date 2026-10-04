@@ -233,6 +233,22 @@ FALLBACK_DIM_HI = {
     "web_page": 3000, "web_site": 54, "reason": 65, "income_band": 20,
 }
 
+# FACTS REFERENCE THE DIMENSION AS LOADED, plus a bounded handful of new keys.
+# Foreign keys used to be drawn uniformly over 1..CURRENT max, so every key a
+# tick appended (and every key issued above fact_fk_max) was referenced by the
+# next tick's thousands of fact rows, and the facts' FK NDV grew with the run.
+# Measured on node 65 (SF1000, 2026-10-03): call_center held 991 rows over keys
+# up to 340,613 (SF1000 has 42) and catalog_sales referenced 1..340,611, so
+# q77's catalog legs carried 110,322 / 8,419 call-center groups and its
+# cs x cr cross join was 0.93B rows. The draw range is now the dimension's
+# key max in its EARLIEST snapshot (the loaded dataset, base_dim_hi), and the
+# keys this tick's append issued (FRESH_KEYS) are referenced by at most one
+# row each, only while the dimension's appended rows are within DIM_GROWTH of
+# its base row count — so a fact's FK NDV is bounded by base * (1 + DIM_GROWTH).
+DEFAULT_DIM_GROWTH = 0.01
+DIM_GROWTH = DEFAULT_DIM_GROWTH
+FRESH_KEYS = {}   # dimension -> keys this tick's append issued that facts may reference
+
 # Key pools from query_pools.py (--key-pools). Shape:
 #   {"date_sk": [...],                      union over the wave (legacy)
 #    "dims": {dim: [...]},                  union over the wave (legacy)
@@ -383,13 +399,39 @@ def draw_dates(col, n, owners, date_lo, date_hi, rnd, prov=None):
     return out
 
 
+_CLAMPED = {}
+
+
+def _clamp_pool(p, hi, fresh):
+    """A query pool without the keys earlier ticks appended past `hi` (they
+    match predicates through generated attributes and would re-inflate the
+    facts' NDV); the pool unchanged if nothing else is left."""
+    if not p:
+        return p
+    k = (id(p), hi, tuple(fresh))
+    c = _CLAMPED.get(k)
+    if c is None or c[0] is not p:   # the pool itself, not a recycled id
+        fs = set(fresh)
+        c = _CLAMPED[k] = (p, [v for v in p if v <= hi or v in fs] or p)
+    return c[1]
+
+
 def draw_dim(dimtbl, n, owners, lo, hi, rnd):
-    out = []
-    union = KEY_POOLS["dims"].get(dimtbl)
+    out, uniform = [], []
+    fresh = FRESH_KEYS.get(dimtbl) or []
+    union = _clamp_pool(KEY_POOLS["dims"].get(dimtbl), hi, fresh)
     for i in range(n):
         o = owners[i] if i < len(owners) else None
-        p = (o["dims"].get(dimtbl) if o else None) or union
-        out.append(rnd.choice(p) if p else rnd.randint(lo, hi))
+        p = _clamp_pool(o["dims"].get(dimtbl), hi, fresh) if o else None
+        p = p or union
+        if p:
+            out.append(rnd.choice(p))
+        else:
+            uniform.append(i)
+            out.append(rnd.randint(lo, hi))
+    # each key this tick's dimension append issued: ONE uniformly drawn row
+    for i, k in zip(rnd.sample(uniform, min(len(uniform), len(fresh))), fresh):
+        out[i] = k
     return out
 
 
@@ -913,7 +955,7 @@ def _bounds_after_append(t, data, n):
         pass
 
 
-def _catalog_bounds(cat, namespace, table, col, min_rows=0):
+def _catalog_bounds(cat, namespace, table, col, min_rows=0, snapshot_id=None):
     """(min, max) of `col` read from ICEBERG MANIFEST STATISTICS — no data scan.
 
     Measured on test2 SF1000 (2026-08-04): 0.01-0.22s per table even for the
@@ -925,7 +967,7 @@ def _catalog_bounds(cat, namespace, table, col, min_rows=0):
         t = cat.load_table((namespace, table))
         f = t.schema().find_field(col)
         lo = hi = None
-        for task in t.scan().plan_files():
+        for task in t.scan(snapshot_id=snapshot_id).plan_files():
             df = task.file
             # min_rows: ignore small files (earlier bench ticks; one 5,000-row
             # seed file spans d_date_sk 2415022..2488070 on the node) when the
@@ -945,16 +987,16 @@ def _catalog_bounds(cat, namespace, table, col, min_rows=0):
         return None, None
 
 
-def scan_dim_hi(cat, namespace, table, col):
+def scan_dim_hi(cat, namespace, table, col, snapshot_id=None):
     import time as _t
     _t0 = _t.time()
     try:
-        return _scan_dim_hi(cat, namespace, table, col)
+        return _scan_dim_hi(cat, namespace, table, col, snapshot_id)
     finally:
         _step("scan_dim_hi", _t0)
 
 
-def _scan_dim_hi(cat, namespace, table, col):
+def _scan_dim_hi(cat, namespace, table, col, snapshot_id=None):
     """max(col) read from the DATA, for when manifest statistics are missing.
 
     Iceberg only records lower/upper bounds when the parquet files carry column
@@ -970,7 +1012,8 @@ def _scan_dim_hi(cat, namespace, table, col):
     hundreds of MB for a single number."""
     try:
         t = cat.load_table((namespace, table))
-        scan = t.scan(selected_fields=(col,))
+        scan = (t.scan(selected_fields=(col,), snapshot_id=snapshot_id) if snapshot_id
+                else t.scan(selected_fields=(col,)))
 
         def _fold(colv, best):
             try:
@@ -1001,6 +1044,48 @@ def _scan_dim_hi(cat, namespace, table, col):
         return None
 
 
+def first_snapshot(t):
+    """The table's earliest retained snapshot: the dataset as loaded."""
+    ss = list(getattr(getattr(t, "metadata", None), "snapshots", None) or [])
+    return min(ss, key=lambda s: s.timestamp_ms) if ss else None
+
+
+def _total_records(snap):
+    try:
+        return int((snap.summary or {}).get("total-records", 0)) if snap else None
+    except Exception:
+        return None
+
+
+def base_rows(t):
+    """Row count of the table as loaded (earliest snapshot), None if unknown."""
+    return _total_records(first_snapshot(t)) or None
+
+
+def base_dim_hi(cat, namespace, table, col):
+    """max(col) of `table` in its EARLIEST snapshot — the highest key of the
+    dimension as loaded, before any bench tick appended to it. Manifest bounds
+    first, a scan of that snapshot otherwise; cached forever per snapshot id
+    (an old snapshot never changes). None when unknown."""
+    try:
+        s0 = first_snapshot(cat.load_table((namespace, table)))
+    except Exception:
+        return None
+    if s0 is None:
+        return None
+    key = "base|%s.%s|%s" % (namespace, table, col)
+    c = _bounds_load().get(key)
+    if c and c.get("snap") == s0.snapshot_id:
+        return c.get("hi")
+    _, hi = _catalog_bounds(cat, namespace, table, col, snapshot_id=s0.snapshot_id)
+    if hi is None:
+        hi = scan_dim_hi(cat, namespace, table, col, snapshot_id=s0.snapshot_id)
+    if isinstance(hi, int):
+        _bounds_load()[key] = {"snap": s0.snapshot_id, "hi": hi}
+        _bounds_save()
+    return hi
+
+
 def load_dim_hi(cat, namespace, dimtables, verbose=True):
     """dimension table -> max surrogate key, read from the LIVE catalog.
 
@@ -1029,6 +1114,16 @@ def load_dim_hi(cat, namespace, dimtables, verbose=True):
                       f"scale factor most appended keys will NOT join")
         elif src == "scan" and verbose:
             print(f"   {d}.{keycol} <= {hi} (scanned; manifest stats missing)")
+        # FK draws stay inside the dimension as loaded (see DIM_GROWTH).
+        # date_dim is exempt: derived dates (date_after) need the CURRENT max,
+        # and its fact keys come from date windows, not this range.
+        if keycol and d != "date_dim" and src != "SF1000 constant":
+            b = base_dim_hi(cat, namespace, d, keycol)
+            if b is not None and b < hi:
+                if verbose:
+                    print(f"   {d}.{keycol}: facts draw 1..{b} (as loaded) + this tick's "
+                          f"new keys, not 1..{hi}")
+                hi = b
         out[d] = hi
     if verbose and out:
         print("   dim key ranges from catalog: "
@@ -1754,8 +1849,21 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
     if verbose:
         flush_date_reports()
     data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
+    rows_before = _total_records(t.current_snapshot())
     _write_and_add(fs, t, data, n, f"{namespace}.{table}", strict=strict)
-    # the facts appended after this may now reference the new keys
+    # the facts appended after this may now reference the new keys — a bounded
+    # handful (draw_dim), and only while the dimension's appended rows stay
+    # within DIM_GROWTH of its row count as loaded
+    FRESH_KEYS[table] = []
+    if keycol and table != "date_dim":
+        b0 = base_rows(t)
+        if b0 and rows_before is not None:
+            budget = max(1, int(b0 * DIM_GROWTH))
+            room = budget - max(0, rows_before - b0)
+            FRESH_KEYS[table] = list(range(kb, kb + max(0, min(n, room))))
+            if verbose:
+                print(f"   {table}: facts may reference {len(FRESH_KEYS[table])} of the "
+                      f"{n} new keys ({rows_before - b0} appended since load, budget {budget})")
     dim_hi_cache.pop(table, None)
 
 
@@ -1811,11 +1919,16 @@ def main():
              "facts so the tick's sales rows can reference the new keys.")
     ap.add_argument("--dim-rate",type=float,default=0.0001,
         help="with --tick: rows appended to each --extra-tables table as a FRACTION "
-             "of its current row count (default 1e-4: store 1,002 -> 1 row, item "
+             "of its row count as loaded, i.e. its earliest snapshot (default 1e-4: store 1,002 -> 1 row, item "
              "300,000 -> 30, customer 12,000,000 -> 1,200), minimum 1. A flat "
              "--rows per dimension grew store to 1,428,002 rows in ~290 ticks on "
              "SF1000 (2026-09-19); dimensions change slowly, facts do not. "
              "--extra-rows overrides.")
+    ap.add_argument("--dim-growth",type=float,default=DEFAULT_DIM_GROWTH,
+        help="with --tick: facts reference a dimension's NEW keys (one row each) only "
+             "while its appended rows are within this fraction of its row count as "
+             "loaded (default 0.01; minimum 1 key); otherwise facts draw keys only "
+             "from the dimension as loaded, so FK NDVs stay at the dataset's sizes")
     ap.add_argument("--extra-rows",type=int,default=0,
         help="rows per extra table (default: same as --rows, the flat count the "
              "internal wave used)")
@@ -1833,7 +1946,7 @@ def main():
     a=ap.parse_args()
     if a.key_pools:
         load_key_pools(a.key_pools)
-    global DRY_RUN; DRY_RUN=a.dry_run
+    global DRY_RUN, DIM_GROWTH; DRY_RUN=a.dry_run; DIM_GROWTH=a.dim_growth
     try:
         years=[int(y) for y in a.years.split(",") if y.strip()]
         date_lo,date_hi=date_sk_bounds(years)
@@ -1893,9 +2006,12 @@ def main():
         extras=[x for x in a.extra_tables.replace(","," ").split() if x]
         def extra_rows_for(x):
             if a.extra_rows: return a.extra_rows
+            # A fraction of the table AS LOADED (earliest snapshot), not of its
+            # current count: the current count compounded every tick's append
+            # into the next tick's size.
             try:
-                cs=cat.load_table((a.namespace,x)).current_snapshot()
-                n=int((cs.summary or {}).get("total-records",0)) if cs else 0
+                t_=cat.load_table((a.namespace,x))
+                n=base_rows(t_) or _total_records(t_.current_snapshot()) or 0
             except Exception:
                 n=0
             return max(1,int(round(n*a.dim_rate))) if n>0 else 1

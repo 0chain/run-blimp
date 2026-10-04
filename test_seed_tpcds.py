@@ -1363,3 +1363,62 @@ class TestFactFkMaxCountsDimensionReferences(unittest.TestCase):
         finally:
             S._namespace_columns, S.catalog_bounds = saved[0], saved[1]
             S._FACT_FK_MAX.clear(); S._FACT_FK_MAX.update(saved[2])
+
+
+class TestFactKeysStayInsideTheLoadedDimension(unittest.TestCase):
+    """Facts draw FK keys from the dimension AS LOADED plus at most one row per
+    key this tick's dimension append issued. Uniform 1..current-max let every
+    appended key reach the facts: node 65 (SF1000, 2026-10-03) had call_center
+    keys up to 340,613 (42 loaded), catalog_sales referenced 1..340,611, and
+    q77's catalog legs held 110,322 call-center groups."""
+
+    def setUp(self):
+        self._saved = (S.KEY_POOLS, dict(S.FRESH_KEYS))
+        S.KEY_POOLS = {"date_sk": [], "dims": {}, "date_by_col": {}, "queries": []}
+        S.FRESH_KEYS.clear()
+
+    def tearDown(self):
+        S.KEY_POOLS = self._saved[0]
+        S.FRESH_KEYS.clear(); S.FRESH_KEYS.update(self._saved[1])
+
+    def test_uniform_draws_add_only_the_fresh_handful(self):
+        S.FRESH_KEYS["call_center"] = [340614, 340615]
+        out = S.draw_dim("call_center", 5000, [None] * 5000, 1, 42, random.Random(3))
+        extra = [v for v in out if v > 42]
+        self.assertEqual(sorted(extra), [340614, 340615], "each fresh key on exactly one row")
+        self.assertLessEqual(len(set(out)), 44)
+
+    def test_no_fresh_keys_means_loaded_keys_only(self):
+        out = S.draw_dim("call_center", 5000, [None] * 5000, 1, 42, random.Random(4))
+        self.assertLessEqual(max(out), 42)
+
+    def test_pool_drops_keys_appended_past_the_loaded_max(self):
+        S.KEY_POOLS["dims"]["item"] = [5, 6, 300001, 300002]
+        out = S.draw_dim("item", 2000, [None] * 2000, 1, 300000, random.Random(5))
+        self.assertEqual(set(out), {5, 6})
+
+    def test_pool_of_only_appended_keys_is_kept(self):
+        S.KEY_POOLS["dims"]["item"] = [300001, 300002]
+        out = S.draw_dim("item", 200, [None] * 200, 1, 300000, random.Random(6))
+        self.assertEqual(set(out), {300001, 300002})
+
+    def test_load_dim_hi_uses_the_loaded_max_except_for_date_dim(self):
+        saved = (S.catalog_bounds, S.base_dim_hi)
+        S.catalog_bounds = lambda cat, ns, t, c, min_rows=0: (1, {"call_center": 340613, "date_dim": 2490000}[t])
+        S.base_dim_hi = lambda cat, ns, t, c: {"call_center": 42, "date_dim": 2488070}[t]
+        try:
+            out = S.load_dim_hi(None, "ns", ["call_center", "date_dim"], verbose=False)
+        finally:
+            S.catalog_bounds, S.base_dim_hi = saved
+        self.assertEqual(out, {"call_center": 42, "date_dim": 2490000})
+
+    def test_base_rows_reads_the_earliest_snapshot(self):
+        class Snap:
+            def __init__(self, sid, ts, rows):
+                self.snapshot_id, self.timestamp_ms, self.summary = sid, ts, {"total-records": str(rows)}
+        class Meta:
+            snapshots = [Snap(3, 300, 991), Snap(1, 100, 42), Snap(2, 200, 43)]
+        class T:
+            metadata = Meta()
+        self.assertEqual(S.first_snapshot(T()).snapshot_id, 1)
+        self.assertEqual(S.base_rows(T()), 42)
