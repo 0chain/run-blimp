@@ -305,10 +305,18 @@ except Exception: print(-1)' 2>/dev/null)
     # cold_serve is the MV read alone now that the serve gate reuses the request's
     # own proof instead of re-running the original on base.
     echo "   $n: author=${A_MS[$n]:-?} materialize=${M_MS[$n]:-?} verify=${V_MS[$n]:-0} cold_serve=${S_MS[$n]:-?}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?} (${MVTBL[$n]:-none})"
+    # The served result's identity; phase 3 (--tick) replaces it with the tick's.
+    I_STATUS[$n]=$(echo "$R" | J status); I_ROWS[$n]=$(echo "$R" | J rows)
+    I_MD5[$n]=$(echo "$R" | J md5); I_MD5R[$n]=$(echo "$R" | J md5_rounded)
+    I_MVURL[$n]=$(echo "$R" | J mv_url); I_RESURL[$n]=$(echo "$R" | J result_url)
     # Let this query's author finish before touching the next one: the gateway
     # builds one MV at a time, so racing ahead only queues them on the same slot.
     drain_authors "$n's author"
   done
+  # ---- TICK=1 (blimp --tick): append rows, then re-run → the delta merge ----
+  # Without it the run stops after phase 1 (author / serve); --verify then
+  # checks the phase-1 served result.
+  if [ "${TICK:-0}" = 1 ]; then
   # ---- DRAIN THE DETACHED AUTHORS BEFORE ANYTHING TOUCHES THE SOURCE --------
   # Backstop for a refresh or build started late. AUTHOR_DRAIN_SEC=0 skips it.
   echo ">> draining detached authors before the tick"
@@ -495,6 +503,7 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
+  fi  # TICK
   # ---- phase 4 (--verify): the tick's served result vs the ORIGINAL query ---
   # One plain comparison: run each query's original SQL over base (no_mv, same
   # data — nothing is appended between the tick above and this run) and compare
@@ -504,7 +513,7 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
   # which re-verified the merged MV (not the served answer) against source.
   # Cost: one original-query run per query; capped by VERIFY_CAP_S.
   if [ "${VERIFY:-0}" = 1 ]; then
-    echo ">> phase 4: verify — tick result vs original query over base"
+    echo ">> phase 4: verify — served result vs original query over base"
     for n in $FNAMES; do
       B=$(curl -s -m "${VERIFY_CAP_S:-3600}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \

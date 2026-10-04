@@ -98,7 +98,7 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 ```
 blimp                 list the commands
 blimp --setup         connect a Blimp node to your data (interactive)
-blimp --query         prove authoring + CDC delta-merge (a TPC-DS query with --tpc, your own SQL with --sql)
+blimp --query         prove authoring (+ CDC delta-merge with --tick) (a TPC-DS query with --tpc, your own SQL with --sql)
 blimp --storage       storage suite: TTFB, warp PUT/GET, MLPerf resnet50
 blimp --acid          ACID / linearizability check of both data paths
 blimp --update        update software on the node: status | all | zs3,eblobber,nessie,gotenberg,rclone
@@ -411,24 +411,27 @@ not part of production operation (production is your pipeline + the
 
 ### A — `./blimp --query` (prove authoring + CDC)
 
-**What it does.** Four phases against the source `--setup` wired, per query:
+**What it does.** Phases against the source `--setup` wired, per query. By
+default it authors / serves (phases 0-1); `--tick` adds the append and the
+delta merge (phases 2-3):
 
 | phase | what happens | what you get |
 |---|---|---|
 | 0 (with `--evict` / `--evict-family`) | drop each query's MV (or its whole family), keep its recipe | a genuinely cold start |
 | 1 | run the query → the node authors an MV from your source | `author_ms`, `materialize_ms`, `verify_ms`, `cold_serve` |
-| 2 | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
-| 3 | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
-| 4 (with `--verify`) | run the original query over base, compare with the tick's served result | `verify: MATCH / MATCH(float) / MISMATCH` |
+| 2 (with `--tick`) | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
+| 3 (with `--tick`) | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
+| 4 (with `--verify`) | run the original query over base, compare with the served result (the tick's, with `--tick`) | `verify: MATCH / MATCH(float) / MISMATCH` |
 
-**One query, three ways.** Phases 2-3 (append + tick) always run; what changes
-is whether the MV is rebuilt and whether the tick's answer is checked:
+**One query, several ways.** What changes is whether the MV is rebuilt, whether
+rows are appended and merged, and whether the answer is checked:
 
 ```
 blimp --query --sql ./my_query.sql          # the same three ways work with your own SQL file in place of --tpc
-blimp --query --tpc 3                      # 1. as-is: serve the MV the node already has (authors only if none), append, tick
-blimp --query --tpc 3 --evict              # 2. cold: evict the MV, re-author it (+ author verify), append, tick
-blimp --query --tpc 3 --evict --verify     # 3. cold + post-verify: as 2, then the tick's answer vs the original query over base
+blimp --query --tpc 3                      # 1. as-is: serve the MV the node already has (authors only if none)
+blimp --query --tpc 3 --evict              # 2. cold: evict the MV, re-author it (+ author verify)
+blimp --query --tpc 3 --tick               # 3. CDC: serve, append rows, run again → delta merge (merge_ms)
+blimp --query --tpc 3 --evict --tick --verify  # 4. cold + CDC + post-verify: the tick's answer vs the original query over base
 blimp --query --tpc 3 --evict-family        # cold for the whole family: evict every MV banked under the query
                                            #   (its chart, branch MVs and answer MVs), not only the matched MV
 ```
@@ -439,17 +442,17 @@ blimp --query --tpc "3 7 19"                   # pick TPC-DS queries
 blimp --query --sql ./my_query.sql             # YOUR SQL file
 blimp --query --sql ./queries/                 # a directory of .sql files
 blimp --query --evict --verify                 # cold start + correctness check
-blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
+blimp --query --tick --append-rows 50000       # bigger CDC tick (default 5000)
 ./tpc_all                                      # all 99, one query at a time (see below)
 blimp --query --second-40                      # named batches: --first-10 (default), --second-40,
                                                #   --third-30, --fourth-19 (together = all 99); they stack
 ```
 
 `./tpc_all` runs TPC-DS queries one at a time, each in two blimp runs: a cold
-run (`--evict-family`: evict the query's MV family, author it with the
+run (`--evict-family --tick`: evict the query's MV family, author it with the
 author's row-hash verify, append, tick 1), then a steady-state run
-(`--verify`: append, tick 2, compare the answer with the original query over
-base). It prints one line per query — author seconds, the author's verify
+(`--tick --verify`: append, tick 2, compare the answer with the original query
+over base). It prints one line per query — author seconds, the author's verify
 seconds, tick 1, tick 2, MATCH / MISMATCH — and saves the logs and
 `summary.txt` under `./tpc_all_logs` (`TPC_ALL_OUT` to move them).
 `./tpc_all "3 7 19"` runs a subset.
@@ -459,7 +462,7 @@ in the Iceberg catalog — the node's DuckDB loads those tables to author the MV
 and answer the query. The tables are parsed from the query's `FROM`/`JOIN`
 clauses and checked against the catalog, and the **fact** is the referenced
 table with the most rows (the node's own rule), so `snapshot_changed` fires for
-exactly the tables the query touches. Only the phase-2 append (the rows added
+exactly the tables the query touches. Only the phase-2 append (`--tick`: the rows added
 before the tick) is TPC-DS-specific: the built-in seeder writes TPC-DS rows, so
 on other tables phase 2 reports `CDC TICK FAILED`, nothing is appended, and the
 tick measures an unchanged MV. Authoring, the author verify and the serve are
@@ -491,21 +494,22 @@ panel's **Query** tab.
 
 `--verify` is off by default: the node does not re-check served answers in
 production (the author verify already proved the MV), so an unflagged run
-measures the production path. Use it to prove a tick's answer is correct.
+measures the production path. Use it to prove a served (or, with `--tick`, a
+tick's) answer is correct.
 
 `UNCHECKED` means phase 4 could not produce a reference: the original query
 over base failed (typically it ran out of memory or spill on a very large
-query), so the tick's answer is unproven, not wrong. Re-run
+query), so the served answer is unproven, not wrong. Re-run
 `blimp --query --tpc N --verify` on a quiet node with more free disk.
 
-**First tick vs steady state.** Each `--query` run does one append and one tick.
+**First tick vs steady state.** Each `--query --tick` run does one append and one tick.
 After a cold author (`--evict`) the first tick is the coldest one: caches are
 empty and helper units may still be building. Run the same query again without
 `--evict` to measure the next tick, which is what every later update costs:
 
 ```
-blimp --query --tpc 3 --evict              # author + first tick
-blimp --query --tpc 3 --verify             # next tick (steady state) + post-verify
+blimp --query --tpc 3 --evict --tick       # author + first tick
+blimp --query --tpc 3 --tick --verify      # next tick (steady state) + post-verify
 ```
 
 **Appends stay realistic.** Each tick's fact rows reference dimension keys
@@ -513,7 +517,7 @@ from the table as originally loaded (its first Iceberg snapshot), plus only the
 few dimension rows that tick itself adds. New dimension rows per tick are a
 fixed share of the as-loaded size (`CDC_DIM_RATE`, default 0.0001), and facts
 reference new keys only until they reach `CDC_DIM_GROWTH` of it (default 0.01),
-e.g. `CDC_DIM_RATE=0.001 blimp --query --tpc 3`. Long benchmark runs
+e.g. `CDC_DIM_RATE=0.001 blimp --query --tpc 3 --tick`. Long benchmark runs
 therefore do not inflate dimension cardinalities. Data produced by kits before
 this change can be reset by setting each table's current snapshot back to its
 first one; earlier snapshots are retained, so this is reversible.

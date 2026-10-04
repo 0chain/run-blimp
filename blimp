@@ -69,7 +69,7 @@ usage(){
   blimp --gc         Reclaim orphaned blobber storage (fleet orphan sweep).
   blimp --immutable on|off           Toggle allocation immutability on-chain
                      (reversible). Optional ALLOC_ID=<id> to target one alloc.
-  blimp --query      Test: query optimizer + incremental CDC (delta-merge) suite.
+  blimp --query      Test: query optimizer (+ incremental CDC delta-merge with --tick).
                      --sql <file|dir>    send the query in YOUR .sql file(s); any table
                                          registered in the Iceberg catalog. The tick's
                                          append is the TPC-DS seeder, so only TPC-DS
@@ -82,11 +82,13 @@ usage(){
                                          30/19. Flags stack, and a batch name also
                                          works as a --tpc token. All 99, one query
                                          at a time with two ticks each: ./tpc_all
-                     --append-rows N     CDC tick base rows (default 5000)
+                     --tick              then append rows to the source and run the
+                                         query again: the node delta-merges them
+                     --append-rows N     CDC tick base rows (default 5000, with --tick)
                      Add --evict to start COLD (evict each MV, re-author from the
                      recipe library), or --evict-family to evict every MV banked
-                     under the query (chart, branches, answers). Add --verify to compare each tick's
-                     served result (md5) with the ORIGINAL query run over base
+                     under the query (chart, branches, answers). Add --verify to compare the served
+                     result (the tick's, with --tick; md5) with the ORIGINAL query run over base
                      on the same data: MATCH / MATCH(float) / MISMATCH per query.
   blimp --update     Update software ON THE NODE (via its :9401 helper, bearer = CLUSTER_TOKEN):
                        blimp --update status                 what is running (images, rclone, tools)
@@ -1396,7 +1398,7 @@ cmd_query(){
       QNRS="$1" SUITES="${SUITES:-}" CDC_ROWS="${CDC_ROWS:-5000}" \
       SQL_FILES="${SQL_FILES:-}" \
       ICEBERG_PREFIX="${ICEBERG_PREFIX:-}" ICEBERG_URL_LOCAL="${ICEBERG_URL_LOCAL:-}" \
-      VERIFY="${VERIFY:-0}" EVICT="${EVICT:-0}" EVICT_FAMILY="${EVICT_FAMILY:-0}" bash "$HERE/test_query.sh"
+      VERIFY="${VERIFY:-0}" TICK="${TICK:-0}" EVICT="${EVICT:-0}" EVICT_FAMILY="${EVICT_FAMILY:-0}" bash "$HERE/test_query.sh"
   }
   # ONE QUERY AT A TIME: each query gets its own serve → append → tick, so a
   # tick line belongs to that query's own merge. An explicit SUITES or --sql run
@@ -1406,7 +1408,7 @@ cmd_query(){
     run_query_suite "${QNRS:-}"; return $?
   fi
   for q in "${qs[@]}"; do
-    echo "######## q$q — serve, append, tick ########"
+    echo "######## q$q ########"
     run_query_suite "$q" || rc=$?
   done
   return $rc
@@ -1439,6 +1441,10 @@ for f in "$@"; do
     # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
     # before phase 1 so it re-authors from the recipe library.
     --evict)        EVICT=1; export EVICT ;;
+    # --tick: after the author/serve, append rows to the source (POST
+    # /admin/source/snapshot_changed) and run the query again — the node
+    # delta-merges the appended rows (merge_ms, mode, the warm serve).
+    --tick)         TICK=1; export TICK ;;
     # --evict-family: evict every MV banked under each query's signature
     # (chart, branches, answer MVs) before phase 1, not just the matched MV.
     --evict-family) EVICT_FAMILY=1; export EVICT_FAMILY ;;

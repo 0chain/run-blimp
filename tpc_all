@@ -1,10 +1,10 @@
 #!/bin/bash
 # tpc_all — run TPC-DS queries ONE AT A TIME through blimp, the way the SF1000
 # benchmark is run:
-#   1. blimp --query --tpc N --evict-family   cold: evict the query's MV family,
+#   1. blimp --query --tpc N --evict-family --tick  cold: evict the query's MV family,
 #                                             author (+ the author's row-hash
 #                                             verify), append, tick 1
-#   2. blimp --query --tpc N --verify         steady state: append, tick 2, then
+#   2. blimp --query --tpc N --tick --verify  steady state: append, tick 2, then
 #                                             compare the tick's answer with the
 #                                             original query over base
 # and prints one summary line per query.
@@ -25,8 +25,8 @@ b(){ "$HERE/blimp" --query --tpc "$1" $2 2>&1 | while IFS= read -r l; do printf 
 for q in $QS; do
   t0=$(date +%s)
   echo "== q$q $(date -u +%T)"
-  b "$q" --evict-family "$OUT/q${q}_1.log"
-  b "$q" --verify       "$OUT/q${q}_2.log"
+  b "$q" "--evict-family --tick" "$OUT/q${q}_1.log"
+  b "$q" "--tick --verify"       "$OUT/q${q}_2.log"
   # author = wall seconds from phase 1 to phase 2 of the cold run (covers the
   # author's build, its row-hash verify and the drain of its background work)
   aw=$(awk '/>> phase 1/{a=$1} />> phase 2/{if(a){print $1-a; exit}}' "$OUT/q${q}_1.log")
