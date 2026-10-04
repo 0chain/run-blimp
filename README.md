@@ -428,6 +428,9 @@ blimp --query --sql ./my_query.sql             # YOUR SQL file
 blimp --query --sql ./queries/                 # a directory of .sql files
 blimp --query --evict --verify                 # cold start + correctness check
 blimp --query --append-rows 50000              # bigger CDC tick (default 5000)
+blimp --query --all                            # all 99 TPC-DS queries
+blimp --query --second-40                      # named batches: --first-10 (default), --second-40,
+                                               #   --third-30, --fourth-19 (together = all 99); they stack
 ```
 
 `--sql` sends the query in your `.sql` file. It can read any table registered
@@ -457,7 +460,9 @@ the browser — so a MISMATCH can be inspected side by side.
 
 `merge_ms` only counts when `delta_verdict` is `merged` — `UNCHANGED` or
 `EMPTY` mean the append produced no delta for that MV and the number measured
-nothing. `mode=incremental` is the delta-merge fast path; `no-delta` is a full
+nothing. `rebaselined` means no delta part was written but the MV content
+changed (a full re-aggregation ran instead of a merge); `NO-BASELINE` means the
+MV did not exist before the tick, so the merge is unproven, not a result. `mode=incremental` is the delta-merge fast path; `no-delta` is a full
 re-author; "no MV — served from base" means the query authored nothing and
 scanned the source. There is **no PASS/FAIL verdict**: those outcomes are
 judgements, not thresholds. Every phase also appears as a run on the node
