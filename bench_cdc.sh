@@ -271,7 +271,7 @@ except Exception: print(-1)' 2>/dev/null)
       [ -z "$act" ] && act=-1
       now=$(date +%s); el=$((now-t0))
       if [ "$act" = "0" ]; then
-        quiet=$((quiet+1)); [ "$quiet" -ge 2 ] && return 0
+        quiet=$((quiet+1)); [ "$quiet" -ge 2 ] && { echo "   $what: drained in ${el}s (author work off the request)"; return 0; }
       else
         quiet=0
       fi
