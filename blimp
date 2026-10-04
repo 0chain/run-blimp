@@ -13,8 +13,9 @@
 #
 # Wiring is saved to ~/.blimp_env (override path with BLIMP_ENV). --setup writes
 # it; --storage/--query read it (and prompt for anything still missing).
-# Non-interactive: pre-set the env vars (REGION, CLUSTER_ID, GW, ICEBERG_URL,
-# WAREHOUSE, ORIGIN_BUCKET, NAMESPACE, GW_AK, GW_SK) and they won't be asked.
+# Non-interactive: pre-set the env vars (REGION, CLUSTER_ID, CLUSTER_TOKEN, GW,
+# ICEBERG_URL, WAREHOUSE, ORIGIN_BUCKET, NAMESPACE, GW_AK, GW_SK) and they won't
+# be asked.
 # ==============================================================================
 set -uo pipefail
 # Resolve $0 through any symlink so `blimp` works when installed as
@@ -31,15 +32,7 @@ die(){ printf '\033[31m[blimp] FATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 ask(){ local var="$1" prompt="$2" def="${3:-}" cur="${!1:-}" v
   [ -n "$cur" ] && { printf '%s' "$cur"; return; }
   # No terminal (CI, `ssh host cmd`, nohup) → take the default instead of dying.
-  # `read </dev/tty` on such a host printed "/dev/tty: No such device or address"
-  # for EVERY prompt and the run ended with no wiring written.
-  #
-  # Test the OPEN, not `-r`: under nohup the /dev/tty device node still exists
-  # and is readable, so `[ -r /dev/tty ]` passes and the redirect below then
-  # fails with ENXIO ("No such device or address") because the process has no
-  # controlling terminal. That is exactly what happened to `blimp --storage`
-  # under nohup (2026-08-01): both gateway S3 key prompts errored, the run
-  # continued with BLANK credentials, and warp/mlperf then measured nothing.
+  # Test the OPEN, not `-r`: under nohup /dev/tty exists but opening it fails.
   if ! { : < /dev/tty; } 2>/dev/null; then
     printf '%s%s: <no tty, using default>\n' "$prompt" "${def:+ [$def]}" >&2
     printf '%s' "$def"; return
@@ -105,7 +98,9 @@ usage(){
 
   Wiring is read from / written to ~/.blimp_env  (set BLIMP_ENV to relocate).
 H
-  [ -f "$ENVF" ] && { echo; bold "current wiring ($ENVF):"; sed 's/^/  /' "$ENVF"; }
+  # Secrets are masked: help output ends up in terminals, logs and screenshots.
+  [ -f "$ENVF" ] && { echo; bold "current wiring ($ENVF):"
+    sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN)[A-Za-z0-9_]*|[A-Za-z0-9_]*_SK|S3_KEY)=.+/\1=***/; s/^/  /' "$ENVF"; }
   return 0
 }
 
@@ -116,11 +111,9 @@ save_env(){
 REGION=$REGION
 CLUSTER_REGION=${CLUSTER_REGION:-$REGION}
 CLUSTER_ID=$CLUSTER_ID
-# Bearer the cluster's gateway validates: the account's FLEET token. Filled from
-# the node's copy (/opt/0chain/zs3server/environment/admin_token) when the CLI
-# runs on the gateway box, else paste it from the panel (Settings -> API token).
-# Never derived from the cluster id: "blimp-<id>"/"zus-<id>" are guessable and
-# no gateway accepts them any more (2026-09-14).
+# Bearer the cluster's gateway validates: the account's FLEET token. Read from
+# the node when the CLI runs on the gateway box, else paste it from the panel
+# (Settings -> API token). Never derived from the cluster id.
 CLUSTER_TOKEN=${CLUSTER_TOKEN:-}
 GW=$GW
 GATEWAY=$GW
@@ -137,15 +130,10 @@ ICEBERG_PREFIX=${ICEBERG_PREFIX:-}
 WAREHOUSE=$WAREHOUSE
 ORIGIN_BUCKET=$ORIGIN_BUCKET
 NAMESPACE=$NAMESPACE
-# SOURCE: which gateway source the suites drive. --setup wires an external
-# catalog as "customer"; without persisting it the suite fell back to a
-# namespace heuristic and drove the built-in sf1000 source instead (test2
-# node, 2026-09-03). Blank = let bench_cdc derive it.
+# SOURCE: which gateway source the suites drive; --setup wires the external
+# catalog as "customer".
 SOURCE=${SOURCE:-customer}
-# WHERE the origin bucket actually lives. Without these three, --storage's cache
-# legs sent every origin GET/PUT to real AWS S3 in \$REGION — which is wrong for
-# any non-AWS origin, and flatly broken for the MinIO source standup_data puts on
-# this box (bucket blimp-sf1 does not exist on AWS). Blank = AWS S3 + IAM role.
+# WHERE the origin bucket lives (endpoint + keys). Blank = AWS S3 + IAM role.
 S3_ENDPOINT=${S3_ENDPOINT:-}
 S3_KEY=${S3_KEY:-}
 S3_SECRET=${S3_SECRET:-}
@@ -172,15 +160,12 @@ persist_wiring(){
   mv "$tmp" "$ENVF"
 }
 
-# heal_wiring — self-heal stale wiring after a cluster REDEPLOY. A redeploy rotates
-# the gateway's ZS3_ADMIN_TOKEN and its S3 keys but leaves the old $ENVF pointing at
-# the destroyed cluster, so --gc/--immutable/--encryption 401 and direct S3 gives
-# InvalidAccessKeyId. Probe the gateway's own credential endpoint with our token;
-# if it is rejected (401/403), recover the LIVE token from the local minioserver
-# container (the installer runs on the gateway box) and re-probe. On success,
-# refresh GW_AK/GW_SK/CLUSTER_TOKEN and persist them so the NEXT run is already
-# correct. No-op when the gateway is unreachable or nothing drifted (e.g. blimp
-# running on a separate box with no local gateway container to read the token from).
+# node_token — the account fleet token from the node's own token file, when this
+# CLI runs on the Blimp node (empty elsewhere). The file, not the gateway
+# container's env, is authoritative: rotating the token rewrites the file but
+# cannot change a running container's env.
+node_token(){ cat /opt/0chain/zs3server/environment/admin_token 2>/dev/null | tr -d '\r\n'; }
+
 # gateway_env VAR — one env var of the co-located minioserver container (empty
 # when not co-located or docker is absent). The gateway's own view of its
 # catalog/S3 addresses lives there; use it whenever the gateway, not this CLI,
@@ -191,27 +176,21 @@ gateway_env(){
     | sed -n "s/^$1=//p" | head -1
 }
 
+# heal_wiring — self-heal stale wiring after a cluster REDEPLOY, which rotates the
+# token and the gateway's S3 keys. On the node: re-read them locally. Elsewhere:
+# refresh the S3 keys via GET /admin/credentials. Persists what changed.
 heal_wiring(){
   [ -n "${GW:-}" ] || return 0
-  # PREFERRED — read this node's ACTUAL gateway auth straight from the local
-  # minioserver container: the admin token (ZS3_ADMIN_TOKEN) and the S3 keys
+  # PREFERRED — read this node's ACTUAL gateway auth locally: the token file and
+  # the S3 keys
   # (MINIO_ROOT_USER/PASSWORD, which is what the gateway authenticates S3 with).
-  # NOT GET /admin/credentials for the keys: in a MULTI-NODE fleet that can return
-  # the primary/fleet keys, which do NOT match node 2's own MinIO root -> the
-  # InvalidAccessKeyId the regression suite hit on node 2. Co-located installs (the
-  # kit runs ON the gateway box) get correct wiring on every command.
+  # NOT GET /admin/credentials for the keys: in a multi-node fleet that can return
+  # the fleet keys, which do not match this node's own MinIO root.
   if command -v docker >/dev/null 2>&1 && docker inspect minioserver >/dev/null 2>&1; then
     local ea tok ak sk
     ea=$(docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)
-    # The FILE is authoritative, the container env is only a PROVISION-TIME
-    # SNAPSHOT. Rotating the fleet token rewrites /opt/.../admin_token (zus-cdc
-    # re-reads it within 30s and the gateway honours it via its fleet bootstrap)
-    # but CANNOT rewrite a running container's env. Healing from the env
-    # therefore "healed" to a stale value and every later admin call 401'd —
-    # measured on node 37 (2026-09-14): env 83cfaafe… vs live file 36f62da5…,
-    # which failed `blimp --query` at /admin/source/snapshot_changed. Read the
-    # file first and fall back to the env for pre-fleet nodes that have none.
-    tok=$(cat /opt/0chain/zs3server/environment/admin_token 2>/dev/null | tr -d '\r\n')
+    # The token FILE first (see node_token); fall back to the wiring's token.
+    tok=$(node_token)
     ak=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_USER=//p' | head -1)
     sk=$(printf '%s' "$ea" | sed -n 's/^MINIO_ROOT_PASSWORD=//p' | head -1)
     [ -n "$tok" ] || tok="${CLUSTER_TOKEN:-}"
@@ -226,7 +205,9 @@ heal_wiring(){
   fi
   # FALLBACK — blimp on a SEPARATE box (no local container): best-effort refresh via
   # the gateway admin API. Detect a stale token (401) and refetch the S3 keys.
-  local port="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" code
+  # No token: leave it to need_env, which fails with the full explanation.
+  [ -n "${CLUSTER_TOKEN:-}" ] || return 0
+  local port="${S3_PORT:-9000}" tok="$CLUSTER_TOKEN" code
   local body="${TMPDIR:-/tmp}/.blimp_cred.$$"
   code=$(curl -s -o "$body" -w '%{http_code}' -m 8 \
     "http://$GW:$port/admin/credentials" -H "Authorization: Bearer $tok" 2>/dev/null)
@@ -252,12 +233,9 @@ heal_wiring(){
 # same-VPC / same-account AWS run, or to a stable DNS name you control.
 this_host(){
   [ -n "${ADVERTISE_HOST:-}" ] && { printf '%s' "$ADVERTISE_HOST"; return; }
-  # VPC MODE: advertise the PRIVATE address, and specifically the one that
-  # ROUTES TO THE GATEWAY. The public IP is unreachable from inside the VPC —
-  # the gateway hung for 411s on every metadata GET to a catalog advertised at
-  # the client's public IP, then died on a read timeout with no error surfaced
-  # (cluster 1785550395356, 2026-08-01). `ip route get` picks the right source
-  # address on a multi-NIC host, where "first hostname -I" is a coin flip.
+  # VPC MODE: advertise the PRIVATE address that routes to the gateway (the
+  # public IP is unreachable from inside the VPC). `ip route get` picks the
+  # right source address on a multi-NIC host.
   if [ "${MODE:-}" = vpc ]; then
     local src=""
     [ -n "${GW_PRIV:-}" ] && src=$(ip route get "$GW_PRIV" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
@@ -274,21 +252,10 @@ this_host(){
 
 # ---- the address THIS node uses to reach services THIS node runs -------------
 #
-# NOT the same question as this_host(). this_host() answers "what address does
-# the CLUSTER use to reach me?" and is correctly the PUBLIC address in external
-# mode. Reusing that for our OWN calls makes the box dial itself through the
-# public path, which a normal restrictive security group blocks:
-#
-#   ConnectTimeout host='18.141.209.155' port=8181  /v1/config?warehouse=...
-#
-# That is what killed the CDC tick on cluster 1786037195000 (2026-08-06) — 0 rows
-# appended, so nothing went stale, so nothing delta-merged, and the whole query
-# suite reported "full re-author / NO-BASELINE". The optimizer was fine; the test
-# never fed it. It reads as an optimizer regression, which is why this deserves
-# its own function rather than a comment on this_host().
-#
-# Anything we started locally is reachable on loopback, always, regardless of
-# security groups, NAT, or which cloud we are on.
+# NOT the same question as this_host(), which answers "what address does the
+# CLUSTER use to reach me?" (the PUBLIC address in external mode). Dialling our
+# own public address is blocked by a restrictive security group, so anything we
+# started locally is reached on loopback.
 local_host(){
   # Only meaningful for services this script stood up. If the catalog/S3 are
   # SOMEONE ELSE'S (the user supplied ICEBERG_URL / S3_ENDPOINT), loopback is
@@ -304,10 +271,6 @@ local_url(){ # <url> <started_here:0|1>
   printf '%s' "$u" | sed -E "s|://[^/:]+|://$(local_host)|"
 }
 
-# ---- stand up an Iceberg REST catalog here (docker compose) ------------------
-# A single `docker run` — no compose plugin needed on the client box (the only
-# thing that ever required it). The catalog is one container; compose bought us
-# nothing here. `docker` (or `sudo docker`) is the only dependency.
 # ---- pick one of N numbered options -----------------------------------------
 # Same no-tty contract as ask(): with no controlling terminal take the default
 # rather than dying, so CI / `ssh host blimp --setup` still completes.
@@ -334,9 +297,9 @@ pick(){ # <var> <prompt> <default-number> <label1> <label2> ...
 # customer never copies a key. Sets FLEET_URL / FLEET_AK / FLEET_SK; returns 1
 # when the gateway is older than the endpoint or fleet mode is off.
 fleet_creds(){
-  [ -n "${GW:-}" ] || return 1
+  [ -n "${GW:-}" ] && [ -n "${CLUSTER_TOKEN:-}" ] || return 1
   local resp; resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" 2>/dev/null) || return 1
+    -H "Authorization: Bearer $CLUSTER_TOKEN" 2>/dev/null) || return 1
   eval "$(printf '%s' "$resp" | "${BLIMP_PY:-python3}" -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(0)
@@ -351,8 +314,6 @@ for k,v in (("FLEET_URL","fleet_url"),("FLEET_AK","fleet_s3_access_key"),("FLEET
 # NAT, so the packet leaves and never comes back. The fleet endpoint
 # fleet-<account>.blimp.software resolves to exactly that public IP, so on a
 # single-node fleet every upload and every metadata write to it times out.
-# Reported from a fresh GCP node (2026-09-15): "Connect timeout ... worked
-# around by pinning the hostname to 127.0.0.1 in /etc/hosts".
 #
 # Same shape for the gateway's own docker hostname (minioserver:9000), which
 # resolves inside the container network and nowhere else — table registration
@@ -414,8 +375,7 @@ choose_catalog(){
          # Nessie warehouses are SERVER-CONFIGURED AND NAMED. A client cannot ask
          # for an arbitrary path: GET /v1/config?warehouse=s3://blimp-src/wh
          # returns 500 "Warehouse 's3://blimp-src/wh' is not known". The gateway
-         # itself uses the name `mv` (ZS3_ICEBERG_WAREHOUSE), which resolves to
-         # s3://tpcds-mv. So the warehouse here is a NAME, and table metadata
+         # itself uses the name `mv`. So the warehouse here is a NAME, and table metadata
          # lands in whatever bucket that name resolves to — not in the data
          # bucket. Probe the name to confirm it before committing to it.
          ICEBERG_WAREHOUSE=$(ask ICEBERG_WAREHOUSE "  Nessie warehouse name" "mv")
@@ -450,12 +410,8 @@ except Exception: print("")' 2>/dev/null)
 # endpoint — your own bucket, or a MinIO/other-cloud address.
 choose_source_location(){
   local have_fleet=0; fleet_creds && have_fleet=1
-  # Option 2 is THIS node's own gateway S3. It was missing, and its absence was
-  # a dead end on a locked-down box (reported 2026-09-15): if the fleet endpoint
-  # could not be reached, the only other route stood up a fresh MinIO container
-  # on :9000 — which needs a Docker Hub pull that an egress-restricted node
-  # refuses, and collides with the gateway's own minioserver already on :9000.
-  # The gateway is right there, already serving S3, already keyed.
+  # Option 2 is THIS node's own gateway S3: already serving, already keyed, and
+  # no MinIO container to pull or to collide with on :9000.
   # GW_AK/GW_SK are this node's own MinIO root keys, discovered by heal_wiring()
   # from the local minioserver container (or the admin API when blimp runs off-box).
   local have_gw=0
@@ -523,6 +479,13 @@ choose_dataset(){
   # sizes below are what the SCRATCH disk needs, not just the bucket. Anything
   # past SF1000 wants a dedicated data disk — scratch_pick() refuses up front
   # rather than filling root mid-run.
+  # A pre-set BLIMP_SF skips the prompt and is used as given.
+  if [ -n "${BLIMP_SF:-}" ]; then
+    case "$BLIMP_SF" in *[!0-9]*) die "BLIMP_SF must be a whole number (got '$BLIMP_SF')";; esac
+    BUILD_DATASET=1; export BUILD_DATASET BLIMP_SF
+    bold "  will generate TPC-DS SF${BLIMP_SF} (BLIMP_SF) and register it into the catalog"
+    return 0
+  fi
   local sf; sf=$(pick SF_CHOICE "Scale factor" 1 \
     "SF1      ~1 GB    (default — minutes)" \
     "SF10     ~10 GB   (tens of minutes)" \
@@ -553,8 +516,8 @@ standup_iceberg(){
   # kind it was talking to. Standing up Nessie makes the local catalog identical
   # in shape to the internal one — same prefix, same warehouse-name semantics,
   # same REST dialect — so there is exactly one catalog type in the product.
-  # Recipe mirrors zs3-init.go installZusCatalog (ROCKSDB store, warehouse by
-  # name, S3 options + secret indirection, management iface off).
+  # Same shape as the node's own catalog: ROCKSDB store, warehouse by name, S3
+  # options + secret indirection, management interface off.
   local wname="${ICEBERG_WAREHOUSE:-src}"
   local wupper; wupper=$(printf '%s' "$wname" | tr '[:lower:]-' '[:upper:]_')
   local wbucket="${ORIGIN_BUCKET:?a data bucket is required before standing up the catalog}"
@@ -626,9 +589,8 @@ standup_iceberg(){
 # ---- create an S3 warehouse bucket here (awscli) ----------------------------
 # GUARDRAIL 1 (co-location): the Iceberg warehouse (table metadata) MUST live in
 # the SAME bucket as the source data. The gateway reads catalog metadata through
-# its single source bucket (localhost:9000 fronts ZS3_SOURCE_BUCKET only); a
-# warehouse in a *different* bucket makes every metadata read 500 → grain
-# unsampleable → the MV author refuses. So when a data bucket is known we put the
+# its single source bucket; a warehouse in a *different* bucket makes every
+# metadata read fail and the MV author refuses. So when a data bucket is known we put the
 # warehouse at s3://<data-bucket>/wh; only with no data bucket do we mint one.
 standup_bucket(){
   command -v aws >/dev/null || die "awscli not installed — the S3 client this kit uses for any S3-compatible endpoint. Install it, or pass an existing s3:// warehouse."
@@ -678,14 +640,8 @@ grant_bucket_access(){
   local princ="\"arn:aws:iam::${acct}:root\""
   [ -n "$role_arn" ] && princ="$princ, \"$role_arn\""
   bold "  granting s3 access on s3://$bkt to account $acct${role_arn:+ + gateway role}"
-  # MERGE, don't clobber. This used to build a single-statement document and
-  # put-bucket-policy it, which REPLACES the whole policy — so a second --setup
-  # silently deleted every other statement on the bucket. Measured on
-  # 2026-08-01: an operator-added grant for the gateway role (the only thing
-  # making reads work) was wiped by a re-run, and the gateway went back to 403
-  # with "no identity-based policy allows the s3:ListBucket action".
-  #
-  # Keep every statement that is not ours, replace only Sid BlimpSourceAccess.
+  # MERGE, don't clobber: put-bucket-policy REPLACES the whole policy. Keep every
+  # statement that is not ours, replace only Sid BlimpSourceAccess.
   local existing; existing=$(aws s3api get-bucket-policy --bucket "$bkt" --query Policy --output text 2>/dev/null)
   local pol; pol=$(EXISTING="$existing" PRINC="$princ" BKT="$bkt" python3 - <<'PYEOF'
 import json, os
@@ -715,9 +671,7 @@ PYEOF
       bold "  ✓ bucket policy applied to s3://$bkt (account + gateway role $role_arn)"
     else
       # A policy naming ONLY <acct>:root grants the gateway NOTHING: for
-      # same-account access :root merely DELEGATES to IAM, so a role without its
-      # own s3 allow still gets 403. Saying "✓ applied" here is how a broken
-      # grant looked successful while every read failed 403 (2026-08-01).
+      # same-account access :root merely DELEGATES to IAM.
       bold "  ! bucket policy applied to s3://$bkt, but the GATEWAY ROLE could not be discovered"
       bold "    (this client's IAM has no ec2:DescribeInstances / iam:GetInstanceProfile, or the"
       bold "     gateway is in another account). A policy naming only <account>:root does NOT grant"
@@ -758,10 +712,8 @@ PY
   printf '%s' "$cur"
 }
 
-# IMDS is AWS-specific. On GCP and Azure the SAME address answers, with an HTML
-# error page — which used to be stored as the node's "IP" and printed mid-run
-# (reported from a GCP node, 2026-09-15). Accept a value only if it looks like
-# what was asked for; off AWS that yields empty, which is a no-op, not an error.
+# IMDS is AWS-specific; other clouds answer the same address with an HTML error
+# page. Accept a value only if it looks like an IPv4 address.
 imds_ipv4(){
   local v; v=$(curl -s -m 2 "$@" 2>/dev/null) || return 0
   case "$v" in ""|*[!0-9.]*) return 0;; esac
@@ -782,13 +734,8 @@ assess_mode(){
       --query 'Reservations[0].Instances[0].[PrivateIpAddress,PublicIpAddress]' --output text 2>/dev/null)"
     [ "$GW_PRIV" = None ] && GW_PRIV=""; [ "$GW_PUB" = None ] && GW_PUB=""
   fi
-  # FALLBACK when the EC2 lookup is unavailable. Discovery above needs
-  # ec2:DescribeInstances, which a client's own instance role often lacks — and
-  # when it silently returned nothing, GW_PRIV stayed empty, the probe below
-  # never ran, MODE fell to external, and the node advertised its PUBLIC address
-  # to a gateway that can only reach it privately. Every catalog read then hung
-  # until timeout (cluster 1785550395356, 2026-08-01). So: if the operator
-  # already told us the gateway address and it is a private one, probe THAT.
+  # FALLBACK when the EC2 lookup is unavailable (it needs ec2:DescribeInstances):
+  # if the operator already gave a private gateway address, probe THAT.
   if [ -z "$GW_PRIV" ] && [ -n "${GW:-}" ]; then
     case "$GW" in
       10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) GW_PRIV="$GW" ;;
@@ -814,12 +761,9 @@ assess_mode(){
   if [ "$MODE" = vpc ]; then
     GW_DEFAULT="$GW_PRIV"; ADVERTISE_DEFAULT="$CLIENT_PRIV"; CREDS_HINT="blank (IAM instance role — same VPC/account)"
   else
-    # External NETWORK path (public DNS + advertise this node publicly)…
-    # Public endpoint of node 0. The pattern is blimp-<id>-0.blimp.software; the
-    # older zus-<id>-0.zus.network is kept only as a fallback for a legacy
-    # cluster, and ONLY when it actually resolves — it was the hardcoded default
-    # here, and it no longer resolves at all (SERVFAIL), so a client that could
-    # not discover the gateway was handed an address that does not exist.
+    # External NETWORK path (public DNS + advertise this node publicly).
+    # Public endpoint of node 0: blimp-<id>-0.blimp.software (the legacy
+    # pattern is used only when it resolves).
     GW_DEFAULT="${GW_PUB:-$(pub_gw_default "$CLUSTER_ID")}"
     ADVERTISE_DEFAULT="${CLIENT_PUB:-$(curl -s -m3 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')}"
     if [ "$SAME_ACCT" = 1 ]; then
@@ -860,10 +804,7 @@ ensure_deps(){
     # aws CLI: prefer snap (newer) when apt's awscli is absent
     command -v aws >/dev/null || { command -v snap >/dev/null && sudo snap install aws-cli --classic >/dev/null 2>&1 || true; }
   elif command -v dnf >/dev/null || command -v yum >/dev/null; then
-    # RPM hosts — Amazon Linux 2023, RHEL, Fedora, Rocky. Without this branch the
-    # kit printed a hint and then died at the catalog step ("docker not
-    # available"), which contradicts the README's "you need nothing
-    # pre-installed" on the single most likely AWS AMI (AL2023, 2026-08-01).
+    # RPM hosts — Amazon Linux 2023, RHEL, Fedora, Rocky.
     local PKG; PKG=$(command -v dnf >/dev/null && echo dnf || echo yum)
     local want=()
     command -v docker >/dev/null || want+=(docker)
@@ -899,8 +840,7 @@ ensure_deps(){
     fi
   fi
   # DuckDB for the tick's query-aware key pools (query_pools.py). Without it
-  # every tick draws keys uniformly and date-baked MVs merge 0 rows (node 37's
-  # system python has none, 2026-09-28). Installed into the venv when missing.
+  # every tick draws keys uniformly. Installed into the venv when missing.
   if [ -x "$BLIMP_PY" ] && ! "$BLIMP_PY" -c 'import duckdb' 2>/dev/null; then
     "$(dirname "$BLIMP_PY")/pip" install -q --force-reinstall --no-deps duckdb 2>&1 | tail -1 || true
   fi
@@ -934,16 +874,17 @@ cmd_setup(){
   [ -n "${ADVERTISE_HOST:-}" ] || ADVERTISE_HOST="$ADVERTISE_DEFAULT"
   export ADVERTISE_HOST
   NAMESPACE=$(ask NAMESPACE "Iceberg namespace" "tpcds")
+  # The gateway accepts only the account fleet token. On the Blimp node it is
+  # read from the node itself; elsewhere it must be supplied (env or prompt).
+  [ -n "${CLUSTER_TOKEN:-}" ] || CLUSTER_TOKEN=$(node_token)
+  [ -n "${CLUSTER_TOKEN:-}" ] || CLUSTER_TOKEN=$(ask CLUSTER_TOKEN "Fleet token (panel: Settings -> API token)")
+  [ -n "${CLUSTER_TOKEN:-}" ] || die "CLUSTER_TOKEN is required: run --setup on the Blimp node, or set CLUSTER_TOKEN=<fleet token from the panel (Settings -> API token)>"
+  export CLUSTER_TOKEN
 
   # --- A. Iceberg catalog · B. source location · C. test dataset -------------
-  # These three used to be EXTERNAL-only: "give me your REST URL or I stand one
-  # up here", "give me your bucket", and an implicit SF1 generated only when the
-  # bucket was left blank. The defaults are now the INTERNAL ones — the catalog
-  # the gateway already runs, and the fleet cache layer as the source — with the
-  # bring-your-own paths kept as explicit choices.
+  # Defaults are the internal ones (the gateway's catalog, the fleet cache layer);
+  # bring-your-own paths are explicit choices.
   choose_catalog
-  # No header here: choose_source_location's own pick() already prints
-  # "Dataset (source) location", so this printed it twice.
   choose_source_location
   echo
   choose_dataset
@@ -959,10 +900,8 @@ cmd_setup(){
       bash "$HERE/standup_data.sh") || die "SF${BLIMP_SF} data standup failed"
     eval "$gen"                      # sets ORIGIN_BUCKET WAREHOUSE S3_ENDPOINT [S3_KEY S3_SECRET] REGION
     # standup_data emits WAREHOUSE=s3://<bucket>/wh, which is right for a path
-    # catalog and WRONG for Nessie — it takes a warehouse NAME and 500s on a
-    # path. The eval above happens AFTER the catalog was chosen, so it would
-    # silently clobber the name: the first E2E registered 24/24 with "mv" but
-    # then wired the gateway with "s3://blimp-e2e/wh". Restore the name here.
+    # catalog and WRONG for Nessie (it takes a warehouse NAME and 500s on a
+    # path). Restore the name the catalog step chose.
     [ -n "${ICEBERG_WAREHOUSE:-}" ] && WAREHOUSE="$ICEBERG_WAREHOUSE"
     DATA_GENERATED=1
     bold "  SF${BLIMP_SF} source → bucket $ORIGIN_BUCKET · endpoint $S3_ENDPOINT · region $REGION"
@@ -1067,56 +1006,32 @@ cmd_setup(){
     cred_lines="    S3 credentials   : none — gateway reads via its IAM instance role"
   fi
   # Wire the cluster DIRECTLY over the authenticated admin API (no SSH):
-  # POST /admin/source/configure sets the gateway's live source env — takes
-  # effect on the next query, no restart. Bearer = zus-<CLUSTER_ID>. Falls
-  # back to the manual UI/SSH instructions below when the endpoint is absent
-  # (pre-2026-07-27 gateway image) or unreachable.
+  # POST /admin/source/configure sets the gateway's live source — effective on
+  # the next query, no restart. Bearer = the fleet token. Falls back to the
+  # manual UI instructions below when the endpoint is absent or unreachable.
   if [ -n "${GW:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
     bold "== wiring the cluster over the admin API (no SSH) =="
-    # s3_endpoint MUST be sent. The gateway's API documents its default as
-    # https://s3.<region>.amazonaws.com, and this body used to OMIT the field —
-    # so a non-AWS origin (the MinIO standup_data puts on this box) was wired as
-    # real AWS and every DuckDB read of the source 403'd:
-    #   [duckdb-prelude][source-env] src_endpoint="https://s3.us-east-1.amazonaws.com"
-    #   HTTP GET error on 'https://blimp-sf1.s3.us-east-1.amazonaws.com/...' (403)
-    #
-    # ZS3_SOURCE_VIA_ROUTER=0 — SENT EXPLICITLY, NEVER OMITTED. With it on, the
-    # gateway gives the source bucket a DuckDB secret scoped to the Router, and
-    # the Router read-through-CACHES every source object it pulls into the
-    # eblobbers. Source data must NOT enter the cache: the cache is for the
-    # workload, and filling it with source scans both pollutes it and pushes the
-    # allocation toward the evictor's watermark. Off by default; VIA_ROUTER=1 in
-    # the environment is the deliberate opt-in.
-    # FLEET SOURCE: the gateway reads it from ITS OWN S3, not the public fleet
-    # address. The fleet URL is the EXTERNAL write path — that is how this CLI
-    # uploaded the data — but handing it to the gateway makes the gateway take a
-    # public round trip (and, on a multi-node fleet, round-robin to a peer) to
-    # read a bucket it serves locally. The gateway's own S3 is what its DuckDB
-    # prelude already uses (ZS3_DUCKDB_S3_ENDPOINT=http://localhost:9000), so
-    # send that plus the gateway's own root keys, which heal_wiring keeps fresh.
+    # s3_endpoint MUST be sent (the gateway otherwise assumes AWS S3).
+    # via_router is sent explicitly and is off unless VIA_ROUTER=1: source scans
+    # should not fill the read-through cache.
+    # FLEET SOURCE: the gateway reads it from ITS OWN S3 (localhost:9000 with its
+    # own root keys), not the public fleet address this CLI uploaded through.
     HOOK_EP="${S3_ENDPOINT:-}"; HOOK_KEY="${S3_KEY:-}"; HOOK_SEC="${S3_SECRET:-}"
     # `gateway` lands here too: the data is on this node's own S3, so the gateway
     # must read it on its own loopback rather than back out through its public
     # address — the same reasoning as for the fleet upload path.
     case "${SOURCE_TARGET:-}" in fleet|gateway)
-      # The gateway's own root keys are fetched LATER in this run ("finishing
-      # setup"), which is after this call — so populate them now. heal_wiring
-      # reads them from the local minioserver container when co-located (the
-      # node-correct values) and falls back to that gateway's own
-      # /admin/credentials otherwise. Idempotent, so the later block is a no-op.
+      # The gateway's own root keys are needed now (idempotent; see heal_wiring).
       [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || heal_wiring
       HOOK_EP="http://localhost:9000"
       HOOK_KEY="${GW_AK:-$HOOK_KEY}"; HOOK_SEC="${GW_SK:-$HOOK_SEC}"
       bold "  source endpoint for the gateway: $HOOK_EP (its own zs3 — the published URL is the upload path only)"
     ;; esac
-    # CATALOG URL FOR THE GATEWAY. With the gateway's own Nessie (catalog option
-    # 1) this CLI reaches it at http://<GW>:19122/iceberg — the HOST port — but
-    # the gateway runs in a container, where a 127.0.0.1 address is loopback to
-    # ITSELF: the ATTACH fails, every MV author declines, and the suite prints
-    # "?" for every timing (node 37, 2026-09-14). The gateway already knows its
-    # own catalog address (ZS3_ICEBERG_REST_URL, http://zus-nessie:19120/iceberg
-    # on a node). Read it from the container when co-located and send THAT; the
-    # CLI's address stays for the registrar/seeder, which run here.
+    # CATALOG URL FOR THE GATEWAY. With the gateway's own Nessie (option 1) this
+    # CLI reaches it on the HOST port, but the gateway runs in a container where
+    # that address is loopback to itself. Send the gateway its own catalog
+    # address (read from the co-located container); the CLI's address stays for
+    # the registrar/seeder, which run here.
     HOOK_IRC="$ICEBERG_URL"
     if [ "${CATALOG_CHOICE:-}" = 1 ]; then
       local gwirc; gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
@@ -1130,13 +1045,12 @@ cmd_setup(){
       HB_EP="$HOOK_EP" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
       python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
     HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
-      -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $CLUSTER_TOKEN" -H "Content-Type: application/json" \
       -d "$HOOK_BODY" || true)
     case "$HOOK_RESP" in
       *'"status": "ok"'*|*'"status":"ok"'*)
         SOURCE=customer; export SOURCE; save_env
-        bold "  ✓ cluster wired: source=customer ns=$NAMESPACE bucket=$ORIGIN_BUCKET (live, no restart)"
-        echo "    (read-through cache retarget is optional — see hookup_cluster_source.sh)";;
+        bold "  ✓ cluster wired: source=customer ns=$NAMESPACE bucket=$ORIGIN_BUCKET (live, no restart)";;
       *)
         echo "  ! API wiring unavailable ($(printf %s "$HOOK_RESP" | head -c 120)) — use the UI/manual steps below";;
     esac
@@ -1152,32 +1066,21 @@ $cred_lines
 
   Then push data changes and refresh MVs incrementally with:
     curl -X POST http://$GW:9000/admin/source/snapshot_changed \\
-      -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" -H "Content-Type: application/json" \\
+      -H "Authorization: Bearer \$CLUSTER_TOKEN" -H "Content-Type: application/json" \\
       -d '{"namespace":"$NAMESPACE","table":"<table>","trigger":"customer"}'
+    (CLUSTER_TOKEN is saved in $ENVF)
 
   Make sure the cluster gateway can reach this node on :8181 (security group / firewall).
 ==========================================================================
 OUT
-  # ---- finish the job HERE, once ------------------------------------------
-  # Everything below used to be discovered LATER, one item per 25-minute suite
-  # run: the gateway S3 keys (warp/mlperf silently measured nothing without
-  # them), the benchmark tools (mount-s3 was apt-only so mlperf never ran on an
-  # rpm host), the router's cache (never enabled, so every cache leg read zero
-  # objects). Four full runs to learn four things. Do them all now, at setup,
-  # so a customer types ONE command once and every suite works first time.
+  # ---- finish the job HERE, once: gateway S3 keys + benchmark tools ---------
   bold "== finishing setup: credentials + tools =="
 
-  # 1. Gateway S3 credentials. NOT the source-bucket keys — vpc mode leaves those
-  #    blank on purpose (IAM instance role), but the gateway's own S3 endpoint
-  #    authenticates by key and warp/mlperf/cache-mp-s3 are useless without it.
-  # Auto-fetched from the gateway itself (GET /admin/credentials, same Bearer
-  # zus-<CLUSTER_ID> every other admin call uses) — no UI copy-paste, no
-  # interactive prompt. Idempotent: safe to call every --setup run; an
-  # already-set GW_AK/GW_SK wins and skips the call, and a gateway image older
-  # than this endpoint (404/unreachable) just leaves them unset, same as
-  # before, with warp/mlperf/cache-mp-s3 skipped.
+  # 1. Gateway S3 credentials. NOT the source-bucket keys — the gateway's own S3
+  #    endpoint authenticates by key and warp/mlperf need it. Auto-fetched from
+  #    GET /admin/credentials (fleet-token bearer); an already-set GW_AK/GW_SK wins.
   if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
-    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" 2>/dev/null)
+    resp=$(curl -s -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer $CLUSTER_TOKEN" 2>/dev/null)
     fetched_ak=$(printf '%s' "$resp" | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin)
@@ -1199,12 +1102,11 @@ except Exception: print("")' 2>/dev/null)
     rm -f "$ENVF.bak"
     echo "  ✓ gateway S3 credentials saved to $ENVF"
   else
-    echo "  ! no gateway S3 credentials — warp, mlperf and cache-mp-s3 will be skipped."
+    echo "  ! no gateway S3 credentials — warp and mlperf will be skipped."
     echo "    Add GW_AK= / GW_SK= to $ENVF later and re-run; nothing else needs redoing."
   fi
 
-  # 2. Benchmark tools, up front. They take minutes to install and used to be
-  #    installed at the START of --storage, so a failure cost a whole run.
+  # 2. Benchmark tools, up front (they take minutes to install).
   if [ "${BLIMP_SKIP_DEPS:-0}" != "1" ]; then
     ensure_storage_tools
     ensure_acid_tools || true   # porcupine ACID checker (Go build); non-fatal
@@ -1214,12 +1116,7 @@ except Exception: print("")' 2>/dev/null)
 }
 
 # preflight — verify EVERY prerequisite in seconds, before any long benchmark,
-# and report them ALL at once.
-#
-# This exists because the suites checked prerequisites lazily: each ~25-minute
-# run died on the next missing thing, so four runs were burned discovering four
-# problems that a ten-second check would have listed together. Fail fast, fail
-# complete, and name the fix for each.
+# and report them ALL at once, naming the fix for each.
 preflight(){
   local need_gw_creds="${1:-0}" need_tools="${2:-0}" problems=0
   bold "== preflight =="
@@ -1232,7 +1129,7 @@ preflight(){
   if [ "$need_gw_creds" = "1" ]; then
     if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
       echo "  ✗ gateway S3 credentials missing (GW_AK/GW_SK in $ENVF)"
-      echo "    → warp, mlperf and cache-mp-s3 cannot run. Get them from the Blimp UI."
+      echo "    → warp and mlperf cannot run. Get them from the Blimp UI."
       problems=$((problems+1))
     else
       echo "  ✓ gateway S3 credentials present"
@@ -1275,13 +1172,12 @@ need_env(){
   # shellcheck disable=SC1090
   . "$ENVF"
   GW="${GW:-${GATEWAY:-}}"; export GW GATEWAY="$GW"
-  # The gateway validates the account's FLEET token only (2026-09-14). The
-  # wiring carries it (heal_wiring reads the node's copy when the CLI runs on
-  # the box); nothing is derived from the cluster id any more.
+  # The gateway validates the account's FLEET token only. The wiring carries it
+  # (heal_wiring reads the node's copy when the CLI runs on the box).
   export CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
   # Self-heal stale creds/token left behind by a cluster redeploy (see heal_wiring).
   heal_wiring
-  [ -n "${CLUSTER_TOKEN:-}" ] || die "CLUSTER_TOKEN is empty: the gateway accepts only the account fleet token. On the gateway box it is read from /opt/0chain/zs3server/environment/admin_token; elsewhere set CLUSTER_TOKEN=<fleet token from the panel (Settings -> API token)> in $ENVF"
+  [ -n "${CLUSTER_TOKEN:-}" ] || die "CLUSTER_TOKEN is empty: the gateway accepts only the account fleet token. On the Blimp node it is read from the node; elsewhere set CLUSTER_TOKEN=<fleet token from the panel (Settings -> API token)> in $ENVF"
 }
 
 # ensure_storage_tools — the --storage suite's benchmark tools, installed
@@ -1301,12 +1197,9 @@ ensure_storage_tools(){
       && sudo install /tmp/warp /usr/local/bin/warp && rm -f /tmp/warp.tgz /tmp/warp \
       || echo "  ! warp install failed — warp sections will be skipped"
   fi
-  # mount-s3 — needed for BOTH the mlperf read path and the cache-mp-s3 leg.
-  # This was apt-ONLY, so on an rpm host (AL2023, the default Amazon Linux client)
-  # the whole block was skipped silently: `mount-s3: missing`, cache-mp-s3 reported
-  # `n/a` on every run, and mlperf never ran at all. Mountpoint ships an .rpm too.
+  # mount-s3 — the mlperf read path (and the --acid filesystem leg); .deb or .rpm.
   command -v mount-s3 >/dev/null || {
-    bold "  installing mount-s3 (mlperf + cache-mp-s3 read path)…"
+    bold "  installing mount-s3 (mlperf read path)…"
     local arch pkg url out; arch=$(uname -m)
     if command -v apt-get >/dev/null; then pkg=deb
     elif command -v dnf >/dev/null || command -v yum >/dev/null; then pkg=rpm
@@ -1321,26 +1214,19 @@ ensure_storage_tools(){
         esac
       fi
       rm -f "/tmp/mount-s3.$pkg"
-      # Print the REASON. Swallowing it is why this sat broken: the summary said
-      # "missing" and the operator had nothing to act on.
+      # Print the REASON, not just "missing".
       command -v mount-s3 >/dev/null || {
-        echo "  ! mount-s3 install failed ($url) — mlperf + cache-mp-s3 will be skipped"
+        echo "  ! mount-s3 install failed ($url) — mlperf will be skipped"
         printf '%s\n' "$out" | tail -3 | sed 's/^/    | /'
       }
     else
-      echo "  ! no apt/dnf/yum — cannot install mount-s3; mlperf + cache-mp-s3 will be skipped"
+      echo "  ! no apt/dnf/yum — cannot install mount-s3; mlperf will be skipped"
     fi
   }
-  # dlio imports mpi4py at startup, which dlopen()s a real MPI runtime. Without
-  # one it dies with "RuntimeError: cannot load MPI library" during dataset
-  # GENERATION, so mlperf produced no numbers at all even with dlio installed
-  # (AL2023, 2026-08-01) — and `mpirun` is required for accel>1 on top of that.
-  # Amazon Linux ships it as openmpi/openmpi-devel; Debian as openmpi-bin +
-  # libopenmpi-dev. Neither puts it on PATH/LD_LIBRARY_PATH — run_cluster.sh
-  # prepends /usr/lib64/openmpi/{bin,lib} itself.
-  # `ls a b` exits non-zero when EITHER path is missing, so the old check always
-  # claimed MPI was absent — it reinstalled every run and then reported failure
-  # even on a host where OpenMPI was already installed and working.
+  # dlio imports mpi4py, which needs a real MPI runtime ("cannot load MPI
+  # library" otherwise), and `mpirun` is required for accel>1. Amazon Linux:
+  # openmpi/openmpi-devel; Debian: openmpi-bin + libopenmpi-dev. run_cluster.sh
+  # puts it on PATH/LD_LIBRARY_PATH itself.
   if ! { [ -x /usr/lib64/openmpi/bin/mpirun ] || [ -x /usr/bin/mpirun ] || command -v mpirun >/dev/null; }; then
     bold "  installing openmpi (dlio/mlperf needs an MPI runtime)…"
     if command -v dnf >/dev/null; then sudo dnf install -y -q openmpi openmpi-devel >/dev/null 2>&1
@@ -1360,22 +1246,16 @@ ensure_storage_tools(){
       && sudo dnf install -y -q python3-pip >/dev/null 2>&1
     command -v apt-get >/dev/null && ! python3 -c 'import ensurepip' 2>/dev/null \
       && sudo apt-get install -y -qq python3-venv >/dev/null 2>&1
-    # TMPDIR must NOT be /tmp: on Amazon Linux /tmp is a RAM-backed tmpfs (1.9 GB
-    # on a c6in.large, and the suite's own artifacts had it at 76% full), while
-    # dlio-benchmark pulls tensorflow + torchvision — multiple GB of wheels that
-    # pip unpacks under TMPDIR. It ran out of space every time while the root disk
-    # had 195 GB free, and the failure surfaced only as `dlio: missing`.
-    # --no-cache-dir keeps the footprint down; a pip cache is useless here anyway.
+    # TMPDIR must NOT be /tmp: it is often a small RAM-backed tmpfs, and
+    # dlio-benchmark pulls multiple GB of wheels that pip unpacks under TMPDIR.
     local dtmp="${DLIO_TMPDIR:-/var/tmp/dlio-build}"
     sudo mkdir -p /opt/dlio "$dtmp"
-    # Mirror the recipe the CLUSTER uses (zusCloudNative zs3-init.go
-    # installMLPerfBenchmark), which demonstrably works — the cluster's own
-    # "Run mlperf" button drives it. The order matters:
+    # The order matters:
     #
     #   1. pip/wheel/setuptools first, or the torch wheel resolution misbehaves.
     #   2. torch from the CPU-ONLY index BEFORE dlio-benchmark. Left to itself,
     #      dlio pulls the default (CUDA) torch — several GB of nvidia-* wheels
-    #      that have no use on a CPU box and that filled /tmp here.
+    #      that have no use on a CPU box.
     #   3. dlio-benchmark last, so it finds torch already satisfied.
     #   4. s3torchconnector for the S3 read path (best-effort).
     local PIPQ="sudo env TMPDIR=$dtmp /opt/dlio/venv_mlperf/bin/pip install --no-cache-dir"
@@ -1402,11 +1282,8 @@ ACID_BIN="$HERE/acid/ptest"
 # a present, runnable binary is reused.
 ensure_acid_tools(){
   [ "${BLIMP_SKIP_DEPS:-0}" = 1 ] && return 0
-  # Reuse ONLY a binary built for THIS host. A committed/pushed ptest is a wrong-arch
-  # trap: a Mac Mach-O passes `-x` but dies "Exec format error" (bit us — the repo
-  # shipped a Mach-O). Match the binary's format to the OS (ELF on Linux, Mach-O on
-  # Darwin); anything else rebuilds from source below. Falls through to rebuild if
-  # `file` is unavailable.
+  # Reuse ONLY a binary built for THIS host (ELF on Linux, Mach-O on Darwin);
+  # anything else rebuilds from source below.
   _want=ELF; [ "$(uname -s)" = Darwin ] && _want=Mach-O
   if [ -x "$ACID_BIN" ] && file "$ACID_BIN" 2>/dev/null | grep -q "$_want"; then echo "  porcupine (acid): ok"; return 0; fi
   [ -x "$ACID_BIN" ] && echo "  (existing ptest is wrong-arch for this host — rebuilding)"
@@ -1434,24 +1311,13 @@ ensure_acid_tools(){
 cmd_storage(){
   need_env
   : "${GW:?gateway missing in wiring}" "${REGION:?}"
-  # Everything the ~25-minute suite needs, checked in seconds and reported
-  # together. --setup installs the tools and saves the keys, so this normally
-  # just confirms; when it doesn't, you learn ALL of it now rather than one item
-  # per run.
+  # Everything the suite needs, checked in seconds and reported together.
   preflight 1 1
   ensure_storage_tools
   [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
   [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
-  # REFUSE to run unauthenticated. These are the GATEWAY's own S3 credentials,
-  # which are NOT the source-bucket credentials: vpc mode deliberately leaves the
-  # source keys blank (the node reads the origin via its IAM instance role), but
-  # the gateway's S3 endpoint is MinIO-style and authenticates by key. With them
-  # blank, warp cannot PUT/GET at all and run_cluster.sh aborts with "AK: set AK"
-  # — taking warp AND mlperf with it — while the suite still printed a summary,
-  # just with the throughput fields empty:
-  #     warp   S3 PUT  MiB/s · GET  MiB/s          <- blank, looks like a format bug
-  # An empty number reads as "the tool is broken", not "you gave me no key", so
-  # say which one is missing and where to get it.
+  # REFUSE to run unauthenticated. These are the GATEWAY's own S3 credentials
+  # (not the source-bucket credentials); say which one is missing.
   if [ -z "${GW_AK:-}" ] || [ -z "${GW_SK:-}" ]; then
     die "gateway S3 credentials are empty (GW_AK=$([ -n "${GW_AK:-}" ] && echo set || echo EMPTY), GW_SK=$([ -n "${GW_SK:-}" ] && echo set || echo EMPTY)).
   warp and mlperf benchmark the GATEWAY's S3 endpoint, which authenticates by
@@ -1461,16 +1327,8 @@ cmd_storage(){
       GW_AK=... GW_SK=... blimp --storage"
   fi
   # Run the suite LOCALLY (on THIS node, to measure the real client->gateway
-  # path), capturing its output. Unlike --query — which runs SERVER-SIDE, so the
-  # gateway's cdc_service tracks it live and the UI shows a yellow "running" row
-  # with partial data — --storage runs HERE, so the gateway has no live view. To
-  # give the SAME live UI, a background heartbeat POSTs the partial results to
-  # cdc_service every <180s as status=running (the UI shows the live row), and we
-  # exits. Each leg (warp/mlperf) now registers its OWN internal-format run from
-  # inside test_cache.sh — identical type + labels to the gateway's run_bench rows,
-  # with cdc sampling the tier columns via __tiers__ — so there is no combined
-  # "storage (client)" heartbeat here anymore. CLUSTER_ID is forwarded so the
-  # per-leg POST /bench/import is authed (Bearer zus-<CLUSTER_ID>).
+  # path). Each leg registers its own run on the node panel's Benchmarks tab
+  # from inside test_cache.sh (fleet-token bearer).
   env GW="$GW" GW_AK="$GW_AK" GW_SK="$GW_SK" \
     CLUSTER_ID="$CLUSTER_ID" CLUSTER_TOKEN="${CLUSTER_TOKEN:-}" \
     REGION="$REGION" CLUSTER_REGION="${CLUSTER_REGION:-$REGION}" \
@@ -1481,107 +1339,9 @@ cmd_storage(){
   exit $?
 }
 
-# storage_heartbeat <logfile> <id> — while --storage runs, push its partial
-# output to the gateway every 75s as status=running so the UI shows a LIVE
-# "running" row (yellow, partial metrics) exactly like a --query run, instead of
-# the run only appearing when it finishes. Each POST rewrites the gateway-side
-# summary/log so bench_status() keeps reporting "running" (freshness < 180s).
-# Killed by cmd_storage; the "done" finalize is a separate storage_import call.
-storage_heartbeat(){
-  local log="$1" id="$2"
-  [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  sleep 15   # let the first leg emit a line before the first beat
-  while :; do storage_import "$log" "$id" "running" quiet; sleep 75; done
-}
-
-# storage_import <logfile> [id] [status] [quiet] — register/update a client-side
-# --storage run on the Blimp UI bench list via the gateway cdc_service
-# `POST /bench/import` (Authorization: Bearer zus-<CLUSTER_ID>). The suite prints
-# human-readable result lines; we scrape the throughput/TTFB/AU lines into a
-# [label,value] metrics array and ship them + the full log so the UI shows the
-# run like a gateway-launched one (tagged client_* / source=client). status is
-# "running" (heartbeat) or "done" (final). Best-effort: an older gateway image
-# without /bench/import (or an unreachable :9401) just skips, never fails the run.
-storage_import(){
-  local log="$1" id="${2:-storage_$(date +%s)}" status="${3:-done}" quiet="${4:-}"
-  [ -n "${CLUSTER_ID:-}" ] || { [ -z "$quiet" ] && echo "  (skipping UI registration — no CLUSTER_ID in wiring)"; return 0; }
-  [ -n "${GW:-}" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
-  local payload
-  payload=$(CLOG="$log" python3 - "$id" "$(hostname 2>/dev/null || echo client)" "$status" <<'PY' 2>/dev/null
-import json,os,re,sys
-rid,host,status=sys.argv[1],sys.argv[2],sys.argv[3]
-try: raw=open(os.environ["CLOG"],errors="replace").read()
-except Exception: raw=""
-c=re.sub(r"\x1b\[[0-9;]*m","",raw)
-# throughput is normalised to DECIMAL MB/s (or GB/s >=1000) — warp reports
-# BINARY MiB/s, but the UI + gateway rows use MB/s, so convert (1 MiB = 1.048576 MB).
-def to_mb(v,u):
-    v=float(v); u=u.lower()
-    return v*(1073.741824 if u.startswith("gib") else 1.048576 if u.startswith("mib") else 0.001048576 if u.startswith("kib") else 1000.0 if u.startswith("gb") else 0.001 if u.startswith("kb") else 1.0)
-def fmt(mb): return "%.2f GB/s"%(mb/1000.0) if mb>=1000 else "%d MB/s"%round(mb)
-def thr(s,paren=False):
-    if paren:
-        m=re.search(r"\(([0-9.]+)\s*(GB/s|MB/s|KB/s)\)",s)
-        if m: return fmt(to_mb(m.group(1),m.group(2)))
-    m=re.search(r"([0-9.]+)\s*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s)",s)
-    return fmt(to_mb(m.group(1),m.group(2))) if m else None
-rows=[]; wctx=None
-def g(rx,s,grp=1):
-    m=re.search(rx,s); return m.group(grp) if m else None
-for ln in c.splitlines():
-    s=ln.strip()
-    if "== warp PUT" in s: wctx="PUT"; continue
-    if "== warp GET" in s: wctx="GET"; continue
-    if s.startswith("* Average:") and wctx:
-        v=thr(s); ob=g(r"([0-9.]+)\s*obj/s",s)
-        if v: rows.append(["warp S3 %s (96MiB, conc16)"%wctx, v+(" · "+ob+" obj/s" if ob else "")])
-        wctx=None; continue
-    if "TTFB:" in s:
-        med=g(r"Median:\s*([0-9a-z]+)",s); p99=g(r"99th:\s*([0-9a-z]+)",s); avg=g(r"Avg:\s*([0-9a-z]+)",s)
-        parts=[x for x in [("p50 "+med if med else ""),("p99 "+p99 if p99 else ""),("avg "+avg if avg else "")] if x]
-        rows.append(["TTFB 1KiB GET (conc1)", " · ".join(parts)]); continue
-    if "mlperf read" in s:
-        au=g(r"AU\s*([0-9.]+)",s); io=thr(s); acc=g(r"accel=([0-9]+)",s)
-        parts=[x for x in [("AU "+au+"%" if au else ""),(io if io else "")] if x]
-        rows.append(["mlperf resnet50"+(" accel-"+acc if acc else ""), " · ".join(parts)]); continue
-od=[]; seen={}
-for k,v in rows:
-    if k not in seen: od.append(k)
-    seen[k]=v
-final=[[k,seen[k]] for k in od]
-print(json.dumps({"id":rid,"type":"storage (client)","status":status,
-  "summary":{"type":"storage (client)","metrics":final,"config":"run-blimp kit (client %s)"%host,"status":status},
-  "log":c[-200000:]}))
-PY
-)
-  [ -n "$payload" ] || return 0
-  if curl -fsS -m 20 -X POST "http://$GW:9401/bench/import" \
-       -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
-       --data-binary "$payload" >/dev/null 2>&1; then
-    [ -z "$quiet" ] && bold "  ✓ registered this run on the Blimp UI bench list (client_$id, $status)"
-  else
-    [ -z "$quiet" ] && echo "  (could not register on the UI bench list — gateway :9401 unreachable or image predates /bench/import)"
-  fi
-  return 0
-}
-
-# prod_ingest — pull the customer's Iceberg tables INTO the cluster's own
-# eblobber-backed warehouse before querying.
-#
-# THIS IS THE PATH THE PRODUCT ACTUALLY USES. The panel's Prod Query does exactly
-# this (datalake ProdQuery -> zus-cdc /prod/ingest, then /admin/query/run), and it
-# is why the UI can author MVs over a customer source. `blimp --setup` instead
-# wires a BYO ATTACH (source=customer), which points the gateway at the customer
-# catalog — and on that path every grain-gate cardinality probe fails to resolve
-# the schema, so authoring falls through to "serve base" with status=no_mv and
-# every timing reads "?". Measured on node 37 (2026-09-14) at SF1 and SF10.
-#
-# After ingesting, queries must NOT carry source=customer: the tables now live in
-# the CLUSTER's catalog, and asking for the customer source re-attaches the BYO
-# one and defeats the ingest.
+# prod_ingest — copy the customer's Iceberg tables INTO the cluster's own
+# warehouse (POST :9401/prod/ingest). Opt-in (BLIMP_INGEST=1); a one-shot full
+# copy, not part of the --query measurement.
 prod_ingest(){
   local tables="$1"          # JSON array string, or "" for the whole namespace
   local base="http://$GW:${CDC_PORT:-9401}/prod/ingest"
@@ -1593,10 +1353,10 @@ b={"iceberg_url":os.environ["ING_IRC"],"warehouse":os.environ["ING_WH"],
 t=os.environ.get("ING_TBL","").strip()
 if t: b["tables"]=json.loads(t)
 print(json.dumps(b))')
-  bold "ingesting the source into the cluster warehouse (zus-cdc /prod/ingest)"
+  bold "ingesting the source into the cluster warehouse (/prod/ingest)"
   local out
   out=$(curl -s -m "${INGEST_TIMEOUT:-1800}" -X POST "$base" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" \
+    -H "Authorization: Bearer $CLUSTER_TOKEN" \
     -H "Content-Type: application/json" -d "$body" 2>/dev/null)
   case "$out" in
     *'"ingested"'*) printf '%s' "$out" | "${BLIMP_PY:-python3}" -c 'import json,sys
@@ -1614,38 +1374,18 @@ cmd_query(){
   preflight 0 0
   # The suite runs against the source wired by `blimp --setup` (the gateway's
   # "customer" source): the gateway authors MVs from it, the CDC append lands in
-  # it, and the delta merge diffs its snapshots. That is the production path.
-  # `/prod/ingest` (BLIMP_INGEST=1) is a one-shot FULL COPY of the namespace into
-  # the cluster warehouse (delete + re-append every table) — useful to snapshot a
-  # remote source locally, useless for the suite: with the gateway Nessie as the
-  # catalog it copies the namespace onto itself, and a later append to the source
-  # is never seen by the copy, so every timing came back "?" (node 37,
-  # 2026-09-14). Ingest is therefore opt-in and never replaces the source.
+  # it, and the delta merge diffs its snapshots. Ingest is opt-in and never
+  # replaces the source.
   if [ "${BLIMP_INGEST:-0}" = 1 ]; then
     prod_ingest "${INGEST_TABLES:-}"
   fi
-  # S3_ENDPOINT/KEY/SECRET must cross this whitelist. bench_cdc.sh forwards
-  # $S3_KEY/$S3_SECRET to seed_tpcds.py and seed_tpcds.py falls back to
-  # $S3_ENDPOINT — but none of the three were listed here, so the CDC APPEND
-  # resolved the bucket against real AWS and died:
-  #   s3fs ... FileNotFoundError: The specified bucket does not exist
-  # With no append there is no delta, so every query fell back to a full
-  # re-author (mode='no-delta') and the delta-merge path — the whole point of
-  # this suite — was never exercised while the run still reported DONE.
-  # Pin the CDC seeder's S3 endpoint to the node's OWN gateway over loopback:
-  # the tick writes both the parquet DATA and the Iceberg METADATA there, and on
-  # a cloud VM the published fleet endpoint (fleet-<id>.blimp.software:9443 -> the
-  # node's own public IP) can't hairpin, while the catalog vends the container-only
-  # name minioserver:9000 which the host can't resolve. endpoint_local() rewrites
-  # to loopback ONLY when loopback actually serves the port, so a genuinely-remote
-  # external source is left untouched. Mirrors the --setup fix.
+  # S3_ENDPOINT/KEY/SECRET must be passed through: the CDC seeder writes both
+  # parquet DATA and Iceberg METADATA there. endpoint_local() rewrites to
+  # loopback ONLY when the published address is unreachable from this box and
+  # loopback serves the port (no hairpin NAT); a remote source is left alone.
   local Q_S3_ENDPOINT; Q_S3_ENDPOINT="$(endpoint_local "${S3_ENDPOINT:-http://$GW:9000}")"
-  # The MV parts (tpcds-mv/<mv>/parts.json, delta-*.parquet, data.parquet) live
-  # on the GATEWAY's store, not the source: passing the source endpoint here made
-  # the delta gate read an empty bucket before AND after every tick, so every
-  # merge reported NO-BASELINE / 0 rows while the trace said DELTA-MERGED
-  # (nodes 37/144: :9002 lists nothing, 127.0.0.1:9000 lists both delta parts,
-  # 2026-10-03). bench_cdc.sh pairs this endpoint with GW_AK/GW_SK.
+  # The MV parts live on the GATEWAY's store, not the source; bench_cdc.sh pairs
+  # this endpoint with GW_AK/GW_SK.
   local Q_MV_S3_ENDPOINT; Q_MV_S3_ENDPOINT="$(endpoint_local "${MV_S3_ENDPOINT:-http://$GW:9000}")"
   run_query_suite(){
     env GW="$GW" CLUSTER_ID="$CLUSTER_ID" ICEBERG_URL="$ICEBERG_URL" WAREHOUSE="$WAREHOUSE" \
@@ -1657,13 +1397,9 @@ cmd_query(){
       ICEBERG_PREFIX="${ICEBERG_PREFIX:-}" ICEBERG_URL_LOCAL="${ICEBERG_URL_LOCAL:-}" \
       VERIFY="${VERIFY:-0}" EVICT="${EVICT:-0}" bash "$HERE/test_query.sh"
   }
-  # ONE QUERY AT A TIME. A batch runs phase 1 for every query, ONE append, then
-  # phase 3 for every query — so a slow cold author holds every other query's
-  # tick hostage, the append lands in whichever query's window it happens to
-  # hit, and a "tick" line cannot be tied to that query's own merge (q4 reported
-  # incr_query=2ms merge=– in a 12-query batch: nothing merged, 2026-09-22).
-  # Each query gets its own serve → append → tick. An explicit SUITES or --sql
-  # run is left as given.
+  # ONE QUERY AT A TIME: each query gets its own serve → append → tick, so a
+  # tick line belongs to that query's own merge. An explicit SUITES or --sql run
+  # is left as given.
   local qs=(${QNRS:-}) q rc=0
   if [ -n "${SUITES:-}" ] || [ -n "${SQL_FILES:-}" ] || [ "${#qs[@]}" -le 1 ]; then
     run_query_suite "${QNRS:-}"; return $?
@@ -1700,8 +1436,7 @@ for f in "$@"; do
     # 4). One original-query run per query; VERIFY_CAP_S caps it (default 3600).
     --verify)       VERIFY=1; export VERIFY ;;
     # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
-    # before phase 1 so it re-authors from the recipe library. force_author was
-    # removed from the gateway (2026-07-31); this is the only real cold path.
+    # before phase 1 so it re-authors from the recipe library.
     --evict)        EVICT=1; export EVICT ;;
     # --tpc "3 7 19": the TPC-DS query numbers to run (default: the proven
     # delta-merge set). --append-rows N: base rows for the CDC tick (default 5000).
@@ -1768,25 +1503,17 @@ cmd_acid(){
   aws s3 mb "s3://$BKT" --endpoint-url "http://$GW:$S3_PORT" >/dev/null 2>&1 || true
 
   # ── ACID must be ARMED for this test, and only for this test ───────────────
-  #
-  # The gateway defaults ZS3_ACID_ALL to OFF (2026-08-06): the warp benchmark
-  # that argued strict whole-file verify was free is the same tool that produced
-  # the phantom EOF errors, so it cannot be used to justify paying that cost on
-  # every deployment. A linearizability test against a gateway with ACID off is
-  # measuring the wrong configuration and will report torn reads that say
-  # nothing about the ACID path.
-  #
-  # So: turn it ON here, and turn it back OFF when we are done — including on
-  # failure or Ctrl-C, via the trap. POST /admin/acid is a RUNTIME pin and is
-  # NOT persisted, so a gateway restart reverts to ZS3_ACID_ALL regardless;
-  # this only affects the live process for the duration of the run.
+  # ACID is off by default on the gateway; a linearizability test against it off
+  # measures the wrong configuration. Turn it ON here and restore the previous
+  # setting afterwards, including on failure or Ctrl-C. POST /admin/acid is a
+  # runtime pin and is not persisted.
   acid_pin(){ # <true|false>
     curl -s -m 15 -o /dev/null -X POST "http://$GW:$S3_PORT/admin/acid" \
-      -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $CLUSTER_TOKEN" -H "Content-Type: application/json" \
       -d "{\"enabled\":$1}" 2>/dev/null || true
   }
   ACID_WAS=$(curl -s -m 15 "http://$GW:$S3_PORT/admin/acid" \
-    -H "Authorization: Bearer ${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
+    -H "Authorization: Bearer $CLUSTER_TOKEN" 2>/dev/null | grep -o '"enabled":[a-z]*' | cut -d: -f2)
   [ -n "$ACID_WAS" ] || ACID_WAS=false
   bold "== arming ACID for the test (was: $ACID_WAS) =="
   acid_pin true
@@ -1881,7 +1608,7 @@ cmd_encryption(){
   need_env   # source the wiring (GW / CLUSTER_ID / CLUSTER_TOKEN); without this
              # $CLUSTER_ID is unbound under `set -u` and every call aborts.
   local a="${1:-status}" S3_PORT="${S3_PORT:-9000}" en
-  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
+  local tok="$CLUSTER_TOKEN"
   case "$a" in
     on|true|1)   en=true ;;
     off|false|0) en=false ;;
@@ -1904,7 +1631,7 @@ cmd_immutable(){
   need_env   # source the wiring (GW / CLUSTER_ID / CLUSTER_TOKEN); without this
              # $CLUSTER_ID is unbound under `set -u` and every call aborts.
   local a="${1:-}" S3_PORT="${S3_PORT:-9000}" im
-  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
+  local tok="$CLUSTER_TOKEN"
   case "$a" in
     on|true|1)   im=true ;;
     off|false|0) im=false ;;
@@ -1923,7 +1650,7 @@ cmd_immutable(){
 cmd_gc(){
   need_env
   : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
-  local S3_PORT="${S3_PORT:-9000}" tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}"
+  local S3_PORT="${S3_PORT:-9000}" tok="$CLUSTER_TOKEN"
   local url="http://$GW:$S3_PORT/admin/fleet/orphan-sweep"
   if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$GW:$S3_PORT/minio/health/live" 2>/dev/null)" != 200 ]; then
     die "gateway $GW:$S3_PORT unreachable — check GW= in $ENVF and the security group"
@@ -1945,13 +1672,13 @@ cmd_gc(){
   echo "== done: reclaimed $total orphan blob(s) =="
 }
 
-# --update: drive the node's own updater (zs3-init --update) through the
-# zus-cdc helper on :9401. The node does the work (backup, rm→up, alias
-# re-attach, health checks, rollback); this just submits, polls, and tails.
+# --update: drive the node's own updater through its helper on :9401. The node
+# does the work (backup, recreate, health checks, rollback); this just submits,
+# polls, and tails.
 cmd_update(){
   need_env
   : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
-  local tok="${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" base="http://$GW:${CDC_PORT:-9401}"
+  local tok="$CLUSTER_TOKEN" base="http://$GW:${CDC_PORT:-9401}"
   local what="" dry=0 tags="" a
   while [ $# -gt 0 ]; do
     a="$1"; shift
@@ -1996,9 +1723,9 @@ print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get
   local seen=0 st="running" log n
   while [ "$st" = running ]; do
     sleep 5
-    log=$(curl -s -m 20 "$base/update/log?id=$id&token=$tok"); n=$(printf '%s\n' "$log" | grep -c .)
+    log=$(curl -s -m 20 "$base/update/log?id=$id" -H "Authorization: Bearer $tok"); n=$(printf '%s\n' "$log" | grep -c .)
     [ "$n" -gt "$seen" ] && { printf '%s\n' "$log" | tail -n +"$((seen+1))" | grep -E '\[update\]|\[rclone\]|FAIL|rolled back' | sed 's/^/  /'; seen=$n; }
-    st=$(curl -s -m 20 "$base/update/state?id=$id&token=$tok" | sed -n 's/.*"status": *"\([a-z]*\)".*/\1/p')
+    st=$(curl -s -m 20 "$base/update/state?id=$id" -H "Authorization: Bearer $tok" | sed -n 's/.*"status": *"\([a-z]*\)".*/\1/p')
     [ -n "$st" ] || st=running
   done
   echo "== update $id: $st ==  (full log: blimp --update-log $id)"
@@ -2008,7 +1735,8 @@ print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get
 case "$CMD" in
   --setup)            cmd_setup ;;
   --update|update)    cmd_update "$@" ;;
-  --update-log)       need_env; curl -s -m 20 "http://$GW:${CDC_PORT:-9401}/update/log?id=${1:?id}&token=${CLUSTER_TOKEN:?fleet token required (node file /opt/0chain/zs3server/environment/admin_token or the panel API token)}" ;;
+  --update-log)       need_env; [ -n "${1:-}" ] || die "usage: blimp --update-log <update-id>"
+                      curl -s -m 20 "http://$GW:${CDC_PORT:-9401}/update/log?id=$1" -H "Authorization: Bearer $CLUSTER_TOKEN" ;;
   --storage|storage)  cmd_storage ;;
   --acid|acid)        cmd_acid ;;
   --encryption|encryption) cmd_encryption "${1:-}" ;;
@@ -2016,5 +1744,5 @@ case "$CMD" in
   --gc|gc)            cmd_gc ;;
   --query|query)      cmd_query ;;
   ""|-h|--help|help)  usage ;;
-  *)                  echo "unknown command: $1"; echo; usage; exit 2 ;;
+  *)                  echo "unknown command: $CMD"; echo; usage; exit 2 ;;
 esac

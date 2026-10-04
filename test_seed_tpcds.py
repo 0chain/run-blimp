@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for the CDC delta generator in seed_tpcds.py.
 
-These guard the failure that invalidated the SF1000 CDC bench on test2
-(2026-08-04): the appended delta carried NULL join keys and a date range outside
+These guard a failure class that invalidates a CDC bench: the appended delta carried NULL join keys and a date range outside
 the MVs' year filters, so every "incremental merge" in the run computed an empty
 result. q24's merge burned 15.2s scanning ~19.7 GB to produce a 0-row delta part;
 q88's produced 0 rows; q4's left its MV at exactly 53,491,237 rows.
@@ -37,7 +36,7 @@ def gen(n=500, years=(2000, 2001, 2002), seed=1234):
 
 class TestDateBounds(unittest.TestCase):
     def test_single_year_matches_measured_date_dim(self):
-        # Measured on test2's SF1000 date_dim, 2026-08-04.
+        # The TPC-DS date_dim calendar.
         self.assertEqual(S.date_sk_bounds([2000]), (2451545, 2451910))
         self.assertEqual(S.date_sk_bounds([2001]), (2451911, 2452275))
         self.assertEqual(S.date_sk_bounds([2002]), (2452276, 2452640))
@@ -222,7 +221,7 @@ class TestEveryFactIsFullyGenerated(unittest.TestCase):
 
     def test_every_query_referenced_column_exists(self):
         """Columns the 99-query TPC-DS set actually reads (scanned from
-        ~/tpcds_queries on test2, 2026-08-04). Anything here that the generator
+        the generated TPC-DS query files). Anything here that the generator
         omits is a silently-dropped join or aggregate."""
         needed = {
             "store_sales": ["ss_addr_sk", "ss_cdemo_sk", "ss_coupon_amt",
@@ -299,8 +298,7 @@ class TestEveryFactIsFullyGenerated(unittest.TestCase):
                                      c[p + "ext_list_price"][i] - c[p + "ext_sales_price"][i])
 
     def test_measures_stay_inside_the_real_facts_value_ranges(self):
-        """Ranges MEASURED off the real SF1 store_sales manifest bounds
-        (2026-08-04). A delta whose values sit outside what the fact actually
+        """Ranges follow the real store_sales value bounds. A delta whose values sit outside what the fact actually
         contains is invisible to every query with a literal value band —
         q13 filters ss_sales_price BETWEEN 50 AND 150, q28 filters list-price
         bands, q48 filters net-profit bands. A 3x markup put list_price at 299
@@ -477,8 +475,7 @@ class TestReferentialReturnsForEveryChannel(unittest.TestCase):
 
 
 class TestProportionalTick(unittest.TestCase):
-    """Both drivers appended a FLAT count per table (50k to each of five facts on
-    test2; 20k to three on AWS with returns omitted entirely). Real TPC-DS facts
+    """A FLAT count per table is not a realistic workload. Real TPC-DS facts
     stand at roughly 4:2:1 store:catalog:web with returns ~10% of their parent."""
 
     def test_default_tick_matches_the_required_shape(self):
@@ -520,7 +517,7 @@ class TestProportionalTick(unittest.TestCase):
 class TestDerivedDatesStayInsideDateDim(unittest.TestCase):
     """Ship and return dates derived from a sale near the end of the calendar
     must name date_dim rows that exist — a key past the max is issued to a later
-    date_dim append that old facts already reference (q94/q95, node 144)."""
+    date_dim append that old facts already reference (q94/q95)."""
 
     def test_date_after_is_bounded(self):
         rnd = random.Random(7)
@@ -544,7 +541,7 @@ class TestDerivedDatesStayInsideDateDim(unittest.TestCase):
 
 class TestDateDimRowFromKey(unittest.TestCase):
     """Appended date_dim rows take their calendar from the key (Julian day),
-    matching the real SF10 rows read from the node (2026-09-28)."""
+    matching the real TPC-DS date_dim rows."""
 
     def test_matches_real_rows(self):
         real = {
@@ -574,7 +571,7 @@ if __name__ == "__main__":
 class TestGeoCorrelation(unittest.TestCase):
     """q24 requires `s_zip = ca_zip AND s_market_id = 8`. Drawing
     ss_customer_sk and ss_store_sk INDEPENDENTLY makes that pair essentially
-    unreachable — measured on the SF1000 catalog (2026-08-04): 84 of 1002 stores
+    unreachable — on the SF1000 catalog: 84 of 1002 stores
     are in market 8 covering 67 zips, 6.78% of the 6,000,000 addresses sit in one
     of those zips, so a random (customer, store) pair passes with p=8.46e-05.
     A 5,000-row store_returns delta expects 0.42 eligible rows, and q24's merge
@@ -642,7 +639,7 @@ class TestDimBoundsAreScaleFree(unittest.TestCase):
     """The seeder must derive dimension key bounds from the DATA, never from a
     constant measured at one scale factor.
 
-    Reported from a fresh on-prem node (2026-09-15): at SF1 the CDC tick logged
+    On a fresh SF1 node the CDC tick logged
     "bounds unreadable; falling back to SF1000 value" and the delta-merge folded
     0 rows. The cause is not SF1 — it is that Iceberg only exposes bounds when
     the parquet carries column statistics, and without them the code guessed
@@ -720,10 +717,9 @@ class TestDimBoundsAreScaleFree(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# QUERY-TARGETED TICK (2026-09-19).
+# QUERY-TARGETED TICK.
 #
-# The measured failure, from the gateway's own bounds prover on node
-# 1788402989672 while ticking for q72:
+# The failure, as reported by the gateway while ticking for q72:
 #
 #   kterm_dimfilter_empty: Δcatalog_sales.cs_sold_date_sk ∈ [2451545, 2452640]
 #     vs date_dim.d_date_sk under "d1.d_year = 1999" ∈ [2451180, 2451544]
@@ -1217,8 +1213,8 @@ class DimOwnKeyResolvesTest(unittest.TestCase):
     dim_for() resolves FACT columns by suffix, and a dimension's own key does
     not carry that suffix ("hd_demo_sk" ends in "_demo_sk", not "hdemo_sk").
     When append_table() could not name the key it skipped the whole bounds
-    block and issued keys from 1, so every tick re-used existing keys: measured
-    on the node 2026-09-21, household_demographics held 62,320 rows over 7,200
+    block and issued keys from 1, so every tick re-used existing keys:
+    household_demographics held 62,320 rows over 7,200
     distinct hd_demo_sk. A re-used key is reachable from pre-append facts, so
     the RI-prune gate refuses the dim delta and the merge pays a fact scan.
     """
@@ -1252,8 +1248,8 @@ class EveryAppendedDimIssuesFreshKeysTest(unittest.TestCase):
     """Every dimension bench_cdc.sh appends to must issue its own key above the
     table's max. income_band's ib_income_band_sk matched no DIM_BY_SUFFIX entry,
     so own_key_of() was None, append_table() skipped its bounds lookup and
-    gen_table_cols() filled the PK with randint(1, 1000): measured on nodes 37
-    and 144 (2026-09-25) income_band held 56,352 / 10,144 live rows over 1,000
+    gen_table_cols() filled the PK with randint(1, 1000): income_band
+    held 56,352 / 10,144 live rows over 1,000
     distinct keys. The table list is read from bench_cdc.sh's default
     CDC_EXTRA_TABLES, so a dimension added there is covered here too."""
 
@@ -1292,7 +1288,7 @@ class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
 
     The own-PK branch asked dim_for(name), which resolves FACT columns; for
     hd_demo_sk / cd_demo_sk it returned None, so the PK fell through to the
-    integer-noise branch. Measured on the node 2026-09-21: 6-row household_
+    integer-noise branch. Observed: 6-row household_
     demographics tick appends carried random hd_demo_sk in 25..943 while the
     append printed "issuing 7201..7206".
     """
@@ -1317,7 +1313,7 @@ class DimOwnPKIsIssuedAboveMaxTest(unittest.TestCase):
 class TestBoundsFoldOnlyOntoParentSnapshot(unittest.TestCase):
     """A cached bound folds an append only when it was stamped at the append's
     parent snapshot; otherwise another writer's files are missing from it and
-    it must be dropped (node 65, 2026-09-28: hi=2490119 cached vs 2494785)."""
+    it must be dropped."""
 
     def _table(self, snap, parent):
         class Snap:  # minimal pyiceberg snapshot
@@ -1347,7 +1343,7 @@ class TestBoundsFoldOnlyOntoParentSnapshot(unittest.TestCase):
 
 class TestFactFkMaxCountsDimensionReferences(unittest.TestCase):
     """income_band keys must be issued above household_demographics'
-    hd_income_band_sk too, not only above the facts (node 37, 2026-09-28)."""
+    hd_income_band_sk too, not only above the facts."""
 
     def test_dimension_reference_raises_the_floor(self):
         saved = (S._namespace_columns, S.catalog_bounds, dict(S._FACT_FK_MAX))
@@ -1368,7 +1364,7 @@ class TestFactFkMaxCountsDimensionReferences(unittest.TestCase):
 class TestFactKeysStayInsideTheLoadedDimension(unittest.TestCase):
     """Facts draw FK keys from the dimension AS LOADED plus at most one row per
     key this tick's dimension append issued. Uniform 1..current-max let every
-    appended key reach the facts: node 65 (SF1000, 2026-10-03) had call_center
+    appended key reach the facts: an SF1000 run had call_center
     keys up to 340,613 (42 loaded), catalog_sales referenced 1..340,611, and
     q77's catalog legs held 110,322 call-center groups."""
 

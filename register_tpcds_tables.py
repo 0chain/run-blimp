@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # register_tpcds_tables.py — register ALL 24 TPC-DS tables into the kit's Iceberg REST
-# catalog from EXISTING parquet in an S3 bucket (e.g. blimp-tpcds1000-aps1, SF1000).
+# catalog from EXISTING parquet in an S3 bucket (e.g. my-tpcds-bucket).
 #
 # No data copy: pyiceberg `add_files` registers the existing parquet files into a new
 # Iceberg table (schema inferred from the parquet). Blimp (source=customer) then pulls
@@ -8,12 +8,12 @@
 #
 # Usage:
 #   pip install "pyiceberg[s3fs]>=0.10" "pyarrow>=14,<17" s3fs boto3
-#   (>=0.9 required: the sf1000 parquet stores small decimals as INT32/INT64,
+#   (>=0.9 required for parquet that stores small decimals as INT32/INT64,
 #    which pyiceberg 0.7/0.8 add_files rejects)
 #   python3 register_tpcds_tables.py \
 #     --catalog http://<client-priv-ip>:8181 \
 #     --warehouse s3://<your-warehouse-bucket>/wh \
-#     --source-bucket blimp-tpcds1000-aps1 --region ap-south-1 \
+#     --source-bucket my-tpcds-bucket --region us-east-1 \
 #     --namespace tpcds
 #
 # The 24 TPC-DS tables live at s3://<source-bucket>/<table>/**/*.parquet.

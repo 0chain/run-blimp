@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# run_cluster.sh — the customer-runnable slice of the cluster's
-# /opt/cdc/run_bench.sh. Only the 2/1 and 8/1 benchmark tests (warp put/get,
-# 1KiB TTFB, mlperf resnet50), with the SAME specs the in-cluster Blimp
-# "Benchmarks" UI runs — but from this client box against the gateway + NFS.
-# All cluster-internal machinery (summary JSON, /opt/cdc, UI wiring, bucket
-# janitor) is stripped.
+# run_cluster.sh — the storage benchmarks (warp put/get, 1KiB TTFB, mlperf
+# resnet50) with the SAME specs the node panel's "Benchmarks" tab runs, from this
+# client box against the gateway.
 #
-# Prereq: setup_tests.sh installed warp v1.1.4, dlio-benchmark 2.0
-# (/opt/dlio/venv_mlperf); box is in the cluster VPC.
+# Prereq: `blimp --setup` installed warp v1.1.4, mount-s3 and dlio-benchmark
+# (/opt/dlio/venv_mlperf).
 #
 # Usage:
-#   GW=10.10.150.76 NFS=10.10.150.76 EC=2/1 AK=<gw-key> SK=<gw-secret> \
+#   GW=<gateway-ip> EC=2/1 AK=<gw-key> SK=<gw-secret> CLUSTER_TOKEN=<fleet-token> \
 #   ./run_cluster.sh <warp|ttfb|mlperf|all>
 #
-# EC=2/1 or 8/1 selects the same detect_ec params as run_bench. Overrides:
+# EC=2/1 or 8/1 selects the benchmark profile. Overrides:
 #   BENCH_DURATION (30) TTFB_DUR (30) WARP_OBJ_SIZE (96MiB)
 #   MLPERF_NUM_FILES (200) NFS_MNT (/mnt/zusnfs). Disk-fill guard aborts at 90%.
 
@@ -25,51 +22,26 @@ WHAT="${1:-all}"; GW="${GW:?set GW (gateway ip:host w/o port)}"; NFS="${NFS:-$GW
 EC="${EC:-2/1}"; DUR="${BENCH_DURATION:-30}"; TTFB_DUR="${TTFB_DUR:-30}"; MNT="${NFS_MNT:-/mnt/zusnfs}"
 OSZ="${WARP_OBJ_SIZE:-96MiB}"
 
-# --- detect_ec: identical table to /opt/cdc/run_bench.sh ------------------------
+# --- detect_ec: the same table the node panel's benchmark uses -----------------
 #   2/1 -> warp-conc 16,
 #          mlperf resnet50 accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain=34*7
 #   8/1 -> warp-conc 64,
 #          mlperf resnet50 accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain=136*7
 d="${EC%%/*}"; p="${EC##*/}"; [ "${p:-0}" -gt 0 ] 2>/dev/null || p=1  # data / parity shards
-# WARP CONCURRENCY = GATEWAY vCPUs, IDENTICAL to the panel (run_bench.sh
-# EC_CONC=$_gwcpu), so a CLI number and a UI number on the same box are directly
-# comparable. Was a flat 64 in the CLI, which collapsed PUT to ~153 MiB/s on a
-# 12-vCPU box (client contention) — that was the tester's ~143 MiB/s. At 1x
-# vCPUs PUT is ~617 MiB/s / GET ~0.9-1.1 GiB/s. WARP_CONC overrides for a
-# deliberate sweep past the core count.
+# WARP CONCURRENCY = GATEWAY vCPUs, identical to the panel, so a CLI number and
+# a UI number on the same box are comparable. WARP_CONC overrides.
 _gwcpu=$(nproc 2>/dev/null || echo 8)
 if [ "$d" -ge 8 ]; then EC_CONC=$_gwcpu
   EC_DATASET_GB=136; EC_ACCEL="${MLPERF_ACCEL:-6}"; EC_RT=24; EC_PF=48
 else                    EC_CONC=$_gwcpu
-  # 45 GiB set: still > the 32 GiB gateway RAM (so the warp GET / mlperf read can NOT
-  # be served from page cache), but sized to FIT the small 2/1 on-prem allocation
-  # (~64 GiB usable on an 8x12GB cluster). The old 68 GiB overfilled it to 90%+ and
-  # wedged mlperf on the disk-full guard. EC_DATASET_GB override still available.
-  # rt-4/pf-2 (2026-08-28, was 12/24): a fleet of N concurrent mlperf runs at rt-12
-  # saturates the single gateway read path (20-57s/GET) and trips mount-s3's CRT
-  # minimum-throughput guard -> EIO. rt-4/pf-2 cuts per-run read concurrency 3x.
-  # ACCEL DEFAULTS TO 1. It used to derive 3 here and then get guarded back down
-  # to 1 on any client < 16 vCPU or any gateway < .4xlarge — which is the common
-  # case — so the run printed a confusing "accel 1 instead of 3" and the EC-derived
-  # 3 never actually applied. State the default that is really used; MLPERF_ACCEL
-  # still overrides it upward for a big client + big gateway.
-  # DATASET SIZE MUST MATCH THE UI's FORMULA. The panel's bench (zus-cdc
-  # run_bench.sh) uses EC_DATASET_GB = MULT(17) x data-shards, floor 34 — on a
-  # 2/1 cluster that is 34 GB train, ~46 GB with the ~27% eval set. This script
-  # used a flat 45 GB -> ~50.5 GB, and on a 62 GB box that is the difference
-  # between a working set that FITS in cache and one that does not: measured on
-  # node 37 (2026-09-14) the page cache built to 56 GB during generation and
-  # collapsed to 4 GB before the read, giving AU 18.7% / 108 MB/s, while the UI
-  # bench on the identical 65.108.232.28 (same CPU/RAM/NVMe/EC/flags) held
-  # 43.7 GB resident and got AU 97.3% / 557 MB/s. Same formula, same result.
+  # ACCEL DEFAULTS TO 1 (MLPERF_ACCEL overrides for a big client + gateway).
+  # DATASET SIZE MATCHES THE PANEL's FORMULA: EC_DATASET_GB = MULT(17) x
+  # data-shards, floor 34 (34 GB train on 2/1, ~46 GB with the eval set).
   _mult="${BENCH_DATASET_MULT:-17}"; [ "$_mult" -lt 17 ] 2>/dev/null && _mult=17
   EC_DATASET_GB="${EC_DATASET_GB:-$(( _mult * d ))}"
   [ "$EC_DATASET_GB" -lt 34 ] && EC_DATASET_GB=34
-  # READER CONCURRENCY MUST ALSO MATCH THE UI: rt = gateway vCPUs, pf = rt*2
-  # (run_bench.sh line ~1181). This script had a flat rt=4/pf=2, which is 3x/12x
-  # less read concurrency than the panel's bench on the same box — another reason
-  # a CLI number could never be compared to a UI number. MLPERF_RT/MLPERF_PF
-  # override for the fleet-concurrency case the old flat values were chosen for.
+  # READER CONCURRENCY MATCHES THE PANEL: rt = gateway vCPUs, pf = rt*2.
+  # MLPERF_RT/MLPERF_PF override.
   EC_RT="${MLPERF_RT:-$_gwcpu}"; EC_PF="${MLPERF_PF:-$(( EC_RT * 2 ))}"
   EC_ACCEL="${MLPERF_ACCEL:-1}"; fi
 # WARP_CONC overrides the EC-derived warp/ttfb concurrency (e.g. push a 2/1 cluster
@@ -84,10 +56,11 @@ echo "[detect_ec] EC=$EC -> warp-conc=$EC_CONC obj=$OSZ mlperf-accel=$EC_ACCEL r
 # ALSO account for ERASURE-CODING write amplification: every logical GB becomes
 # (d+p)/d physical GB on the blobber disks (EC 2/1 → 1.5×). Capping only against
 # the LOGICAL allocation lets the physical write overrun a small disk even though
-# the guard thinks it left headroom (tester hit disk_full this way). So divide the
+# the guard thinks it left headroom. So divide the
 # cap by (d+p)/d as well, so the PHYSICAL footprint lands at ~80% of the disk.
 # (No cap when the query fails — falls back to the EC default.)
-ALLOC_GB=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage?token=${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}" 2>/dev/null \
+[ -n "${CLUSTER_TOKEN:-}" ] || { echo "FATAL: fleet token required (CLUSTER_TOKEN)"; exit 1; }
+ALLOC_GB=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage" -H "Authorization: Bearer $CLUSTER_TOKEN" 2>/dev/null \
   | grep -oE '"capacity_bytes":[0-9]+' | head -1 | grep -oE '[0-9]+' | awk '{printf "%d",$1/1073741824}')
 if [ "${ALLOC_GB:-0}" -gt 0 ]; then
   # train ≤ alloc × 0.80/1.27 (train+eval) × d/(d+p) (EC amplification)
@@ -102,17 +75,8 @@ W(){ warp "$1" --host="$GW:9000" --access-key="${AK:?set AK}" --secret-key="${SK
 # clean_bkt — remove a warp/ttfb scratch bucket after use (warp --keep-data leaves it
 # on the allocation otherwise; that's what piled up 50+ GiB of warp* buckets). Uses
 # the gateway S3 endpoint via awscli.
-# NEVER `rb` a bucket that does not exist. On a gateway with bucket federation on
-# (MINIO_DOMAIN + MINIO_ETCD_ENDPOINTS — every cluster gateway), a FAILED
-# DeleteBucket used to "restore" the etcd entry it had just deleted, registering a
-# bucket that never existed. ListBuckets is served from those records, so the ghost
-# stayed listed while every per-bucket op 404'd. Since clean_bkt is called BEFORE
-# the warp phases, it minted a phantom for the exact two names warp was about to
-# create — warp's CreateBucket then hit BucketAlreadyOwnedByYou and the whole run
-# died ("you already own it", then "bucket … does not exist" on the GET). Internal
-# warp was unaffected only because run_bench.sh cleans up with `mc rb`.
-# Fixed gateway-side too (zs3 DeleteBucket -> BucketNotFound); this head-bucket
-# guard keeps the suite correct against gateways that predate that fix.
+# NEVER `rb` a bucket that does not exist (older gateways could register a phantom
+# bucket on a failed DeleteBucket); head-bucket first.
 clean_bkt(){ export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=us-east-1
   for b in "$@"; do
     aws s3api head-bucket --bucket "$b" --endpoint-url "http://$GW:9000" >/dev/null 2>&1 || continue
@@ -124,7 +88,7 @@ mount_nfs(){ mountpoint -q "$MNT" && return 0; sudo mkdir -p "$MNT"
   if ! sudo mount -t nfs4 -o nconnect=16,rsize=1048576,wsize=1048576 "$NFS":/ "$MNT"; then
     # Fail LOUD and make callers skip: falling through would run the benchmark
     # against the local disk under the mountpoint dir and report the client box's
-    # speed as the cluster's (observed on an external-mode host, 2026-07-27).
+    # speed as the cluster's.
     echo "SKIP: NFS $NFS:/ unreachable (external-mode host? NFS is VPC-only)"
     return 1
   fi
@@ -138,7 +102,7 @@ bench_ttfb(){ echo "== 1KiB TTFB (PUT conc=$EC_CONC 10s, GET conc=1 ${TTFB_DUR}s
   clean_bkt "$TB"; }
 
 # --- warp PUT + GET, 96MiB objects, conc=EC_CONC (separate, not mixed) ----------
-# run_bench sizes PUT_DUR from a rate probe so the PUT lands the FULL ~EC_DATASET_GB
+# The panel sizes PUT_DUR from a rate probe so the PUT lands the FULL ~EC_DATASET_GB
 # set (> gateway RAM) — a fixed 30s only writes ~24GB and the GET then reads a
 # cache-favorable subset. Match it: probe 8s, set PUT_DUR = budget*1.1/rate (floor DUR).
 bench_warp(){ local BUD=$(( ${WARP_BUDGET_MIB:-$(( EC_DATASET_GB * 1024 ))} ))
@@ -185,9 +149,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # the whole dataset onto the client's own disk — 30 GiB of it, reported as
   # "mlperf write-NFS: N MB/s" as though it had been written to the Blimp node.
   # A cluster write measurement that never touched the cluster. Skip instead.
-  # 2026-08-04: mlperf now writes AND reads over mountpoint-s3 (no NFS) — the
-  # datagen is mounted-s3 too, not just the train read. NFS :2049 is VPC-only
-  # and being retired; mp-s3 is the certified product path. mount-s3 must exist.
+  # mlperf reads over mountpoint-s3 (no NFS); mount-s3 must exist.
   command -v mount-s3 >/dev/null 2>&1 || { echo "!! mlperf SKIPPED: mount-s3 not installed (run 'blimp --setup')"; return 0; }
   # dlio imports mpi4py, which dlopen()s libmpi at startup. Distro OpenMPI is NOT
   # on the default PATH/LD_LIBRARY_PATH (Amazon Linux keeps it under
@@ -227,7 +189,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # path (2nd fails "Failed to create FUSE session"). $$ (this run_cluster.sh PID)
   # is unique per concurrent leg; the dataset BUCKET stays shared (read-only reuse).
   local BKT="${MLPERF_BUCKET:-mlperf-bench}" MPS3="${MPS3_MNT:-/mnt/mps3-$$}" DLIO=/opt/dlio/venv_mlperf/bin/dlio_benchmark
-  # MEMORY GUARD, copied from the cluster (zs3-init.go run_bench). dlio's datagen
+  # MEMORY GUARD (same as the panel's benchmark). dlio's datagen
   # writes through /dev/shm and `mpirun -np ACCEL` spawns ACCEL torch ranks; none
   # of it is memory-bounded, so a run can exhaust RAM and wedge the whole box —
   # which is exactly what happened here (the client stopped answering SSH mid
@@ -251,27 +213,18 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # Stale OpenMPI session dirs make mpirun fail on a rerun; the cluster clears
   # them before every generate.
   rm -rf /tmp/ompi.* /tmp/openmpi-sessions-* /tmp/pmix.* 2>/dev/null || true
-  # EXACT run_bench resnet50 profile (zs3-init line 10936 / train line 11173):
+  # The panel's resnet50 profile:
   #   2/1 -> accel 3 / read_threads 12 / prefetch 24 / batch 1200 / ntrain 34*7=238 / neval 64
   #   8/1 -> accel 6 / read_threads 24 / prefetch 48 / batch 1200 / ntrain 136*7=952 / neval 64
-  # TUNING NOTE (2026-08-04, cluster 1785851761080 / c6in.4xlarge, 66 GB set over
-  # mp-s3): the EC-2/1 default (accel 3 / rt 12 / pf 24) is AU-bound and reads
-  #   1682 MB/s (AU 98%). Bumping to accel 4 / rt 16 / pf 32 lifts it to ~2164 MB/s
-  #   (AU 96%, ~15.4k -> ~19.8k samples/s) — more torch ranks + read threads +
-  #   prefetch depth saturate the read path harder. Override for that run with:
-  #     MLPERF_ACCELS=4 MLPERF_READ_THREADS=16 MLPERF_PREFETCH=32
-  #   (needs a >=16 vCPU client, else the accel-1 mount-s3 OOM guard below forces 1).
-  #   ACID on/off makes ~no difference here (mlperf is AU-bound; see
-  #   devOps/0chain-debug/zs3_acid_concurrent_download_corruption_20260804.md).
+  # More read concurrency on a big client (>=16 vCPU, else the accel-1 guard
+  # below applies): MLPERF_ACCELS=4 MLPERF_READ_THREADS=16 MLPERF_PREFETCH=32
   local ACC="${MLPERF_ACCELS:-$EC_ACCEL}" RT="${MLPERF_READ_THREADS:-$EC_RT}" PF="${MLPERF_PREFETCH:-$EC_PF}"
   # ACCEL 1 ON ANY CLIENT SMALLER THAN A *.4xlarge (16 vCPU).
-  # The EC-derived profile (2/1 -> accel 3) is the CLUSTER's run_bench profile and
+  # The EC-derived profile (2/1 -> accel 3) is the panel's profile and
   # assumes a cluster-sized driver. On a small client it runs `mpirun -np 3`: three
   # torch ranks x RT read threads all pulling through ONE mount-s3 daemon, which
-  # lives OUTSIDE the dlio memory cgroup. On a c6in.large (2 vCPU / 3.8 GB) that
-  # drove mount-s3 to 1.58 GB RSS and the kernel global-OOM-killed it mid-train:
-  #   Out of memory: Killed process 29520 (mount-s3) anon-rss:1579852kB
-  #   -> every rank: "Transport endpoint is not connected", no [METRIC] at all.
+  # lives OUTSIDE the dlio memory cgroup; on a small box the kernel OOM-kills it
+  # mid-train ("Transport endpoint is not connected").
   # accel=1 also skips mpirun entirely (see the `ACC > 1` guard below), so there is
   # no MPI oversubscription of a 2-core box either. MLPERF_ACCELS still overrides.
   local NCPU; NCPU=$(nproc 2>/dev/null || echo 1)
@@ -286,8 +239,7 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   # The small-box case is already covered cloud-agnostically by the client vCPU
   # guard above (accel 1 when nproc < 16) and by the MLPERF_ACCELS override for a
   # known-small gateway. If a gateway-size auto-cap is wanted later, read the
-  # gateway's own core count (it already samples runtime.NumCPU into datalake
-  # node_metering and self-tunes off it) — never a cloud-specific metadata API.)
+  # gateway's own core count — never a cloud-specific metadata API.)
   local BATCH="${MLPERF_BATCH:-1200}" EP="${MLPERF_EPOCHS:-1}"
   local NF="${MLPERF_NUM_FILES:-$(( EC_DATASET_GB * 7 ))}" NE="${MLPERF_NUM_EVAL:-64}"
   export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=us-east-1
@@ -298,12 +250,10 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   sudo mkdir -p "$MPS3"; sudo chown "$(id -u)" "$MPS3"
   grep -qs '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
   fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
-  # mount-s3 refuses a non-empty mountpoint (it fails with a confusing "No such
-  # file or directory (os error 2)" here). A prior run's `mkdir -p $MPS3/resnet50`
-  # can leave a LOCAL resnet50/ dir when $MPS3 was unmounted, so recreate the
-  # mountpoint clean when it is not a live mount.
+  # mount-s3 refuses a non-empty mountpoint. Never delete what is there (it may
+  # be real data under a mistyped MPS3_MNT): refuse and say so.
   if ! mountpoint -q "$MPS3" && [ -n "$(sudo ls -A "$MPS3" 2>/dev/null)" ]; then
-    sudo rm -rf "$MPS3" && sudo mkdir -p "$MPS3"
+    echo "!! mlperf SKIPPED: $MPS3 is not a mountpoint and is not empty — empty it or set MPS3_MNT to an empty directory"; return 0
   fi
   if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
        mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" \
@@ -322,14 +272,9 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     echo "== mlperf resnet50: REUSING existing dataset ($HAVE train files in $NG) =="
   else
     echo "== mlperf resnet50: generate $NF train + $NE eval (~$(( NF*143/1024 ))GiB), native-S3 upload =="
-    # 🚨 DO NOT generate straight into the mp-s3 mount. mountpoint-s3 FUSE WRITE of
-    # large files from a client WEDGES / is ~200x slower than native S3 (measured
-    # 2026-08-05: native warp 913 MB/s vs mp-s3 fio 4.2 MB/s on a c6in.4xlarge
-    # gateway, and mp-s3 fully WEDGED — 0 bytes uploaded, fio stuck in fsync — on a
-    # c6in.large gateway). dlio-over-mp-s3 datagen therefore stalled the whole
-    # suite. Instead: generate to a LOCAL scratch dir (fast local disk), then upload
-    # via `aws s3 cp` (native S3 MULTIPART, the same fast path warp uses). TRAIN
-    # below still READS via mp-s3 ($NG) — mp-s3 READ is fine, only WRITE wedges.
+    # Do NOT generate straight into the mp-s3 mount: FUSE writes of large files
+    # are far slower than native S3. Generate to LOCAL scratch, then upload with
+    # `aws s3 cp` (native multipart). TRAIN below still READS via mp-s3 ($NG).
     local g0 g1 gsec gbytes LG LGBASE
     # dlio generates the WHOLE dataset locally before the native-S3 upload, and
     # the old default (/var/tmp) is the boot disk: a fresh node filled root and
@@ -349,9 +294,8 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     # --metadata zus-dedup=off: keep the bytes on THIS node. dlio's datagen is
     # seeded (np.random.seed(10)) so every node generates identical tfrecords; with
     # fleet dedup the 2nd node's upload binds the names to the FIRST node's blobs and
-    # the train then reads over the WAN (node 37: AU 18% at exactly 1 Gbps while the
-    # holder node read the same set at AU 97%, 2026-09-14). The gateway honors the
-    # flag by also storing a local copy, so this measures the node's own storage.
+    # the train then reads over the inter-node link. The gateway honors the flag
+    # by also storing a local copy, so this measures the node's own storage.
     aws s3 cp "$LG/" "s3://$BKT/resnet50/" --recursive --metadata zus-dedup=off --endpoint-url "http://$GW:9000" --only-show-errors 2>&1 | tail -2
     g1=$(date +%s); gsec=$(( g1 - g0 )); [ "$gsec" -lt 1 ] && gsec=1
     gbytes=$(du -sb "$LG" 2>/dev/null | awk '{print $1+0}')
@@ -379,25 +323,21 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
     fusermount -u "$MPS3" 2>/dev/null || sudo umount -l "$MPS3" 2>/dev/null || true
     # Non-empty mountpoint guard (mount-s3 refuses it — see the datagen mount).
     if ! mountpoint -q "$MPS3" && [ -n "$(sudo ls -A "$MPS3" 2>/dev/null)" ]; then
-      sudo rm -rf "$MPS3" && sudo mkdir -p "$MPS3"
+      echo "!! mlperf SKIPPED: $MPS3 is not a mountpoint and is not empty — empty it or set MPS3_MNT to an empty directory"; return 0
     fi
     # Mount as ROOT with --allow-other. dlio runs inside the memory scope via
     # `sudo systemd-run`, i.e. as root, and a FUSE mount is private to the user
     # that created it — so an ec2-user mount gave every rank
     #   PermissionError: [Errno 13] Permission denied: '/mnt/mps3/resnet50/train'
-    # The cluster never sees this because its whole driver runs as root.
     # --allow-other needs user_allow_other in /etc/fuse.conf; add it if absent.
     grep -qs '^user_allow_other' /etc/fuse.conf || \
       echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null 2>&1 || true
     # --force-path-style: without it, mount-s3 defaults to virtual-hosted-style
     # addressing (bucket prepended to the host, e.g. "$BKT.$GW"). That works by
     # accident when $GW is a bare IP (SDKs special-case IPs to path-style), which
-    # is why this passed in vpc mode — but in external mode $GW is a real
-    # hostname (zus-<id>-0.zus.network) and "$BKT.zus-<id>-0.zus.network" was
-    # never provisioned in DNS, so every request failed with
-    # AWS_IO_DNS_INVALID_NAME (cluster 1785632294645, cross-region client,
-    # 2026-08-02). Path-style is correct for a MinIO-compatible endpoint either
-    # way, so force it unconditionally rather than branch on IP-vs-hostname.
+    # is why this passed in vpc mode — but in external mode $GW is a hostname
+    # and "$BKT.<host>" does not resolve (AWS_IO_DNS_INVALID_NAME). Path-style is
+    # correct for a MinIO-compatible endpoint either way.
     if ! sudo -E env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" \
          mount-s3 --allow-other --force-path-style --endpoint-url "http://$GW:9000" --maximum-throughput-gbps "${MPS3_TPUT_GBPS:-25}" --max-threads "${MPS3_MAX_THREADS:-64}" --allow-delete --allow-overwrite "$BKT" "$MPS3"; then
       echo "!! mlperf SKIPPED: could not mount s3://$BKT at $MPS3 via mountpoint-s3"
@@ -417,11 +357,8 @@ bench_mlperf(){ : "${AK:?set AK}" "${SK:?set SK}"
   local MPIRUN; MPIRUN=$(command -v mpirun || echo /usr/lib64/openmpi/bin/mpirun)
   local L="$DLIO"; [ "$ACC" -gt 1 ] && L="$MPIRUN --allow-run-as-root --bind-to none --use-hwthread-cpus --oversubscribe -np $ACC $DLIO"
   echo "== mlperf resnet50 TRAIN via $IFACE (accel=$ACC rt=$RT pf=$PF batch=$BATCH epochs=$EP) =="
-  # Capture, don't blind-grep. Piping straight into `grep [METRIC]` means a train
-  # step that CRASHES prints absolutely nothing — which is exactly what happened
-  # (2026-08-01): generation succeeded, training died, and the leg emitted only
-  # its banner, so the suite looked like it had simply produced no numbers. Show
-  # the metrics on success; show the tail of the real failure otherwise.
+  # Capture, don't blind-grep: show the metrics on success, the tail of the real
+  # failure otherwise.
   local tout trc xn0 xn
   xn0=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # cross-node window; the Z is required (docker parses a naked ts as host-local time)
   tout=$(MEMRUN "$MLPERF_MEM_CAP" $L workload=resnet50_h100 ++workload.dataset.data_folder="$DF" \

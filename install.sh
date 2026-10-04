@@ -22,21 +22,34 @@ SUDO=''; [ "$(id -u)" -eq 0 ] || SUDO='sudo'
 say "installing blimp from $REPO@$REF into $HOME_DIR"
 $SUDO mkdir -p "$HOME_DIR"
 
+# Never delete the install dir. A non-empty directory is updated in place only
+# when it is our own git checkout or a previous tarball install (marker file);
+# anything else is refused, so a mistyped or shared BLIMP_HOME is never touched.
+MARKER=".blimp-kit"
+is_empty(){ [ -z "$(ls -A "$1" 2>/dev/null)" ]; }
+if ! is_empty "$HOME_DIR" && [ ! -d "$HOME_DIR/.git" ] && [ ! -f "$HOME_DIR/$MARKER" ]; then
+  say "refusing: $HOME_DIR is not empty and is not a blimp install."
+  say "set BLIMP_HOME to an empty or new directory (e.g. BLIMP_HOME=$HOME_DIR/run-blimp)."
+  exit 1
+fi
+
 # Prefer git; fall back to a codeload tarball so a node without git still works.
-if command -v git >/dev/null 2>&1; then
+if command -v git >/dev/null 2>&1 && { [ -d "$HOME_DIR/.git" ] || is_empty "$HOME_DIR"; }; then
   if [ -d "$HOME_DIR/.git" ]; then
     $SUDO git -C "$HOME_DIR" fetch -q origin "$REF" && $SUDO git -C "$HOME_DIR" reset -q --hard "origin/$REF"
   else
-    $SUDO rm -rf "$HOME_DIR"; $SUDO git clone -q --branch "$REF" --depth 1 "$REPO" "$HOME_DIR"
+    $SUDO git clone -q --branch "$REF" --depth 1 "$REPO" "$HOME_DIR"
   fi
 else
-  say "git not found — downloading tarball"
+  say "downloading tarball"
   tmp="$(mktemp -d)"
   curl -fsSL "$REPO/archive/refs/heads/$REF.tar.gz" -o "$tmp/kit.tgz" \
     || curl -fsSL "$REPO/archive/refs/tags/$REF.tar.gz" -o "$tmp/kit.tgz"
   tar -xzf "$tmp/kit.tgz" -C "$tmp"
-  $SUDO rm -rf "$HOME_DIR"; $SUDO mkdir -p "$HOME_DIR"
-  $SUDO cp -R "$tmp"/*/* "$HOME_DIR"/; rm -rf "$tmp"
+  # Copy over (overwrites kit files, deletes nothing), then mark it as ours.
+  $SUDO cp -R "$tmp"/*/. "$HOME_DIR"/
+  $SUDO touch "$HOME_DIR/$MARKER"
+  rm -rf "$tmp"
 fi
 
 $SUDO chmod +x "$HOME_DIR/blimp" "$HOME_DIR"/*.sh 2>/dev/null || true

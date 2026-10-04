@@ -14,17 +14,16 @@ ok(){ PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n     want: %s\n     got:  %s\n' "$1" "$2" "$3"; }
 eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1" "$2" "$3"; }
 
-echo "== origin endpoint plumbing (run_router.sh / test_cache.sh) =="
+echo "== origin endpoint plumbing =="
 # A blank S3_ENDPOINT must mean AWS (no flag). A non-blank one MUST produce the
-# flag: without it every origin call silently went to real AWS and MinIO
-# answered InvalidAccessKeyId, so the cache leg reported "no objects".
+# flag: without it every origin call silently goes to AWS.
 oep(){ [ -n "${1:-}" ] && printf -- '--endpoint-url %s' "$1" || printf ''; }
 eq "blank endpoint -> no flag (AWS + IAM role)" ""                                  "$(oep '')"
 eq "minio endpoint -> flag"  "--endpoint-url http://10.0.0.1:9000"                  "$(oep 'http://10.0.0.1:9000')"
 eq "aws endpoint  -> flag"   "--endpoint-url https://s3.ap-south-1.amazonaws.com"   "$(oep 'https://s3.ap-south-1.amazonaws.com')"
 
 echo
-echo "== cache set sizing (run_router.sh) =="
+echo "== cache set sizing =="
 # The bar is per-blobber shard share > per-blobber RAM. At EC 2/1 a logical N
 # GiB set is ~N/2 per blobber; below blobber RAM the "hit" is served from the
 # blobbers' page cache and no client-side number reveals it.

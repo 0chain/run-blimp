@@ -6,15 +6,12 @@
 #   C. Test dataset      — TPC-DS SF1 (default) / SF10 / SF100 / SF1000 | none
 #
 # OFFLINE BY DESIGN. Every network call is stubbed, so this runs in CI with no
-# cluster, no docker and no AWS. The stubs reproduce REAL responses captured from
-# a live gateway (node 37, 2026-09-13) — in particular Nessie's 500 for an unknown
-# warehouse, which is what makes the warehouse a NAME and not an s3:// path.
+# cluster, no docker and no AWS. The stubs reproduce real gateway responses — in
+# particular Nessie's 500 for an unknown warehouse, which is what makes the
+# warehouse a NAME and not an s3:// path.
 #
 #   ./test_setup_options.sh          run all
 #   ./test_setup_options.sh -v       show each assertion
-#
-# The live end-to-end (generate -> register -> --storage -> --query) is a
-# different thing and lives in test_setup_e2e.sh.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VERBOSE=0; [ "${1:-}" = -v ] && VERBOSE=1
@@ -29,7 +26,7 @@ case_(){ printf '\n\033[1m%s\033[0m\n' "$*"; }
 # ---------------------------------------------------------------- stubs ----
 # Nessie's real shapes. /v1/config answers for a KNOWN warehouse name and 500s
 # for anything else; /admin/credentials carries the fleet address + keys.
-FLEET_URL_STUB="https://fleet-8429413131.blimp.software:9443"
+FLEET_URL_STUB="https://fleet-1234567890.blimp.software:9443"
 NESSIE_OK=1        # flip to 0 to simulate an unreachable :19122
 FLEET_OK=1         # flip to 0 to simulate fleet mode off / old gateway
 KNOWN_WAREHOUSE=mv
@@ -160,6 +157,12 @@ done
 reset; BUILD_DATASET=2; choose_dataset >/dev/null 2>&1
 eq "$BUILD_DATASET" "0" "C 'no' -> bring your own data"
 
+# A pre-set BLIMP_SF skips the scale-factor prompt and is used as given.
+reset; BUILD_DATASET=1; BLIMP_SF=10; SF_CHOICE=1; choose_dataset >/dev/null 2>&1
+eq "$BLIMP_SF" "10" "pre-set BLIMP_SF=10 wins over the picker"
+reset; BUILD_DATASET=1; BLIMP_SF=1000; choose_dataset >/dev/null 2>&1
+eq "$BLIMP_SF" "1000" "pre-set BLIMP_SF=1000 is used without a prompt"
+
 # ================================================ registration wiring =======
 # The registrar takes the warehouse NAME for Nessie and the s3:// path for a
 # plain REST catalog. Sending a path to Nessie is a hard 500, so this mapping is
@@ -185,20 +188,19 @@ pfx_path=""; [ -n "${ICEBERG_PREFIX:-}" ] && pfx_path="/$ICEBERG_PREFIX"
 eq "$pfx_path" "" "before standup, the local catalog has no prefix yet"
 
 # The WAREHOUSE that reaches the gateway is the same value the registrar uses,
-# because /admin/source/configure sends it as IRC_URL "<url>|<warehouse>". A
-# first E2E on node 37 wired the Nessie URL with "s3://blimp-e2e/wh" — a
-# warehouse Nessie does not know — which would 500 every source read. The
-# default must therefore be the NAME whenever the Nessie catalog is in play.
+# because /admin/source/configure sends it with the catalog URL. An s3:// path
+# is a warehouse Nessie does not know and would fail every source read, so the
+# default must be the NAME whenever the Nessie catalog is in play.
 case_ "warehouse sent to /admin/source/configure"
 reset; CATALOG_CHOICE=1; choose_catalog >/dev/null 2>&1
-ORIGIN_BUCKET=blimp-e2e
+ORIGIN_BUCKET=example-bucket
 WAREHOUSE=$(ask WAREHOUSE "  w" "${ICEBERG_WAREHOUSE:-${ORIGIN_BUCKET:+s3://$ORIGIN_BUCKET/wh}}" 2>/dev/null)
 eq "$WAREHOUSE" "mv" "Nessie chosen -> warehouse defaults to the NAME, not an s3:// path"
 
 reset; CATALOG_CHOICE=2; choose_catalog >/dev/null 2>&1
-ORIGIN_BUCKET=blimp-e2e
+ORIGIN_BUCKET=example-bucket
 WAREHOUSE=$(ask WAREHOUSE "  w" "${ICEBERG_WAREHOUSE:-${ORIGIN_BUCKET:+s3://$ORIGIN_BUCKET/wh}}" 2>/dev/null)
-eq "$WAREHOUSE" "s3://blimp-e2e/wh" "local catalog -> warehouse is the s3:// path"
+eq "$WAREHOUSE" "s3://example-bucket/wh" "local catalog -> warehouse is the s3:// path"
 
 # ===================================================== standup_data leg =====
 # The fleet leg must be selected by BLIMP_DATA_TARGET and must refuse to run
@@ -236,12 +238,31 @@ else bad "WAREHOUSE clobber guard missing"; fi
 # fleet token rewrites the file but cannot rewrite a running container's env, so
 # healing from the env pins a stale token and every admin call 401s.
 case_ "heal_wiring token source"
-if grep -q "cat /opt/0chain/zs3server/environment/admin_token" "$HERE/blimp"; then
-  ok "heal_wiring reads the live admin_token file"
-else bad "heal_wiring does not read the live token file"; fi
-if sed -n '/^heal_wiring(){/,/^}/p' "$HERE/blimp" | grep -q 'tok=$(cat /opt/0chain'; then
+if sed -n '/^node_token(){/,/}/p' "$HERE/blimp" | grep -q "cat /opt/0chain/zs3server/environment/admin_token"; then
+  ok "node_token reads the live admin_token file"
+else bad "node_token does not read the live token file"; fi
+if sed -n '/^heal_wiring(){/,/^}/p' "$HERE/blimp" | grep -q 'tok=$(node_token)'; then
   ok "the file is tried BEFORE the container env"
 else bad "the container env still wins over the file"; fi
+# --setup must obtain the token on the node BEFORE anything calls the gateway.
+SETUP=$(sed -n '/^cmd_setup(){/,/^}/p' "$HERE/blimp")
+tl=$(printf '%s\n' "$SETUP" | grep -n 'CLUSTER_TOKEN=$(node_token)' | head -1 | cut -d: -f1)
+cl=$(printf '%s\n' "$SETUP" | grep -n '^  choose_source_location' | head -1 | cut -d: -f1)
+if [ -n "$tl" ] && [ -n "$cl" ] && [ "$tl" -lt "$cl" ]; then ok "--setup reads the node token before fleet_creds"
+else bad "--setup does not read the node token before fleet_creds"; fi
+
+# ================================================== secrets + transport =====
+case_ "secrets are not printed, the token travels as a header"
+ENVF_T=$(mktemp)
+printf 'GW=gw.example\nCLUSTER_TOKEN=tok123\nGW_AK=ak\nGW_SK=sk123\nS3_KEY=k123\nS3_SECRET=s123\nEMPTY_TOKEN=\n' > "$ENVF_T"
+out=$(ENVF="$ENVF_T" usage 2>/dev/null)
+for v in tok123 sk123 k123 s123; do
+  case "$out" in *"$v"*) bad "help prints a secret value ($v)" ;; *) ok "help masks $v" ;; esac
+done
+case "$out" in *"GW=gw.example"*) ok "help still shows non-secret wiring" ;; *) bad "help hides non-secret wiring" ;; esac
+rm -f "$ENVF_T"
+if grep -v '^[[:space:]]*#' "$HERE/blimp" "$HERE"/*.sh | grep -q 'token=\$'; then
+  bad "a ?token= query string is still sent"; else ok "no ?token= query strings"; fi
 
 # ========================================================= registrar ========
 case_ "register_tpcds_tables.py flags"
@@ -270,9 +291,9 @@ rm -rf "$QT_TMP"
 # legacy zus-<id>-0.zus.network was hardcoded here and no longer resolves at
 # all, so a client that could not discover the gateway was handed a dead name.
 case_ "public gateway default"
-g=$(pub_gw_default 1789320141035)
+g=$(pub_gw_default 1700000000000)
 case "$g" in
-  blimp-1789320141035-0.blimp.software) ok "prefers blimp-<id>-0.blimp.software ($g)" ;;
+  blimp-1700000000000-0.blimp.software) ok "prefers blimp-<id>-0.blimp.software ($g)" ;;
   *) bad "public default is not the current pattern: $g" ;;
 esac
 g2=$(pub_gw_default 9999999999999)   # resolves nowhere → still the current pattern
@@ -284,9 +305,8 @@ esac
 [ "$FAIL" = 0 ]
 
 # ---------------------------------------------------- scale factors ----
-# A fresh cloud node reported (2026-09-15) that the SF picker stopped at SF1000.
 # The generator is duckdb's dsdgen(sf=N), which takes any N; the only real limit
-# is local scratch, which scratch_pick() now checks up front.
+# is local scratch, which scratch_pick() checks up front.
 case_ "scale factors offered"
 
 SF_BLOCK=$(sed -n '/pick SF_CHOICE/,/esac/p' "$HERE/blimp")
@@ -300,10 +320,8 @@ DUPES=$(printf '%s' "$SF_BLOCK" | grep -o 'BLIMP_SF=[0-9]*' | sort | uniq -d)
 eq "$DUPES" "" "each menu entry maps to a distinct scale factor"
 
 # ------------------------------------------- gateway-S3 source option ----
-# Reported: with the fleet endpoint unreachable, the only other route stood up a
-# MinIO container on :9000 — a Docker Hub pull a locked-down box refuses, and a
-# port collision with the gateway's own minioserver. The node's own gateway S3
-# is right there.
+# With the fleet endpoint unreachable, the node's own gateway S3 must be offered
+# (no MinIO container to pull, no :9000 collision).
 case_ "dataset source options"
 
 SRC_BLOCK=$(sed -n '/choose_source_location(){/,/^}/p' "$HERE/blimp")
@@ -346,8 +364,7 @@ for site in 'FLEET_ENDPOINT="$(endpoint_local' 'reg_ep="--s3-endpoint $(endpoint
 done
 
 # ------------------------------------------------------- scratch space ----
-# The mlperf leg wrote ~33 GiB to /var/tmp (boot disk) and aborted the whole
-# suite with ENOSPC after earlier legs had already produced numbers.
+# Local staging must not default to the boot disk.
 case_ "local scratch is sized before it is used"
 
 [ -f "$HERE/scratch_dir.sh" ] && ok "scratch_dir.sh present" || bad "scratch_dir.sh missing"
@@ -364,24 +381,17 @@ else
 fi
 
 # ------------------------------------------------------ cloud portability ----
-# IMDS is AWS-only; other clouds answer the same URL with an HTML error page,
-# which used to be stored as an IP/region and printed mid-run.
+# IMDS is AWS-only; other clouds answer the same URL with an HTML error page.
 case_ "non-AWS clouds"
 
 grep -q 'imds_ipv4' "$HERE/blimp" \
   && ok "IMDS responses are shape-checked before use" \
   || bad "IMDS responses used unvalidated"
-sed -n '/placement\/region/,+2p' "$HERE/run_cluster.sh" | grep -q 'a-z\]\[a-z\]-' \
-  && ok "region is shape-checked before use" || bad "region used unvalidated"
 
 
 # ------------------------------------------------- CLI vs UI comparability ----
-# The panel runs run_bench.sh (embedded in zs3-init.go); the CLI runs
-# run_cluster.sh. They measure the same box, so their knobs must agree or the two
-# numbers are not comparable — which is exactly what was reported. warp
-# concurrency was the outlier: a flat 64 (>=8 shards) / 16 in the CLI against the
-# panel's "gateway vCPUs", i.e. 8x apart on an 8-vCPU gateway, on the single knob
-# that most moves the result.
+# The panel's benchmark and the CLI's run_cluster.sh measure the same box, so
+# their knobs must agree or the two numbers are not comparable.
 case_ "CLI benchmark knobs match the panel's"
 
 RC="$HERE/run_cluster.sh"

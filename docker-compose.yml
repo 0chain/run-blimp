@@ -17,7 +17,7 @@
 # a server-configured NAME) — so a kit standing up one catalog while the node
 # ran another meant every consumer had to branch on which it was talking to.
 #
-#   export CLUSTER_ID=1789395562780 ORIGIN_BUCKET=my-bucket
+#   export CLUSTER_ID=1700000000000 ORIGIN_BUCKET=my-bucket
 #   export S3_ENDPOINT=http://minio:9000 S3_KEY=… S3_SECRET=…   # any S3-compatible store
 #   docker compose up -d nessie              # catalog comes up on :8181
 #   docker compose run --rm blimp --setup    # connect + save wiring (once)

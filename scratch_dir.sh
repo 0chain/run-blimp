@@ -5,10 +5,7 @@
 # the BOOT disk: the TPC-DS generator to /tmp/_sf<N>.duckdb and $HOME/.blimp_sf<N>,
 # the mlperf leg to /var/tmp/mlperf-gen. On a cloud VM the boot disk is small and
 # the data disk is the big one, so the bigger scale factors fill root and die
-# mid-run. Reported from a fresh node (2026-09-15): the mlperf leg wrote ~33 GiB
-# of scratch to /var/tmp, hit "No space left on device", and the whole suite
-# aborted with "no leg produced numbers" — after the earlier legs had already
-# produced good numbers.
+# mid-run.
 #
 # Two rules:
 #   1. An explicit override always wins. The operator knows their box.

@@ -15,44 +15,16 @@ Warehouse = your warehouse, Namespace = tpcds. Leave S3 keys blank if the Blimp
 cluster runs in the same AWS account (it reads via its instance role).
 
 ================================ WHY THIS SHAPE ===============================
-Everything below exists because a delta whose values are wrong is INDISTINGUISH-
-ABLE from a delta that is missing: the merge runs, reports a time, and computes
-nothing. Four separate mechanisms produced 0-row deltas on real runs:
+A delta whose values are wrong is INDISTINGUISHABLE from a delta that is
+missing: the merge runs, reports a time, and computes nothing. So:
 
- 1. MISSING COLUMNS. The generator carried a hand-maintained subset of each
-    fact's columns and conform_to_table_schema null-filled the rest. NULL never
-    satisfies an equi-join, so any query joining on an omitted key saw an empty
-    delta. Measured on test2 SF1000 (2026-08-04): store_sales appends had NULL
-    ss_ticket_number / ss_net_paid / ss_sold_time_sk / ss_hdemo_sk, so q24's
-    15,233 ms "merge" and q88's 2,346 ms "merge" both produced 0-row delta parts.
-    FIX: generate EVERY physical column of the fact, driven off the table's own
-    schema. A hand-maintained column list is a bug generator; there is no list.
-
- 2. OUT-OF-RANGE DATES. The date_sk range was hardcoded to year 2000
-    (2451545..2451910) while q4's MV filters d_year IN (2001, 2002) — disjoint,
-    so q4's merge left its MV at exactly 53,491,237 rows. FIX: --years.
-
- 3. OUT-OF-RANGE DIMENSION KEYS. Every dimension key range was a hardcoded
-    guess. Two ways that silently drops rows:
-      - too HIGH: ss_promo_sk used randint(1,1800) but SF1000's promotion tops
-        out at p_promo_sk=1500 (measured), so ~20% of the delta could not join
-        promotion at all;
-      - too HIGH FOR THE SCALE: item is 300,000 rows at SF1000 but 18,000 at
-        SF1, so the same randint(1,300000) drops ~94% of every item join on the
-        SF1 box.
-    FIX: read each dimension's real key range from the CATALOG at run time
-    (iceberg manifest lower/upper bounds — no data scan, measured 0.02s/table).
-
- 4. COLLIDING SYNTHETIC KEYS. ss_ticket_number was a module constant and
-    cs_order_number was random.randint(1e9, 9e9): the second append reissued the
-    first append's tickets, and the random order-number window overlapped the
-    base's real range (max 8,859,306,610, measured). Duplicate keys make the
-    sales x returns join fan out, so the "delta" is wrong rather than empty.
-    FIX: key base = (current max in the table) + 1, read from manifest bounds.
-
-Plus: web_returns was not a recognised --table at all. It fell through to the
-store_returns branch, which built sr_* columns and add_files'd them into
-web_returns — every wr_* column NULL, i.e. a 100%-dead delta.
+ 1. EVERY physical column of a table is generated, driven off its own schema
+    (a NULL join key empties the delta).
+ 2. Dates span the queried years (--years).
+ 3. Dimension key ranges are read from the CATALOG at run time (Iceberg
+    manifest lower/upper bounds — no data scan), so keys join at any scale.
+ 4. Synthetic keys continue from the table's current max + 1, so appends never
+    reissue a key.
 """
 import argparse, bisect, random, decimal, os, json
 DRY_RUN = False   # --dry-run: build + conform every delta, write nothing
@@ -64,8 +36,7 @@ DRY_RUN = False   # --dry-run: build + conform every delta, write nothing
 # ---------------------------------------------------------------------------
 # Pure generation helpers (no pyarrow / no catalog) so they can be unit-tested.
 #
-# d_year -> inclusive d_date_sk bounds. Verified against the SF1000 date_dim on
-# test2 (2026-08-04): SELECT d_year, min(d_date_sk), max(d_date_sk) ... .
+# d_year -> inclusive d_date_sk bounds (the TPC-DS date_dim calendar).
 # ---------------------------------------------------------------------------
 YEAR_DATE_SK = {
     1998: (2450815, 2451179), 1999: (2451180, 2451544), 2000: (2451545, 2451910),
@@ -76,11 +47,7 @@ def date_sk_bounds(years):
     """Inclusive (lo, hi) d_date_sk span covering every year in `years`.
 
     The delta must land inside the *queried* year filter or the merge silently
-    computes nothing. Measured on test2 2026-08-04: the hardcoded 2000-only span
-    (2451545..2451910) put every appended row outside q4's `d_year IN (2001,2002)`
-    MV filter, so q4's 7.3s "incremental merge" added 0 rows and left the MV at
-    exactly 53,491,237. Spanning 2000-2002 by default keeps the d_year=2000
-    queries fed AND gives q4 a non-empty delta."""
+    computes nothing; the default spans 2000-2002."""
     lo = min(YEAR_DATE_SK[y][0] for y in years)
     hi = max(YEAR_DATE_SK[y][1] for y in years)
     return lo, hi
@@ -89,8 +56,7 @@ def date_sk_bounds(years):
 # Canonical TPC-DS fact schemas. Used to CREATE a fact that does not exist yet,
 # and to let the generator run in unit tests with no catalog. When the table DOES
 # exist its own schema wins — these are a fallback, never the source of truth.
-# Kinds: i=int32, l=int64, d=decimal(7,2). Dumped from the SF1000 catalog on
-# test2 (2026-08-04); identical to the TPC-DS 2.x spec.
+# Kinds: i=int32, l=int64, d=decimal(7,2). The TPC-DS 2.x spec.
 # ---------------------------------------------------------------------------
 def _cols(spec):
     return [(n, k) for k, names in spec for n in names.split()]
@@ -209,22 +175,15 @@ DIM_BY_SUFFIX = [
     ("web_page_sk",     ("web_page", "wp_web_page_sk")),
     ("web_site_sk",     ("web_site", "web_site_sk")),
     ("reason_sk",       ("reason", "r_reason_sk")),
-    # income_band was missing: own_key_of("income_band") returned None, so
-    # append_table() never looked up the max and gen_table_cols() filled
-    # ib_income_band_sk with randint(1, 1000) every tick — 56,352 live rows over
-    # 1,000 distinct keys on node 37 (2026-09-25). hd_income_band_sk (its only
-    # FK) was the same noise, mostly above the real max so it never joined.
+    # income_band must be listed so its own key continues from the table max.
     ("income_band_sk",  ("income_band", "ib_income_band_sk")),
 ]
 
 # LAST-RESORT dimension key ranges, used only when neither the catalog stats nor
 # a column scan can be read (i.e. the table is unreachable, not merely
-# stats-less). These are SF1000 values and are WRONG at every other scale:
-# measured against the TPC-DS row counts they over-state item by 94% at SF1,
-# 66% at SF10 and 32% at SF100, and customer by 99/96/83%. A key drawn above a
-# dimension's real max cannot join, so using these silently folds most of the
-# delta away — at SF1 to zero (visible), at SF100 to a plausible-looking but
-# wrong number (worse). scan_dim_hi() exists so this is essentially never hit.
+# stats-less). These are SF1000 values and are WRONG at every other scale (a key
+# above a dimension's real max cannot join). scan_dim_hi() exists so this is
+# essentially never hit.
 FALLBACK_DIM_HI = {
     "date_dim": 2488070, "time_dim": 86399, "item": 300000, "customer": 12000000,
     "customer_demographics": 1920800, "household_demographics": 7200,
@@ -234,14 +193,10 @@ FALLBACK_DIM_HI = {
 }
 
 # FACTS REFERENCE THE DIMENSION AS LOADED, plus a bounded handful of new keys.
-# Foreign keys used to be drawn uniformly over 1..CURRENT max, so every key a
-# tick appended (and every key issued above fact_fk_max) was referenced by the
-# next tick's thousands of fact rows, and the facts' FK NDV grew with the run.
-# Measured on node 65 (SF1000, 2026-10-03): call_center held 991 rows over keys
-# up to 340,613 (SF1000 has 42) and catalog_sales referenced 1..340,611, so
-# q77's catalog legs carried 110,322 / 8,419 call-center groups and its
-# cs x cr cross join was 0.93B rows. The draw range is now the dimension's
-# key max in its EARLIEST snapshot (the loaded dataset, base_dim_hi), and the
+# Drawing foreign keys over 1..CURRENT max would let every appended key be
+# referenced by later ticks, growing the facts' FK NDV with the run. The draw
+# range is the dimension's key max in its EARLIEST snapshot (the loaded
+# dataset, base_dim_hi), and the
 # keys this tick's append issued (FRESH_KEYS) are referenced by at most one
 # row each, only while the dimension's appended rows are within DIM_GROWTH of
 # its base row count — so a fact's FK NDV is bounded by base * (1 + DIM_GROWTH).
@@ -255,33 +210,15 @@ FRESH_KEYS = {}   # dimension -> keys this tick's append issued that facts may r
 #    "date_by_col": {fact_col: [...]},      union, keyed by the fact column
 #    "queries": [{"name", "date_by_col", "date_sk", "dims"}, ...]}
 #
-# WHY PER-QUERY AND PER-COLUMN, not one flat list (measured 2026-09-19, q72 on
-# node 1788402989672). q72's MV bakes `d1.d_year = 1999`; the gateway's bounds
-# prover refused every tick with
-#     kterm_dimfilter_empty: Δcatalog_sales.cs_sold_date_sk ∈ [2451545,2452640]
-#     vs date_dim.d_date_sk under "d1.d_year = 1999" ∈ [2451180,2451544]
-#     — disjoint, the term contributes no rows
-#     delta_noop: the Δ terms produced 0 rows — no part written
-# 2451545..2452640 is exactly date_sk_bounds([2000,2001,2002]), i.e. the UNIFORM
-# default: no date window reached the sold-date column at all. Two defects made
-# that possible and both are structural, not q72-specific:
-#   1. the pool was ONE list for every fact column. q72 filters cs_sold_date_sk
-#      (via date_dim d1) and q67 filters ss_sold_date_sk (via the bare
-#      date_dim); unioned, each query's own fact gets only a share of its window
-#      and a query whose date_dim instance is NOT the one joined to the sold
-#      date (q72 has three: d1 sold, d2 inventory, d3 ship) gets nothing usable.
-#   2. every column was drawn from the union INDEPENDENTLY, so a row could take
-#      its date from q67 and its demographics keys from q72 and satisfy neither.
-#      q72's MV needs d_year=1999 AND cd_marital_status='D' AND
-#      hd_buy_potential='>10000' on the SAME row.
-# Fix: each appended row is OWNED by one query (round-robin over the queries
-# that constrain this table) and draws its date and its dimension keys from that
+# WHY PER-QUERY AND PER-COLUMN, not one flat list: a query's filters must all
+# hold on the SAME row, and each fact date column has its own window. Each
+# appended row is OWNED by one query (round-robin over the queries that
+# constrain this table) and draws its date and its dimension keys from that
 # query's pools. Columns no query constrains keep the uniform draw.
 KEY_POOLS = {"date_sk": [], "dims": {}, "date_by_col": {}, "queries": []}
 
 # Lines describing which window each date column drew from, drained and printed
-# by append_fact / append_table. A structural no-op is then visible IN THE TICK
-# LOG instead of only in the gateway's refusal three minutes later.
+# by append_fact / append_table, so a structural no-op is visible in the tick log.
 DATE_REPORTS = []
 
 
@@ -437,8 +374,7 @@ def draw_dim(dimtbl, n, owners, lo, hi, rnd):
 
 def date_window_report(table, col, vals, prov):
     """One line: which window each row was dated from and how many of the whole
-    append landed inside it. `0/N in window` is the structural no-op, stated at
-    append time instead of three minutes later in the gateway's refusal."""
+    append landed inside it. `0/N in window` is the structural no-op."""
     parts = []
     for label, (pool, drawn, lo, hi) in prov.items():
         if not pool:
@@ -468,16 +404,8 @@ def own_key_of(table):
     dim_for() resolves FACT columns by suffix, so it cannot name a dimension's
     own key when that key does not carry the suffix: "hd_demo_sk" ends in
     "_demo_sk", not "hdemo_sk", and likewise "cd_demo_sk". Both callers that
-    ask "which of this table's columns is its PK" were using dim_for() and got
-    None, so the demographics dims never issued fresh keys — gen_table_cols
-    filled the PK with int noise and append_table skipped its bounds lookup.
-
-    Measured on the node 2026-09-21: household_demographics held 62,320 rows
-    over 7,200 distinct hd_demo_sk (8.66x duplication, max never past 7,200),
-    and its 6-row tick appends carried random keys in 25..943. A re-used key is
-    reachable from pre-append facts, so the RI-prune gate must refuse the dim
-    delta and the merge pays a fact scan instead of a metadata comparison —
-    q72's chart merge ran 95-170 s for 785 delta rows.
+    ask "which of this table's columns is its PK" use this instead, so the
+    demographics dims issue fresh keys too.
     """
     return next((k for _s, (t, k) in DIM_BY_SUFFIX if t == table), None)
 
@@ -501,12 +429,8 @@ def date_after(d, lo_gap, hi_gap, date_max, rnd):
     """A date key `lo_gap`..`hi_gap` days after `d`, never past `date_max`.
 
     A derived date (ship after sale, return after sale) must name a date_dim
-    row that EXISTS: a key past the table's max is issued to a later tick's
-    date_dim append, so pre-append facts reference it and the RI-prune proof
-    correctly refuses the dimension delta. Unbounded, sold+2..90 put web_sales
-    ship keys up to 2490639 while the next date_dim append started at 2490560,
-    and q94/q95's key-local lane declined into a 46-57 s rebuild every tick
-    (node 144, SF1000, 2026-09-28)."""
+    row that EXISTS: a key past the table's max would be issued to a later
+    tick's date_dim append while pre-append facts already reference it."""
     lo, hi = d + lo_gap, min(d + hi_gap, date_max)
     if lo > hi:
         return min(d, date_max)
@@ -609,15 +533,9 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
         # net_paid_inc_tax differ from net_paid + ext_tax by a cent per row —
         # which at 50k rows is a ~£250 discrepancy the MV verifier would flag
         # against a source that computes the composite exactly.
-        # Ranges MEASURED off the real SF1 store_sales manifest bounds
-        # (2026-08-04): wholesale_cost 1.00..100.00, list_price 1.00..200.00,
-        # sales_price 0.00..199.56, ext_sales_price 0..19308, ext_list_price
-        # ..19984. A markup of up to 3x put list_price at 299 and
-        # ext_sales_price at 27,823 — outside anything the real fact contains,
-        # which silently biases every query with a literal value band
-        # (q13's ss_sales_price BETWEEN 50 AND 150, q28's list-price bands,
-        # q48's net-profit bands): the delta lands mostly OUTSIDE the band the
-        # MV filters on, so the merge sees far fewer rows than it should.
+        # Ranges follow the TPC-DS fact: wholesale_cost 1.00..100.00, list_price
+        # 1.00..200.00, sales_price 0.00..~200. Values outside them bias every
+        # query with a literal value band (the delta lands outside the band).
         Q = lambda xs: [_q(x) for x in xs]
         wholesale = Q(rnd.uniform(1, 100) for _ in range(n))
         listp = Q(float(w) * rnd.uniform(1.0, 2.0) for w in wholesale)
@@ -699,10 +617,8 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
     """Returns rows that actually reference the sales rows just appended.
 
     Every returns fact joins its parent on (item_sk, ticket/order number). Rows
-    generated INDEPENDENTLY of the sales (the old behaviour for store_returns,
-    and web_returns had no generator at all) never match, so the delta merge
-    scans both facts and produces nothing — measured on test2 2026-08-04 as
-    q24's 15,233 ms, 0-row "merge". Dimension keys, dates and money are all
+    generated INDEPENDENTLY of the sales never match, so the delta merge scans
+    both facts and produces nothing. Dimension keys, dates and money are all
     derived from the parent sale so the pair is internally consistent."""
     rfact, keypairs = RETURNS_OF[sales_fact]
     names = [c[0] for c in returns_columns]
@@ -773,7 +689,7 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
 
 
 # ---- backwards-compatible thin wrappers (older tests / callers) ------------
-# SF1000's base store_sales tops out at ss_ticket_number=240,000,000 (measured).
+# SF1000's base store_sales tops out at ss_ticket_number=240,000,000.
 # Only a default for the pure-python wrapper: the real append reads the CURRENT
 # max from the catalog so repeat appends never reissue a ticket.
 TICKET_BASE = 240_000_001
@@ -843,9 +759,8 @@ def _step(name, t0):
 
 
 # BOUNDS CACHE, keyed by the table's snapshot. catalog_bounds reads EVERY
-# manifest of the table; the tick calls it for every table on every run, and a
-# table gains one manifest per tick, so the cost grew without bound: 190.7 s of
-# a 322 s tick on node 37 (2026-09-24). The (lo, hi) of a column only moves
+# manifest of the table, and a table gains one manifest per tick, so the cost
+# grows with the run. The (lo, hi) of a column only moves
 # when rows are added, and the tick itself adds them — so the cache is updated
 # from the appended rows (_bounds_after_append) and stamped with the snapshot
 # that append produced. Any other writer moves the snapshot, which misses the
@@ -926,12 +841,8 @@ def _bounds_after_append(t, data, n):
             # FOLD ONLY ONTO THE SNAPSHOT THIS APPEND EXTENDS. A cached bound
             # stamped at an older snapshot misses whatever another writer
             # appended in between; folding this append into it and stamping
-            # the new snapshot made the miss permanent. On node 65 the cache
-            # held store_sales.ss_sold_date_sk hi=2490119 while the manifests
-            # reached 2494785, so fact_fk_max() under-read, date_dim keys were
-            # issued from 2490328 (below keys old facts already reference)
-            # and every q51 tick's RI prune fell to a probe (2026-09-28).
-            # Dropped here, the bound is re-read from the manifests next time.
+            # the new snapshot would make the miss permanent. Dropped here,
+            # the bound is re-read from the manifests next time.
             if parent is None or c.get("snap") != parent:
                 del b[key]
                 continue
@@ -958,8 +869,7 @@ def _bounds_after_append(t, data, n):
 def _catalog_bounds(cat, namespace, table, col, min_rows=0, snapshot_id=None):
     """(min, max) of `col` read from ICEBERG MANIFEST STATISTICS — no data scan.
 
-    Measured on test2 SF1000 (2026-08-04): 0.01-0.22s per table even for the
-    450-file store_sales, because it only reads manifest lower/upper bounds.
+    It only reads manifest lower/upper bounds, so it is fast at any size.
     Returns (None, None) when the table or its stats are unavailable, so every
     caller must have a fallback."""
     try:
@@ -1003,7 +913,7 @@ def _scan_dim_hi(cat, namespace, table, col, snapshot_id=None):
     statistics; files written without them leave catalog_bounds() blind (the
     same condition that prints "statistics missing for column N"). Scanning is
     the difference between a bound that is EXACT AT ANY SCALE FACTOR and a
-    constant that is only right at the one scale it was measured on.
+    constant that is only right at one scale.
 
     Projects a SINGLE key column of a DIMENSION table, and streams it: the max
     is folded batch by batch so peak memory is one batch, not one column. That
@@ -1170,14 +1080,7 @@ def _load_geo_pairs_scan(cat, namespace, verbose=True):
 
     WHY: q24 requires `s_zip = ca_zip AND s_market_id = 8`. Drawing
     ss_customer_sk and ss_store_sk independently makes that pair essentially
-    unreachable. MEASURED on the SF1000 catalog (2026-08-04): 1002 stores, 84 of
-    them in market 8 covering 67 distinct zips; 6.78% of the 6,000,000 addresses
-    sit in one of those zips, so a uniformly-random (customer, store) pair passes
-    with probability 8.46e-05 — 0.42 expected rows in a 5,000-row store_returns
-    delta, and ~11,821 rows needed for ONE expected hit. That is why q24's merge
-    reported 11,408 ms over a 0-row delta part even after every column, date and
-    dimension range had been fixed: the remaining defect was the INDEPENDENCE of
-    two columns, not the value of either one.
+    unreachable (well under one expected row per tick at SF1000).
 
     Done entirely in Arrow (two hash joins over projected key columns, no python
     dicts) so the 12M-row customer scan stays well under 200 MB.
@@ -1224,18 +1127,15 @@ def conform_to_table_schema(tbl, table, n, strict=True):
 
     strict=True additionally REFUSES to null-fill. With the schema-driven
     generator every physical column is synthesized, so a null-fill here means a
-    column was missed — and a NULL join key silently empties the delta, which is
-    precisely the bug that made three measured merges report a time for 0 rows.
-    It must be loud, not silent."""
+    column was missed — and a NULL join key silently empties the delta. It must
+    be loud, not silent."""
     import pyarrow as pa
     from pyiceberg.io.pyarrow import schema_to_pyarrow
     aschema = schema_to_pyarrow(table.schema())
     # schema_to_pyarrow stamps PARQUET:field_id on every field, and pq.write_table
     # then writes those IDs into the file — which add_files refuses outright:
-    # "Cannot add file ... because it has field IDs. `add_files` only supports
-    # addition of files without field_ids". That aborted the CDC append for all
-    # five facts (AWS SF1, 2026-08-01), so every delta-merge measured 0 rows.
-    # Only the metadata is a problem; names/types/nullability are what both the
+    # "Cannot add file ... because it has field IDs". Only the metadata is a
+    # problem; names/types/nullability are what both the
     # physical glob and the iceberg-schema read actually need, so keep those.
     aschema = pa.schema([pa.field(f.name, f.type, f.nullable) for f in aschema])
     have = {name: tbl[name] for name in tbl.column_names}
@@ -1249,10 +1149,7 @@ def conform_to_table_schema(tbl, table, n, strict=True):
                 # The row generator emits every decimal as decimal(7,2) (see the
                 # kinds map), but the real Iceberg schema has narrower decimals —
                 # ca_gmt_offset / s_gmt_offset / w_gmt_offset are decimal(5,2),
-                # max 999.99. A (7,2) value above that made arr.cast() raise
-                # "Decimal value does not fit in precision 5", which killed the
-                # CDC tick outright: "CDC TICK FAILED (exit 1) — no rows added",
-                # so EVERY merge measurement was skipped (2026-09-11).
+                # max 999.99; a (7,2) value above that fails arr.cast().
                 #
                 # Generic: derived from the target type, no column names.
                 if pa.types.is_decimal(field.type) and pa.types.is_decimal(arr.type):
@@ -1282,8 +1179,7 @@ def conform_to_table_schema(tbl, table, n, strict=True):
             cols.append(pa.nulls(n, field.type))
     if filled:
         msg = (f"NULL-FILLED {len(filled)} column(s) of {table.name()}: {filled}. "
-               "A NULL join key silently empties the delta — every merge measured "
-               "against it reports a time for zero rows.")
+               "A NULL join key silently empties the delta.")
         if strict:
             raise SystemExit("FATAL: " + msg)
         print("   WARN: " + msg)
@@ -1405,11 +1301,9 @@ def apply_geo_correlation(cols, fact, geo, rnd=random):
     return n
 
 
-# CROSS-FACT correlation (2026-09-06). q29 joins store_sales ⋈ store_returns ⋈
-# catalog_sales on the SAME customer and item — a customer who bought in the
-# store, returned it, then bought it from the catalog. Facts appended
-# independently never produce such a triple, so q29's delta terms fold to 0
-# rows every tick (40s of proving emptiness). Every tick now records the
+# CROSS-FACT correlation. q29 joins store_sales ⋈ store_returns ⋈ catalog_sales
+# on the SAME customer and item. Facts appended independently never produce such
+# a triple, so its delta terms fold to 0 rows. Every tick records the
 # (customer, item) pairs of the RETURNED sales and re-issues a share of them
 # (CDC_CROSS_FACT, default 0.5) as the bill customer/item of the sales facts
 # appended after it. CDC_CROSS_FACT=0 restores independent draws.
@@ -1532,24 +1426,17 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
     distinct count is at most `max_ratio` of the sampled rows (a categorical
     attribute: i_category, ca_state, s_gmt_offset, p_channel_dmail ...).
 
-    WHY: appended dimension rows used to get '<col>:<key>' in EVERY string column,
-    unique per row. Each 5,000-row item append therefore added 5,000 brand-new
-    categories, brands and classes: after a day of ticks the node's item table
-    held 662,000 rows with 120,010 distinct i_category (the real domain is 10).
-    That changes what the benchmark queries mean (categories no query names) and
-    prices every grain over a dimension attribute at the fact size — q61's
-    [ca_gmt_offset d_moy d_year i_category s_gmt_offset] branch was refused at an
-    estimated 1.44B groups (node 1788402989672, 2026-09-05). Categorical columns
-    now draw from the live domain; id-like columns (near-unique in the sample)
-    keep the unique-per-row value. Returns {} when the table cannot be sampled."""
+    WHY: a unique value per appended row in every string column would add new
+    categories/brands/classes on every tick, inflating categorical cardinality
+    far beyond the real domain. Categorical columns draw from the live domain;
+    id-like columns (near-unique in the sample) keep the unique-per-row value.
+    Returns {} when the table cannot be sampled."""
     import pyarrow.compute as pc
     scols = [c for c, k in columns if k == "s"]
     if t is None or not scols:
         return {}
-    # CACHED ACROSS TICKS. A categorical domain does not move when the appends
-    # draw from it, but sampling it re-planned a scan over every manifest of the
-    # table (one per tick, ~1,000 now): date_dim's 8-row append took 6.9 s and
-    # store's 1-row append 6.7 s (node 144, SF1000, 2026-10-03).
+    # CACHED ACROSS TICKS: a categorical domain does not move when the appends
+    # draw from it, and sampling it scans every manifest of the table.
     # SEED_STRDOM_REFRESH=1 re-samples.
     import json as _j
     try:
@@ -1605,10 +1492,8 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
 def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random,
                    str_domains=None):
     """Generate EVERY column of a NON-sales table (inventory, customer, item, ...)
-    from its live schema. No per-table row template: the internal 9-table wave
-    (bench/sf1/sf1000_append_test.py) hand-wrote 4-10 columns per table and let
-    the gateway null-fill the rest; here every physical column is synthesized so
-    the strict null guard holds for these tables too.
+    from its live schema. No per-table row template: every physical column is
+    synthesized so the strict null guard holds for these tables too.
 
       own surrogate key (c_customer_sk on customer) -> key_base+i, never reused
       foreign _sk                                  -> uniform over the catalog range
@@ -1651,10 +1536,8 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
             out[name] = [rnd.randint(1, 1000) for _ in range(n)]
     if table == "date_dim" and "d_date_sk" in out:
         # A DATE ROW IS ITS KEY'S DAY. Random calendar values on appended keys
-        # made a query's date window (d_date range, d_quarter_name '2001Q1',
-        # d_year 2001) match synthetic keys far past the calendar, so every
-        # date-bound prune spanned them: q82's inventory read kept 922 of
-        # 1,104 files, q17's bound reached key 2489578 (node 65/37, 2026-09-28).
+        # would make a query's date window (d_date range, d_quarter_name,
+        # d_year) match synthetic keys far past the calendar.
         rows = [date_dim_row(k) for k in out["d_date_sk"]]
         for c in names:
             if c in rows[0] and c != "d_date_sk":
@@ -1693,12 +1576,9 @@ def date_dim_row(jdn):
     }
 
 
-# Facts can reference a dimension key before its row exists — derived dates
-# (sale + days) did for date_dim, and web_sales ship-address keys reached past
-# customer_address's max too (node 144, 2026-09-28) — so every dimension asks.
-# The bounds are cached per table snapshot and advanced by each append
-# (catalog_bounds / _bounds_after_append): the cost is one cold fill per node
-# (186 s on node 65), then ~3 s a tick.
+# Facts can reference a dimension key before its row exists (e.g. derived
+# dates), so every dimension asks. The bounds are cached per table snapshot and
+# advanced by each append (catalog_bounds / _bounds_after_append).
 _FACT_FK_MAX = {}
 
 
@@ -1711,9 +1591,7 @@ def fact_fk_max(cat, namespace, dim):
     refs = [(fact, col) for fact, spec in FACT_COLUMNS.items() for col, _k in spec]
     # EVERY REFERENCING TABLE, not only the facts: household_demographics
     # references income_band (hd_income_band_sk) and customer references the
-    # demographics/address dims. Issuing income_band keys above the FACTS'
-    # max left old hd rows reaching the "new" keys, so the gateway's RI prune
-    # refused income_band on every q84 tick (node 37, SF1000, 2026-09-28).
+    # demographics/address dims; new keys must be above all of them.
     for t, cols in _namespace_columns(cat, namespace).items():
         if t != dim and t not in FACT_COLUMNS:
             refs += [(t, c) for c in cols]
@@ -1776,19 +1654,8 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
     # columns by suffix (cs_bill_hdemo_sk -> household_demographics), and the
     # dimension's own key does not carry that suffix: "hd_demo_sk" ends in
     # "_demo_sk", not "hdemo_sk", so dim_for("hd_demo_sk") is None. keycol was
-    # therefore None for household_demographics and customer_demographics, the
-    # whole bounds block below was skipped — including the scan_dim_hi fallback
-    # and its SystemExit guard — and kb stayed 1, so EVERY tick re-issued keys
-    # from 1. Dims whose own key does match a suffix (i_item_sk, w_warehouse_sk,
-    # d_date_sk) were never affected, which is why only the two *demo dims show
-    # it.
-    #
-    # Measured on the node (2026-09-21): household_demographics held 62,320 rows
-    # over 7,200 distinct hd_demo_sk (8.66x duplication, max never past 7200),
-    # customer_demographics 1,979,760 over 1,920,800. A re-used key IS reachable
-    # from pre-append facts, so the RI-prune gate must refuse the dim delta —
-    # q72's merge then scanned catalog_sales x inventory for 785 delta rows and
-    # took 95-170 s. Look the key up by VALUE, the way load_dim_hi already does.
+    # Look the key up by VALUE (own_key_of), the way load_dim_hi already does,
+    # or a re-used key would be reachable from pre-append facts.
     keycol = next((c for c, _ in columns if (dim_for(c) or ("",))[0] == table), None)
     if keycol is None:
         own = own_key_of(table)
@@ -1799,24 +1666,9 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
         if mx is None:
             # NEVER RE-ISSUE A DIMENSION KEY FROM 1.
             #
-            # `kb = (mx or 0) + 1` turned a missing manifest bound into
-            # key_base=1, so the append re-issued keys that already exist. That
-            # breaks the premise the whole incremental design rests on, stated
-            # in bench_cdc.sh: "seed_tpcds.py issues each dimension's surrogate
-            # key as max(existing)+1 (never reused) ... that is the exact
-            # premise the RI-prune gate asserts when it drops an insert-only dim
-            # delta as zero-contribution". A duplicate key IS reachable from
-            # pre-append facts, so the gate must refuse, and the merge pays a
-            # full fact scan instead of a metadata comparison.
-            #
-            # Measured on q72 (node 37.27.65.188, 2026-09-20): the gate reported
-            # "old catalog_sales rows reach cs_bill_hdemo_sk=7200, appended
-            # household_demographics keys start at 1 — a probe decides", and the
-            # tick spent 71.5 s scanning catalog_sales for a delta that should
-            # have been discharged from manifests alone.
-            #
-            # scan_dim_hi() already solves this for the fact-FK path
-            # (load_dim_hi); the dim-append path simply never called it.
+            # A missing manifest bound must not become key_base=1: new
+            # dimension keys are max(existing)+1, never reused (a duplicate key
+            # is reachable from pre-append facts). Fall back to a scan.
             mx = scan_dim_hi(cat, namespace, table, keycol)
             if verbose and mx is not None:
                 print(f"   {table}.{keycol}: manifest bound missing — scanned max={mx}")
@@ -1883,8 +1735,8 @@ def main():
     ap.add_argument("--mode",choices=["append","upsert"],default="append",
         help="append = add_files only (incremental-mergeable). upsert = copy-on-write "
              "DELETE of a store/call-center/web-site slice + replacement rows: rewrites "
-             "data files, so the snapshot has REMOVED files and the gateway must "
-             "full-rematerialize.")
+             "data files, so the snapshot has REMOVED files and the MV must be "
+             "fully rematerialized.")
     ap.add_argument("--upsert-store-sk",type=int,default=7,help="slice replaced in upsert mode")
     ap.add_argument("--stream-days",type=int,default=int(os.environ.get("CDC_STREAM_DAYS","0") or 0),
         help="REALISTIC-STREAM mode: appended fact rows are dated in the last N days of the "
@@ -1920,18 +1772,15 @@ def main():
     ap.add_argument("--dim-rate",type=float,default=0.0001,
         help="with --tick: rows appended to each --extra-tables table as a FRACTION "
              "of its row count as loaded, i.e. its earliest snapshot (default 1e-4: store 1,002 -> 1 row, item "
-             "300,000 -> 30, customer 12,000,000 -> 1,200), minimum 1. A flat "
-             "--rows per dimension grew store to 1,428,002 rows in ~290 ticks on "
-             "SF1000 (2026-09-19); dimensions change slowly, facts do not. "
-             "--extra-rows overrides.")
+             "300,000 -> 30, customer 12,000,000 -> 1,200), minimum 1; dimensions "
+             "change slowly, facts do not. --extra-rows overrides.")
     ap.add_argument("--dim-growth",type=float,default=DEFAULT_DIM_GROWTH,
         help="with --tick: facts reference a dimension's NEW keys (one row each) only "
              "while its appended rows are within this fraction of its row count as "
              "loaded (default 0.01; minimum 1 key); otherwise facts draw keys only "
              "from the dimension as loaded, so FK NDVs stay at the dataset's sizes")
     ap.add_argument("--extra-rows",type=int,default=0,
-        help="rows per extra table (default: same as --rows, the flat count the "
-             "internal wave used)")
+        help="rows per extra table (default: derived from --dim-rate)")
     ap.add_argument("--dry-run",action="store_true",
         help="build + schema-conform every delta, write NOTHING (validates the "
              "generator against the live catalog)")
@@ -1941,8 +1790,7 @@ def main():
         help="draw ss_customer_sk and ss_store_sk INDEPENDENTLY instead of as a "
              "zip-consistent (customer, address, store) triple. Independence is "
              "what leaves q24 (s_zip = ca_zip AND s_market_id = 8) with a 0-row "
-             "delta: measured on SF1000, a random pair passes with p=8.46e-05, so "
-             "a 5,000-row store_returns delta expects 0.42 eligible rows.")
+             "delta.")
     a=ap.parse_args()
     if a.key_pools:
         load_key_pools(a.key_pools)
@@ -1962,11 +1810,11 @@ def main():
     if a.s3_endpoint:
         # Custom endpoint: point BOTH pyiceberg's file IO and the writer at it
         # (without this, PyArrow S3 IO resolves bucket names against real AWS ->
-        # ACCESS_DENIED on a local-only bucket; observed q64 bench 2026-07-29).
+        # ACCESS_DENIED on a local-only bucket).
         # Same convention as register_tpcds_tables.py: s3.endpoint always; path-
         # style ONLY for non-AWS endpoints (MinIO needs it; forcing it on real
         # AWS would regress newer buckets — S3_ENDPOINT is commonly the AWS
-        # regional URL on blimp nodes, per standup_data.sh).
+        # regional URL, per standup_data.sh).
         props["s3.endpoint"]=a.s3_endpoint
         if "amazonaws.com" not in a.s3_endpoint:
             props["s3.path-style-access"]="true"
@@ -2039,16 +1887,10 @@ def main():
         import time as _time
         _tt0=_time.time(); _tt=[]
         try:
-            # PARALLEL BY TABLE. Each append is one Iceberg commit on its own
-            # table (~10 s each, ~24 of them: the tick was ~200 s, almost all
-            # of it these commits in sequence). Different tables commit
-            # independently, so dimensions run together, then facts together —
-            # facts after dimensions, since they reference the new dimension
-            # keys (dim_hi_cache). A failure still raises into the rollback.
+            # PARALLEL BY TABLE (opt-in, SEED_PARALLEL=N; commits may serialize
+            # on the catalog). Dimensions first, then facts, since facts
+            # reference the new dimension keys. A failure raises into the rollback.
             from concurrent.futures import ThreadPoolExecutor
-            # Opt-in: measured on nodes 37/65 (2026-10-03) the per-table commits
-            # serialize on the catalog — 8 threads took each append from ~5 s
-            # to ~36-75 s and the wall time did not move. SEED_PARALLEL=N.
             workers=int(os.environ.get("SEED_PARALLEL","1"))
             def _dim(x):
                 _t=_time.time()
@@ -2074,8 +1916,7 @@ def main():
             with ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
                 for r in list(ex.map(_fact,plan)):
                     _tt.append(r)
-            # WHERE THE TICK'S TIME GOES — measured per table, so the slowest
-            # step is named instead of guessed (the tick was ~80-95 s, 2026-09-24).
+            # WHERE THE TICK'S TIME GOES, per table.
             print("== tick timing: total %.1fs | %s"%(_time.time()-_tt0,
                   ", ".join("%s %.1fs"%(k,v) for k,v in sorted(_tt,key=lambda kv:-kv[1]))))
             print("== tick steps: %s"%", ".join("%s %.1fs"%(k,v) for k,v in sorted(STEP_T.items(),key=lambda kv:-kv[1])))
@@ -2111,8 +1952,8 @@ def main():
         # Copy-on-write delete of the slice being replaced: pyiceberg rewrites
         # every data file containing matching rows, so the resulting snapshot
         # REMOVES files — exactly what real upserts/overwrites/compactions do.
-        # The gateway must detect that (added_files.removed_files) and take the
-        # full re-materialize path; an added-only merge would double-count.
+        # A consumer must detect removed files and fully re-materialize; an
+        # added-only merge would double-count.
         from pyiceberg.expressions import EqualTo
         t.delete(EqualTo(sc,a.upsert_store_sk)); t.refresh()
         print(f"upsert: deleted {sc}={a.upsert_store_sk} slice -> snapshot {t.current_snapshot().snapshot_id}")

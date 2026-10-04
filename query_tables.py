@@ -7,7 +7,7 @@ table), the way the gateway itself decides.
 
   python3 query_tables.py --sql-file q.sql [--sql-file ...] \
       --catalog http://GW:19122/iceberg [--prefix main] [--warehouse mv] \
-      --namespace tpcds [--s3-key K --s3-secret S]
+      --namespace tpcds
 
 Prints one JSON object per SQL file: {"file","tables":[...],"fact":"...",
 "rows":{table:n}}. --list-refs prints the raw identifiers found in the SQL and

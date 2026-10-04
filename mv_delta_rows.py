@@ -4,25 +4,15 @@ merge_ms number.
 
 WHY THIS EXISTS
 ---------------
-A merge against an EMPTY delta still runs, still reports a merge_ms, and is
-indistinguishable in every log line the gateway emits from a merge that did real
-work. The gateway counts delta FILES, never delta ROWS (mv_wave_log has
-delta_files / delta_key / merge_ms and no row column), so nothing in the product
-can tell you the difference. Measured on test2 SF1000, 2026-08-04:
-
-    mv_h_4a822e01c1c3/delta-1785877060488.parquet ->      0 rows  (q24, 15,233 ms)
-    mv_h_8c010ddc8133/delta-1785877078390.parquet ->      0 rows  (q88,  2,346 ms)
-    mv_f5dcf9d821f33c4a/delta-1785866093543.parquet -> 49,992 rows (a real merge)
-
-Two of those three "merges" measured nothing. Timings from a run that has not
-passed this gate must not be reported as results.
+A merge against an EMPTY delta still runs and still reports a merge_ms, so the
+timing alone cannot tell a real merge from one that did nothing. Timings from a
+run that has not passed this gate must not be reported as results.
 
 HOW IT WORKS
 ------------
-The append-merge lane writes each delta as
+An append merge writes each delta as
     s3://<mv-namespace-with-dashes>/<mv_table>/delta-<unix_ms>.parquet
-listed in <mv_table>/parts.json, alongside the base <mv_table>/data.parquet
-(mv_append_merge.go: mvDeltaPartName / mvPartsManifestName).
+listed in <mv_table>/parts.json, alongside the base <mv_table>/data.parquet.
 
 So:
     snapshot  -> record each MV's current part list + data.parquet ETag
@@ -37,8 +27,8 @@ VERDICT VOCABULARY (a merge can be real without writing a part)
     UNCHANGED     no new part and identical ETag             -> nothing happened
 
 Usage:
-    mv_delta_rows.py snapshot --out /tmp/pre.json  --tables mv_a mv_b
-    mv_delta_rows.py verdict  --pre /tmp/pre.json  --tables mv_a mv_b
+    mv_delta_rows.py snapshot --out pre.json  --tables mv_a mv_b
+    mv_delta_rows.py verdict  --pre pre.json  --tables mv_a mv_b
 Connection: --endpoint/--bucket, or MV_S3_ENDPOINT / MV_BUCKET / AWS_* env.
 """
 import argparse, json, os, sys
@@ -133,9 +123,7 @@ def main():
                     help="MV table names (the mv_table field of /admin/query/run)")
     ap.add_argument("--bucket", default=os.environ.get("MV_BUCKET", ""),
                     help="MV bucket = the MV namespace with _ replaced by - "
-                         "(ZS3_MV_NAMESPACE=tpcds_mv -> tpcds-mv). NOTE this is "
-                         "NOT ZS3_MV_WAREHOUSE_BUCKET, which holds qresults/ and "
-                         "the iceberg warehouse, not the append-merge parts.")
+                         "(tpcds_mv -> tpcds-mv)")
     ap.add_argument("--endpoint", default=os.environ.get("MV_S3_ENDPOINT", "")
                     or os.environ.get("S3_ENDPOINT", ""))
     ap.add_argument("--key", default=os.environ.get("MV_S3_KEY", "")

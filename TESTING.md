@@ -15,7 +15,7 @@ than an error, which is the class a run log cannot show you.
 ## `./test_kit.sh` — measurement decisions
 
 - a non-blank `S3_ENDPOINT` always produces `--endpoint-url`; without it origin
-  calls quietly go to the public cloud endpoint and the cache leg reports "no objects"
+  calls quietly go to the public cloud endpoint
 - the cache set is sized so the per-blobber shard share exceeds per-blobber RAM
   (below that the "hit" is served from blobber page cache and nothing
   client-side reveals it)
@@ -30,17 +30,18 @@ than an error, which is the class a run log cannot show you.
 
 ## `./test_setup_options.sh` — the setup choices
 
-54 assertions over the three `--setup` questions, with `curl` stubbed to replay
+Assertions over the three `--setup` questions, with `curl` stubbed to replay
 real captured responses (including Nessie's 500 on an unknown warehouse):
 
 - a Nessie warehouse is a **name**, and the name survives `standup_data.sh`
-  printing an `s3://…` warehouse of its own (it used to clobber it, so a run
-  registered 24/24 tables into `mv` and then wired the node with
-  `s3://blimp-e2e/wh`)
+  printing an `s3://…` warehouse of its own (a clobbered name would wire the
+  node with an `s3://<bucket>/wh` path Nessie does not know)
 - choosing another S3 endpoint (B = 2) with the node's own catalog (A = 1) is
   demoted to a local catalog — metadata and data must share one endpoint
 - the live admin-token file wins over the container env, which is only a
-  provision-time snapshot
+  provision-time snapshot, and `--setup` reads it before calling the gateway
+- `BLIMP_SF` pre-set skips the scale prompt; help output masks secrets; no
+  `?token=` query strings are sent
 - `query_tables.py` extracts the tables a query reads from every `FROM`/`JOIN`
   position (comma lists and nested subqueries included, CTE names excluded)
 

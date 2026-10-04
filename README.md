@@ -87,7 +87,7 @@ You need **nothing** pre-installed — `blimp --setup` installs what it uses
 > hosts where you'd rather not install anything on the OS:
 > ```bash
 > docker build -t blimp-kit . && \
-> docker run --rm --network host -e CLUSTER_ID=… -e WAREHOUSE=s3://… blimp-kit --setup
+> docker run --rm --network host -e CLUSTER_ID=… -e CLUSTER_TOKEN=… -e WAREHOUSE=s3://… blimp-kit --setup
 > ```
 > `--network host` lets it use the node's own identity and reach the gateway
 > on its private address (that is what makes the key-free path work). See `docker-compose.yml`
@@ -110,27 +110,35 @@ Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 
 Rough timing: `--setup` about 10-15 minutes end to end (longer at SF100+),
 `--query` about 5 minutes per query at SF1 (at SF1000 a cold author plus
-tick is 1-20 minutes depending on the query), `--storage` about 30 minutes for all three
-legs, `--acid` about 5 minutes.
+tick is 1-20 minutes depending on the query), `--storage` tens of minutes —
+the first run is dominated by generating the mlperf dataset, which later runs
+reuse (`MLPERF_REGEN=1` regenerates it) — and `--acid` about 5 minutes.
 
 **Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
 export these (or source a file with `set -a`) and `--setup` runs unattended:
 
 ```
 REGION CLUSTER_ID ICEBERG_URL WAREHOUSE ORIGIN_BUCKET NAMESPACE \
-S3_KEY S3_SECRET        # only for an S3 endpoint you own (B = 2); the fleet option needs none
-GW GW_AK GW_SK          # optional — auto-derived from CLUSTER_ID when unset
+CLUSTER_TOKEN           # the account fleet token (panel: Settings -> API token); read from the
+                        #    node itself when --setup runs on the Blimp node, required elsewhere
+S3_KEY S3_SECRET        # only for an S3 endpoint you own (B = 3); options 1 and 2 need none
+GW                      # optional — defaults from the network assessment (the private address,
+                        #    else blimp-<CLUSTER_ID>-0.blimp.software)
+GW_AK GW_SK             # optional — the gateway's own S3 keys: read from the local gateway when
+                        #    --setup runs on the node, else fetched from the gateway with CLUSTER_TOKEN
 CATALOG_CHOICE=1|2|3    # A. Iceberg catalog: 1 = the node's own Nessie (default, nothing to
                         #    install; warehouse NAME via ICEBERG_WAREHOUSE, default "mv"),
                         #    2 = stand a Nessie up on this box (:8181), 3 = ICEBERG_URL you have
-SOURCE_CHOICE=1|2       # B. dataset location: 1 = the fleet cache layer (default; the fleet
-                        #    S3 URL + keys are fetched from the gateway), 2 = another S3 endpoint
+SOURCE_CHOICE=1|2|3     # B. dataset location: 1 = the fleet cache layer (default; the fleet
+                        #    S3 URL + keys are fetched from the gateway), 2 = this node's own
+                        #    gateway S3 (keys read from the node), 3 = another S3 endpoint
 BUILD_DATASET=1|2       # C. 1 = generate a TPC-DS test set at B and register it in A (default),
-BLIMP_SF=1|10|100|1000  #    scale factor for it; 2 = bring your own data (ORIGIN_BUCKET/NAMESPACE)
+                        #    2 = bring your own data (ORIGIN_BUCKET/NAMESPACE)
+BLIMP_SF=1|10|100|1000  #    scale factor for C = 1; when set, the scale prompt is skipped
 ```
 
 Option 1 + 1 is the internal path: a node with no catalog, no bucket and no
-data gets a working cluster in one command. Picking another S3 endpoint (B = 2)
+data gets a working cluster in one command. Picking another S3 endpoint (B = 3)
 with the node's Nessie (A = 1) is refused and demoted to a local catalog: the
 gateway can only write table metadata into a warehouse *it* has configured,
 which lives on the fleet endpoint, and the source config carries one
@@ -168,10 +176,10 @@ $ blimp --setup
 == blimp --setup — connect a Blimp node to this node's data ==
   ✓ deps ready (python: ~/.blimp_venv/bin/python3)
 S3 region (cloud buckets only; any value for MinIO/other S3) [us-east-1]:
-Blimp cluster id (from blimp.software): 1789395562780
+Blimp cluster id (from blimp.software): 1700000000000
 
-network assessment → private gateway 10.10.12.249 reachable: yes (private path, nothing to type)
-Blimp gateway address [10.10.12.249]:
+network assessment → private gateway 10.0.1.23 reachable: yes (private path, nothing to type)
+Blimp gateway address [10.0.1.23]:
 Iceberg namespace [tpcds]:
 
 Iceberg catalog
@@ -179,16 +187,17 @@ Iceberg catalog
    2) stand up an Iceberg REST catalog on THIS box (:8181)
    3) point at an Iceberg REST catalog I already have
   choice [1]:
-  using the gateway Nessie catalog — http://10.10.12.249:19122/iceberg (branch main)
+  using the gateway Nessie catalog — http://127.0.0.1:19122/iceberg (branch main)
   Nessie warehouse name [mv]:
     warehouse "mv" -> s3://tpcds-mv (table metadata lands there)
 
 Dataset (source) location
-   1) the fleet cache layer — https://fleet-8429413131.blimp.software:9443 (default)
-   2) another S3 endpoint (your own bucket / MinIO / other cloud)
+   1) the fleet cache layer — https://fleet-<account>.blimp.software:9443 (default)
+   2) this node's own gateway S3 — http://10.0.1.23:9000 (nothing to install)
+   3) another S3 endpoint (your own bucket / MinIO / other cloud)
   choice [1]:
   Bucket on the fleet endpoint [blimp-src]:
-  source → https://fleet-8429413131.blimp.software:9443/blimp-src (fleet keys, fetched from the gateway)
+  source → https://fleet-<account>.blimp.software:9443/blimp-src (fleet keys, fetched from the gateway)
 
 Build a TPC-DS test dataset at that location?
    1) yes (default)
@@ -200,6 +209,7 @@ Scale factor
    2) SF10   ~10 GB  (tens of minutes)
    3) SF100  ~100 GB (hours)
    4) SF1000 ~1 TB   (many hours; needs a big box + disk)
+   5) SF10000 / 6) SF100000 (dedicated data disk)
   choice [1]:
   will generate TPC-DS SF1 and register it into the catalog
   Warehouse (Nessie: a warehouse NAME; otherwise s3://bucket/prefix) [mv]:
@@ -217,7 +227,7 @@ Iceberg catalog
   REST prefix (Nessie branch; blank for a plain REST catalog):
 
 Dataset (source) location
-  choice [1]: 2
+  choice [1]: 3
   Data bucket (blank = generate one here): my-lake
   S3 endpoint URL of that bucket (MinIO/Ceph/R2/any cloud, e.g. http://minio:9000;
     blank = your cloud's S3 in us-east-1) [https://s3.us-east-1.amazonaws.com]: http://minio.internal:9000
@@ -233,20 +243,23 @@ The prompts, in order (Enter takes the default; a pre-set env var skips the prom
 2. `Blimp cluster id (from blimp.software)` — required
 3. `Blimp gateway address [<derived from the cluster id>]` — then the network
    assessment picks the private or the public path to it
-4. `Iceberg namespace [tpcds]`
+4. `Iceberg namespace [tpcds]` — then the fleet token: read from the node when
+   `--setup` runs on it, otherwise prompted (or `CLUSTER_TOKEN`)
 5. **A. Iceberg catalog** — `1) use this cluster's gateway Nessie (default)`,
    `2) stand up a Nessie on THIS box (:8181)`, `3) point at a catalog I already have`.
    Option 1 asks `Nessie warehouse name [mv]` and probes it; option 3 asks the
    REST URL and its prefix (blank for a plain REST catalog).
 6. **B. Dataset (source) location** — `1) the fleet cache layer (default)` →
    `Bucket on the fleet endpoint [blimp-src]` (fleet URL + keys are fetched from
-   the gateway, nothing to type); `2) another S3 endpoint` → data bucket
-   (blank = generate one here) and its S3 endpoint URL (MinIO, Ceph, R2, any
-   cloud's S3; blank = your cloud's S3 in the region above).
-   Picking 2 with option A1 is refused and demoted to a local catalog (see the
+   the gateway, nothing to type); `2) this node's own gateway S3` (keys read from
+   the node); `3) another S3 endpoint` → data bucket (blank = generate one here)
+   and its S3 endpoint URL (MinIO, Ceph, R2, any cloud's S3; blank = your
+   cloud's S3 in the region above).
+   Picking 3 with option A1 is refused and demoted to a local catalog (see the
    note under the env block).
 7. **C. Build a TPC-DS test dataset at that location?** — `1) yes (default)` →
-   `Scale factor 1 / 10 / 100 / 1000`; `2) no, I bring my own data`.
+   `Scale factor 1 / 10 / 100 / 1000 / 10000 / 100000` (skipped when `BLIMP_SF`
+   is set); `2) no, I bring my own data`.
 8. `Warehouse` — prefilled with the Nessie warehouse NAME (A1/A2) or
    `s3://<data-bucket>/wh` (A3)
 9. S3 access key / secret — asked only for an S3 endpoint you own that the node
@@ -287,7 +300,7 @@ Guardrails `--setup` enforces (each is a real failure mode):
 
    ```
    POST http://<gateway>:9000/admin/source/configure
-   Authorization: Bearer <the node's live admin token>
+   Authorization: Bearer <CLUSTER_TOKEN, the account fleet token>
    {"source":"customer","iceberg_url":"<catalog as the GATEWAY reaches it>|<warehouse>",
     "namespace":"…","bucket":"…","s3_endpoint":"…","s3_key":"…","s3_secret":"…","s3_region":"…"}
    ```
@@ -295,13 +308,11 @@ Guardrails `--setup` enforces (each is a real failure mode):
    Two addresses for one catalog: with option A1 you reach the gateway's Nessie
    on the host port (`http://<gateway>:19122/iceberg`), but the gateway runs in
    a container where that is loopback to itself, so `--setup` sends the
-   gateway its own catalog address (`ZS3_ICEBERG_REST_URL`, read from the
-   co-located container) and keeps the host address for the registrar and
-   seeder. The bearer is the node's live admin token (the datalake-minted fleet
-   token, kept fresh in `/opt/0chain/zs3server/environment/admin_token`), not
-   `blimp-<id>`. The gateway applies the config live — the very next query
-   reads your data — and persists it across restarts. On success `--setup`
-   prints `✓ cluster wired: source=customer … (live, no restart)`.
+   gateway its own catalog address (read from the co-located container) and
+   keeps the host address for the registrar and seeder. The bearer is the
+   account fleet token (`CLUSTER_TOKEN`). The gateway applies the config live —
+   the very next query reads your data — and persists it across restarts. On
+   success `--setup` prints `✓ cluster wired: source=customer … (live, no restart)`.
 8. **Finishing** — fetches the gateway's S3 keys into `~/.blimp_env` and
    installs the benchmark tools (`warp`, `mount-s3`, `dlio`, the ACID checker).
 
@@ -331,9 +342,9 @@ catalog drop `--prefix` and pass the warehouse as an `s3://…` path. Omit
 ### Step 4 — point the Blimp node at the source (optional)
 
 **Automatic (no SSH):** `--setup` wires the node itself over the authenticated
-admin API — `POST http://<gw>:9000/admin/source/configure`, with the node's
-live admin token as the bearer (read from the node when the kit runs on it,
-else `CLUSTER_TOKEN` from `~/.blimp_env`). The gateway applies the source in
+admin API — `POST http://<gw>:9000/admin/source/configure`, with the account
+fleet token as the bearer (read from the node when the kit runs on it, else
+`CLUSTER_TOKEN` from the env or `~/.blimp_env`). The gateway applies the source in
 its live env (effective on the next query, **no restart**) and persists it
 across reboots. On an older gateway image the call fails gracefully and
 `--setup` prints the manual steps.
@@ -341,7 +352,7 @@ across reboots. On an older gateway image the call fails gracefully and
 Manual fallback (older gateway image, or the admin-API call failed): paste
 `--setup`'s printed values into the Blimp node UI (Production tab).
 
-An S3 endpoint you own (B = 2) **requires** `S3_KEY`/`S3_SECRET`; `--setup`
+An S3 endpoint you own (B = 3) **requires** `S3_KEY`/`S3_SECRET`; `--setup`
 sends them in the `/admin/source/configure` body. For the fleet cache layer,
 or a bucket the node reaches with its own identity, leave them unset.
 
@@ -489,8 +500,9 @@ blimp --query --tpc 3 --verify             # next tick (steady state) + post-ver
 **Appends stay realistic.** Each tick's fact rows reference dimension keys
 from the table as originally loaded (its first Iceberg snapshot), plus only the
 few dimension rows that tick itself adds. New dimension rows per tick are a
-fixed share of the as-loaded size (`--dim-rate`), and facts reference new keys
-only until they reach `CDC_DIM_GROWTH` of it (default 0.01). Long benchmark runs
+fixed share of the as-loaded size (`CDC_DIM_RATE`, default 0.0001), and facts
+reference new keys only until they reach `CDC_DIM_GROWTH` of it (default 0.01),
+e.g. `CDC_DIM_RATE=0.001 blimp --query --tpc 3`. Long benchmark runs
 therefore do not inflate dimension cardinalities. Data produced by kits before
 this change can be reset by setting each table's current snapshot back to its
 first one; earlier snapshots are retained, so this is reversible.
@@ -551,23 +563,18 @@ just wrote is the value everyone reads, and a read that races an overwrite
 never returns a stale copy or a torn mix of the old and new bytes.
 
 > **ACID is OFF by default on the gateway, and `--acid` turns it on for you.**
-> As of 2026-08-06 the gateway defaults `ZS3_ACID_ALL` to off: the warp
-> benchmark that argued strict whole-file verify was free is the same tool that
-> produced the phantom `EOF` errors, so it cannot be used to justify paying that
-> cost on every deployment. `ZS3_ACID_BUCKETS` still keeps the MV warehouse
-> buckets strict.
 >
 > `blimp --acid` arms it via `POST /admin/acid` before the run and restores the
 > previous setting afterwards — including on failure or Ctrl-C. That pin is a
-> RUNTIME setting and is not persisted, so a gateway restart reverts to
-> `ZS3_ACID_ALL` regardless.
+> RUNTIME setting and is not persisted, so a gateway restart reverts to the
+> node's configured default.
 >
 > **If you run the porcupine checker by hand, arm it yourself first** — a
 > linearizability test against a gateway with ACID off is measuring the wrong
 > configuration, and any torn read it reports says nothing about the ACID path:
 >
 > ```bash
-> set -a; . ~/.blimp_env; set +a          # GW + CLUSTER_TOKEN (the node's live admin token)
+> set -a; . ~/.blimp_env; set +a          # GW + CLUSTER_TOKEN (the account fleet token)
 > curl -X POST http://$GW:9000/admin/acid \
 >   -H "Authorization: Bearer $CLUSTER_TOKEN" \
 >   -H 'Content-Type: application/json' -d '{"enabled":true}'

@@ -1,32 +1,18 @@
 #!/usr/bin/env bash
-# test_cache.sh — Blimp STORAGE/CACHE cluster test suite (setup-aware, one command).
+# test_cache.sh — Blimp STORAGE suite, run by `blimp --storage`:
+#   1. warp        — S3 PUT/GET + 1KiB TTFB
+#   2. mlperf      — resnet50 (dlio) via mountpoint-s3
 #
-# Runs, in order, from a client box that is IN THE CLUSTER'S VPC (so every path uses
-# the gateway PRIVATE IP and external S3 goes through the VPC S3 gateway endpoint —
-# no egress):
-#   1. warp        — S3 PUT/GET + 1KiB TTFB (conc 16 for 2/1)
-#   2. mlperf      — resnet50 (dlio) via mountpoint-s3 (accel-4/rt-16/pf-32)
+# PREREQS: `blimp --setup` installs warp/dlio/mount-s3/awscli.
 #
-# PREREQS (one-time): run ./setup_tests.sh to provision this box in the cluster
-# VPC with warp/dlio/mount-s3/awscli and an S3 VPC gateway endpoint.
-#
-# Endpoints are taken from env if set, else prompted. Save them in an env file and
-# `source` it to re-run non-interactively:
-#   GW=10.10.150.76 GW_AK=... GW_SK=... \
-#   REGION=ap-south-1 EC=2/1 ./run_all.sh
+# Endpoints are taken from env if set, else prompted:
+#   GW=<gateway-ip> GW_AK=... GW_SK=... CLUSTER_TOKEN=... EC=2/1 ./test_cache.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 ask(){ local cur="${!1:-}"; if [ -n "$cur" ]; then printf '%s' "$cur"; return; fi
-  # This script is normally exec'd NON-INTERACTIVELY by `blimp --storage`, which
-  # pre-sets GW/GW_AK/GW_SK from ~/.blimp_env. A bare `read` with no value and no
-  # controlling terminal (nohup / `ssh host cmd` / systemd) BLOCKS FOREVER waiting
-  # for input that never arrives — the "storage hangs before mount/train, no
-  # mlperf read emitted" symptom. Test the OPEN of /dev/tty (not `-r`: under nohup
-  # the device node exists but the redirect fails with ENXIO). No tty => return
-  # empty (the ${VAR:?} guard below then aborts cleanly — an `exit` here would only
-  # leave this $() subshell and the parent would sail on with a blank value); a
-  # real terminal => prompt on it.
+  # No controlling terminal => return empty (the ${VAR:?} guards below then abort
+  # cleanly); a real terminal => prompt on it.
   { : < /dev/tty; } 2>/dev/null || { printf '' ; return; }
   printf '%s' "$2 " >&2; read -r v </dev/tty; printf '%s' "$v"; }
 
@@ -46,10 +32,8 @@ EC="${EC:-2/1}"
 REGION="${REGION:-ap-south-1}"
 export GW GW_AK GW_SK EC REGION
 
-# AUTO-REAP the benchmark scratch buckets on exit (completion, error, or Ctrl-C) —
-# same policy as the cluster's run_bench.sh, so a run never leaves warp/mlperf data
-# filling the allocation disk (the small on-prem allocations fill fast: a 66 GiB
-# mlperf dataset alone pins an 8x12GB cluster at 90%). These are PURE SCRATCH
+# AUTO-REAP the benchmark scratch buckets on exit (completion, error, or Ctrl-C),
+# so a run never leaves warp/mlperf data filling the allocation disk. These are PURE SCRATCH
 # buckets (warp PUT/GET set, 1 KiB TTFB probe, the mlperf dataset) — regenerated
 # next run. Set BENCH_KEEP=1 to keep them (e.g. iterate mlperf accel/rt/pf without
 # the ~17 min regenerate). Only ever removes these known bench buckets — never data.
@@ -71,9 +55,7 @@ trap reap_bench_buckets EXIT
 # objects but frees the PHYSICAL shard files on its own GC cadence; on a small
 # single-box 2-blobber EC 2/1 node that lag can be tens of seconds. mlperf's
 # generate that starts on unreclaimed disk trips the blobber's >90% write
-# threshold on the tail files ("disk_full … above write threshold" — Olyad's #5:
-# last 2 of 64 eval files on a 110 GiB alloc holding only ~40 GiB of mlperf).
-# There is no peer to redirect to on a single node, so WAIT for the physical disk
+# threshold. There is no peer to redirect to on a single node, so WAIT for the physical disk
 # to actually free before proceeding. Polls /admin/alloc/usage (disk_* fields);
 # best-effort — proceeds with a warning on timeout (the disk_guard still gates).
 wait_disk_reclaim(){
@@ -84,7 +66,7 @@ wait_disk_reclaim(){
   start=$(date +%s)
   echo "[reclaim] waiting for physical disk to free >= ${need_gb} GiB after reap (timeout ${timeout}s)"
   while :; do
-    u=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage?token=${CLUSTER_TOKEN}" 2>/dev/null)
+    u=$(curl -s -m 8 "http://$GW:9000/admin/alloc/usage" -H "Authorization: Bearer $CLUSTER_TOKEN" 2>/dev/null)
     dt=$(printf '%s' "$u" | grep -oE '"disk_capacity_bytes":[0-9]+' | grep -oE '[0-9]+')
     du=$(printf '%s' "$u" | grep -oE '"disk_used_bytes":[0-9]+' | grep -oE '[0-9]+')
     now=$(date +%s); waited=$(( now - start ))
@@ -124,14 +106,12 @@ echo ""
 echo "gateway=$GW  EC=$EC ($REGION)"
 echo "----------------------------------------------------------------------"
 # capture our own output so the final summary can be extracted from it
-CAP="${CAP:-/tmp/test_cache_out.log}"; : > "$CAP"
+CAP="${CAP:-$(mktemp -t test_cache_out.XXXXXX)}"; : > "$CAP"
 exec > >(tee -a "$CAP") 2>&1
 run(){ echo; echo ">>> $1"; shift; "$@"; }
 
-# --- register each leg as an ORDINARY internal run (identical type + labels to the
-# gateway's own run_bench warp/mlperf rows). cdc auto-fills the tier columns by
-# running run_bench's __tiers__ sampler between the running and done imports. Token
-# = zus-<CLUSTER_ID>; best-effort (skips silently if wiring/py absent).
+# --- register each leg as a run on the node panel's Benchmarks tab (same type +
+# labels as a panel-started run). Fleet-token bearer; best-effort.
 BL_TOK="${CLUSTER_TOKEN:?fleet token required (CLUSTER_TOKEN)}"
 bl_post(){ # <bid> <status> <type> <metrics_json> [logfile]
   [ -n "${CLUSTER_ID:-}" ] && [ -n "${GW:-}" ] && command -v python3 >/dev/null 2>&1 || return 0
@@ -150,8 +130,8 @@ try: urllib.request.urlopen(r,timeout=15)
 except Exception: pass
 PY
 }
-# parse a captured leg log into internal-format [label,value] rows (identical labels
-# to run_bench). throughput normalised to decimal MB/s (GB/s >=1000).
+# parse a captured leg log into [label,value] rows (same labels as the panel).
+# throughput normalised to decimal MB/s (GB/s >=1000).
 bl_parse(){ # <type> <logfile>  -> metrics json on stdout
   BL_TYPE="$1" BL_LOG="$2" python3 - <<'PY' 2>/dev/null || echo '[]'
 import os,re,json
@@ -197,10 +177,7 @@ print(json.dumps(rows))
 PY
 }
 
-# Leg selector. --storage was all-or-nothing, so re-measuring ONE leg re-paid the
-# others: every mlperf attempt first re-ran ~12 min of warp and ~7 min of fio for
-# numbers already in hand. run_cluster.sh has always accepted the legs
-# individually; this just exposes that.
+# Leg selector (run_cluster.sh accepts the legs individually).
 #   STORAGE_LEGS=mlperf         only mlperf
 #   STORAGE_LEGS=warp,mlperf    several
 #   (unset / all)               everything, as before
@@ -208,16 +185,14 @@ LEGS="${STORAGE_LEGS:-all}"
 want(){ case "$LEGS" in all|"") return 0;; esac; case ",$LEGS," in *",$1,"*) return 0;; esac; return 1; }
 [ "$LEGS" != "all" ] && echo "[legs] running only: $LEGS"
 
-# CLEANUP is AUTOMATIC (reap_bench_buckets on EXIT, defined above) — same as the
-# cluster's run_bench.sh, so a run never leaves warp/mlperf data filling the small
-# on-prem allocation. To iterate the mlperf train leg (different accel/rt/pf) without
-# paying the ~17 min dataset regenerate each time, run with BENCH_KEEP=1 to keep the
-# scratch buckets; then remove them deliberately when done:
+# CLEANUP is AUTOMATIC (reap_bench_buckets on EXIT, defined above). To iterate the
+# mlperf train leg without regenerating the dataset each time, run with
+# BENCH_KEEP=1 to keep the scratch buckets; then remove them deliberately when done:
 #   BENCH_KEEP=1 blimp --storage        # keep warp/mlperf data across runs
 #   AWS_ACCESS_KEY_ID=$GW_AK AWS_SECRET_ACCESS_KEY=$GW_SK AWS_REGION=us-east-1 \
 #     aws s3 rb s3://mlperf-bench --force --endpoint-url http://$GW:9000
 # Watch the allocation with:
-#   curl -s "http://$GW:9000/admin/alloc/usage?token=zus-<cluster-id>"
+#   curl -s "http://$GW:9000/admin/alloc/usage" -H "Authorization: Bearer $CLUSTER_TOKEN"
 
 # 1) warp — registered as ONE internal "warp" run (PUT + GET + TTFB), tiers by cdc
 if want warp; then
@@ -228,19 +203,14 @@ if want warp; then
   # Free the warp PUT/GET scratch NOW, before mlperf generates its ~66 GiB dataset.
   # Both land on the same small on-prem allocation disk; leaving warp's set resident
   # until the EXIT trap means the mlperf generate runs on top of it and trips the
-  # gateway's >90% write-threshold (PUT broken pipe). Olyad hit exactly this. Only
-  # when mlperf actually follows; BENCH_KEEP still keeps everything (reap no-ops).
+  # gateway's >90% write-threshold. Only when mlperf actually follows; BENCH_KEEP
+  # still keeps everything (reap no-ops).
   if want mlperf; then reap_bench_buckets warpbench warpprobe ttfb1k; wait_disk_reclaim; fi
 fi
 
-# 3) mlperf resnet50 via mountpoint-s3, accel-4 / rt-16 / pf-32 (generate once, keep)
-# Params come from detect_ec (EC 2/1 -> accel 3 / rt 12 / pf 24), the SAME table
-# the cluster's own benchmark uses. They used to be overridden to 4/20/40 — more
-# ranks and threads than the cluster runs for the same EC — and on a 4 GB client
-# the extra torch rank starved the mount-s3 daemon, which sits OUTSIDE the dlio
-# memory cgroup: the FUSE mount died 14 files into a 476-file read and every rank
-# then failed with "Transport endpoint is not connected". Override with
-# MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
+# 2) mlperf resnet50 via mountpoint-s3 (generate once, keep). Params come from
+# run_cluster.sh's detect_ec, the same table the panel's benchmark uses. Override
+# with MLPERF_ACCELS / MLPERF_READ_THREADS / MLPERF_PREFETCH on a bigger box.
 if want mlperf; then
   MB="mlperf_$(date +%s)"; ML=$(mktemp); bl_post "$MB" running "mlperf resnet50" '[]'; sleep 6
   run "2/2 mlperf resnet50 (mp-s3, EC-derived accel/rt/pf)" \
@@ -257,13 +227,7 @@ fi
 
 echo ""
 echo "============================ STORAGE/CACHE SUMMARY ============================"
-# Print a line ONLY when that leg actually produced numbers. Unconditional
-# printf emitted "warp S3 PUT  MiB/s · GET  MiB/s" with empty fields whenever a
-# leg was skipped (or failed), which reads as a broken tool rather than a leg
-# that never ran — and with STORAGE_LEGS that is now the normal case.
-# Also surface the WRITE side of each test, not just the read: the cache-miss
-# fill, the write→read leg, and mlperf's dataset generation were all measured but
-# never reached the summary.
+# Print a line ONLY when that leg actually produced numbers.
 awk '
   / TTFB: Avg/                { ttfb=$0 }
   /== warp PUT/               { sect="put" } /== warp GET/ { sect="get" }
@@ -283,4 +247,4 @@ awk '
     if (!any) print "  (no leg produced numbers — see the log above for the failure)"
   }' "$CAP"
 echo "==============================================================================="
-echo "==================== suite complete — compare to EXPECTED_TEST_RESULTS.md ===================="
+echo "==================== suite complete (full log: $CAP) ===================="

@@ -5,7 +5,7 @@ seed_tpcds.py draws every foreign key uniformly over the dimension's key range
 and every date uniformly over --years, so a query with narrow dimension
 filters (q18: one year, one demographics tuple, a state list) almost never
 sees its appended rows: the delta term folds to 0 rows and the merge is never
-exercised (node 1788402989672, 2026-09-06).
+exercised.
 
 This tool reads the query's simple dimension predicates (equality, IN,
 BETWEEN, comparisons, LIKE, and OR-groups confined to one dimension),
@@ -42,8 +42,8 @@ constraint" for that dimension.
 
 Usage:
   query_pools.py --sql-file q18.sql [--sql-file …] --catalog http://host:8181 \
-      --warehouse s3://tpcds1000/wh --namespace tpcds_sf1000 \
-      [--s3-endpoint http://host:9002] [--s3-key … --s3-secret …] --out pools.json
+      --warehouse s3://my-bucket/wh --namespace tpcds \
+      [--s3-endpoint http://host:9000] [--s3-key … --s3-secret …] --out pools.json
 """
 import argparse, json, re, sys
 

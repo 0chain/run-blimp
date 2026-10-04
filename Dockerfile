@@ -42,11 +42,10 @@ WORKDIR /kit
 # EVERY file a command reaches for at runtime, or the image is subtly broken:
 # query_tables.py (--sql derives tables/fact), mv_delta_rows.py (the delta
 # verdict that gates merge_ms), query_pools.py (query-aware CDC tick),
-# suites/ (the DEFAULT --query batch is the named suite "first-10"), and
-# tfrecord2idx (dlio shells out to it during mlperf datagen).
-# run_router.sh was listed here and does not exist in the repo — a COPY of a
-# missing path fails the build, so `docker build .` had been broken outright.
-COPY blimp register_tpcds_tables.py seed_tpcds.py standup_data.sh \
+# suites/ (the DEFAULT --query batch is the named suite "first-10"),
+# tfrecord2idx (dlio shells out to it during mlperf datagen), and scratch_dir.sh
+# (sourced by standup_data.sh and run_cluster.sh).
+COPY blimp register_tpcds_tables.py seed_tpcds.py standup_data.sh scratch_dir.sh \
      query_tables.py mv_delta_rows.py query_pools.py tfrecord2idx \
      test_query.sh bench_cdc.sh test_cache.sh \
      run_cluster.sh /kit/

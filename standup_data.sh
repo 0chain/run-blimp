@@ -25,11 +25,10 @@ REGION="${REGION:-ap-south-1}"
 CLUSTER_ID="${CLUSTER_ID:-local}"
 OUT="${BLIMP_DATA_DIR:-$SF_SCRATCH/data}"
 log(){ printf '\033[1m[data]\033[0m %s\n' "$*" >&2; }
+# emit KEY VALUE — one shell-quoted line for the caller's eval.
+emit(){ printf '%s=%q\n' "$1" "$2"; }
 die(){ printf '\033[31m[data] FATAL: %s\033[0m\n' "$*" >&2; exit 1; }
-# All 24 TPC-DS tables — must match register_tpcds_tables.py's TPCDS_TABLES
-# exactly. `web_site` used to appear TWICE here in place of `web_sales`, so the
-# web-channel FACT table was never generated: 23 dirs, "registered 23/24", and
-# every web_sales query (and its MVs / delta-merges) had no source table.
+# All 24 TPC-DS tables — must match register_tpcds_tables.py's TPCDS_TABLES.
 TABLES="call_center catalog_page catalog_returns catalog_sales customer \
 customer_address customer_demographics date_dim household_demographics income_band \
 inventory item promotion reason ship_mode store store_returns store_sales time_dim \
@@ -69,38 +68,49 @@ fi
 
 # --- 2. AWS (region-local S3 bucket) vs no writable S3 (MinIO on this box) ------
 # MinIO IS the customer's S3 when there is no writable bucket: either the host is
-# not on AWS at all, or it IS on AWS but its instance role cannot create/write one
-# (a locked-down role with read-only S3 is the common case — the bench role grants
-# only ListBucket/GetObject on the showcase bucket). The AWS leg below therefore
-# FALLS BACK here instead of dying: standing the source up on this box always
-# works, and it is what "blank data bucket = we generate a source for you"
-# promises. Before this, a read-only role aborted `blimp --setup` outright with
-# "could not create/access s3://…" and the customer had no source at all.
+# not on AWS at all, or its instance role cannot create/write one. The AWS leg
+# below therefore FALLS BACK here instead of dying.
 minio_source(){
   local_dkr(){ docker "$@" 2>/dev/null || sudo docker "$@"; }
   command -v docker >/dev/null || die "docker needed to stand up MinIO (blimp --setup installs it)"
-  MK="${MINIO_ROOT_USER:-blimpadmin}"; MS="${MINIO_ROOT_PASSWORD:-blimp$(printf '%s' "$CLUSTER_ID" | tail -c 8)Pw!}"
-  log "standing up MinIO :9000 + bucket blimp-sf${SF} on this box, loading SF${SF}"
+  # Random root password, generated once and kept (mode 600) so a re-run reuses
+  # the existing data dir with the same credentials. MINIO_ROOT_PASSWORD overrides.
+  local pwf="$HOME/.blimp_minio_pw"
+  MK="${MINIO_ROOT_USER:-blimpadmin}"
+  if [ -n "${MINIO_ROOT_PASSWORD:-}" ]; then MS="$MINIO_ROOT_PASSWORD"
+  elif [ -s "$pwf" ]; then MS="$(cat "$pwf")"
+  else
+    MS="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32)"
+    [ "${#MS}" -ge 16 ] || die "could not generate a MinIO password from /dev/urandom"
+    ( umask 077; printf '%s' "$MS" > "$pwf" )
+  fi
+  # Never publish on 0.0.0.0 by default: S3 binds this box's private address
+  # (MINIO_BIND overrides, e.g. 127.0.0.1 or 0.0.0.0), the console loopback only.
+  ADV="${ADVERTISE_HOST:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+  local bind="${MINIO_BIND:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+  [ -n "$bind" ] || bind=127.0.0.1
+  local lep="http://$bind:9000"; [ "$bind" = 0.0.0.0 ] && lep="http://127.0.0.1:9000"
+  log "standing up MinIO $bind:9000 + bucket blimp-sf${SF} on this box, loading SF${SF}"
   local_dkr rm -f blimp-minio >/dev/null 2>&1 || true
-  local_dkr run -d --name blimp-minio --restart unless-stopped -p 9000:9000 -p 9001:9001 \
+  local_dkr run -d --name blimp-minio --restart unless-stopped \
+    -p "$bind:9000:9000" -p 127.0.0.1:9001:9001 \
     -e MINIO_ROOT_USER="$MK" -e MINIO_ROOT_PASSWORD="$MS" \
     -v "$HOME/.blimp_minio_data:/data" minio/minio server /data --console-address ":9001" >/dev/null \
     || die "minio start failed"
-  for i in $(seq 1 25); do curl -s -m2 -o /dev/null http://localhost:9000/minio/health/live && break; sleep 2; done
-  curl -s -m3 -o /dev/null http://localhost:9000/minio/health/live || die "MinIO did not come up on :9000"
-  ADV="${ADVERTISE_HOST:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+  for i in $(seq 1 25); do curl -s -m2 -o /dev/null "$lep/minio/health/live" && break; sleep 2; done
+  curl -s -m3 -o /dev/null "$lep/minio/health/live" || die "MinIO did not come up on $bind:9000"
   BKT="blimp-sf${SF}"
   AWS_ACCESS_KEY_ID="$MK" AWS_SECRET_ACCESS_KEY="$MS" AWS_DEFAULT_REGION=us-east-1 \
-    aws --endpoint-url "http://localhost:9000" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
+    aws --endpoint-url "$lep" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
   AWS_ACCESS_KEY_ID="$MK" AWS_SECRET_ACCESS_KEY="$MS" AWS_DEFAULT_REGION=us-east-1 \
-    aws --endpoint-url "http://localhost:9000" s3 sync "$OUT" "s3://$BKT/" --exclude ".done" >&2 \
+    aws --endpoint-url "$lep" s3 sync "$OUT" "s3://$BKT/" --exclude ".done" >&2 \
     || die "MinIO load failed"
-  echo "ORIGIN_BUCKET=$BKT"
-  echo "WAREHOUSE=s3://$BKT/wh"
-  echo "S3_ENDPOINT=http://${ADV}:9000"
-  echo "S3_KEY=$MK"
-  echo "S3_SECRET=$MS"
-  echo "REGION=us-east-1"
+  emit ORIGIN_BUCKET "$BKT"
+  emit WAREHOUSE "s3://$BKT/wh"
+  emit S3_ENDPOINT "http://${ADV:-$bind}:9000"
+  emit S3_KEY "$MK"
+  emit S3_SECRET "$MS"
+  emit REGION us-east-1
 }
 
 # --- 2a. FLEET CACHE LAYER (the default when --setup picked it) ---------------
@@ -125,12 +135,12 @@ fleet_source(){
   # shellcheck disable=SC2086
   aws --endpoint-url "$ep" $vfy s3 sync "$OUT" "s3://$bkt/" --exclude ".done" >&2 \
     || die "fleet upload failed (endpoint $ep, bucket $bkt)"
-  echo "ORIGIN_BUCKET=$bkt"
-  echo "WAREHOUSE=s3://$bkt/wh"
-  echo "S3_ENDPOINT=$ep"
-  echo "S3_KEY=$AWS_ACCESS_KEY_ID"
-  echo "S3_SECRET=$AWS_SECRET_ACCESS_KEY"
-  echo "REGION=${AWS_DEFAULT_REGION}"
+  emit ORIGIN_BUCKET "$bkt"
+  emit WAREHOUSE "s3://$bkt/wh"
+  emit S3_ENDPOINT "$ep"
+  emit S3_KEY "$AWS_ACCESS_KEY_ID"
+  emit S3_SECRET "$AWS_SECRET_ACCESS_KEY"
+  emit REGION "${AWS_DEFAULT_REGION}"
 }
 
 # `gateway` is the same shape as `fleet`: an S3 endpoint plus keys that the
@@ -173,10 +183,10 @@ if [ "$ON_AWS" = 1 ] && command -v aws >/dev/null && aws sts get-caller-identity
     log "upload to s3://$BKT failed"
   fi
   if [ "$S3_OK" = 1 ]; then
-    echo "ORIGIN_BUCKET=$BKT"
-    echo "WAREHOUSE=s3://$BKT/wh"
-    echo "S3_ENDPOINT=https://s3.${REGION}.amazonaws.com"
-    echo "REGION=$REGION"
+    emit ORIGIN_BUCKET "$BKT"
+    emit WAREHOUSE "s3://$BKT/wh"
+    emit S3_ENDPOINT "https://s3.${REGION}.amazonaws.com"
+    emit REGION "$REGION"
   else
     log "this box's AWS identity has no writable S3 bucket — falling back to MinIO ON THIS BOX"
     minio_source
