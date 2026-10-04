@@ -421,7 +421,7 @@ delta merge (phases 2-3):
 | 1 | run the query → the node authors an MV from your source | `author_ms`, `materialize_ms`, `verify_ms`, `cold_serve` |
 | 2 (with `--tick`) | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
 | 3 (with `--tick`) | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
-| 4 (with `--verify`) | run the original query over base, compare with the served result (the tick's, with `--tick`) | `verify: MATCH / MATCH(float) / MISMATCH` |
+| 4 (with `--verify`) | run the original query over base, compare with the served result (the tick's, with `--tick`) | `verify: MATCH / MATCH(float) / MATCH(ties) / MISMATCH` |
 
 **One query, several ways.** What changes is whether the MV is rebuilt, whether
 rows are appended and merged, and whether the answer is checked:
@@ -478,8 +478,16 @@ query  fact           mv_rows x cols  author_ms  merge_ms      mode  incr_ms  de
 q1     store_returns      177924x5         4270     19216  incremental     329          50  merged
 ```
 
-The `verify` column is `MATCH` / `MATCH(float)` / `MISMATCH` with `--verify`,
-`(no --verify)` without it. Under the table each query prints the tick's result
+The `verify` column is `MATCH` / `MATCH(float)` / `MATCH(ties)` / `MISMATCH`
+with `--verify`, `(no --verify)` without it. `MATCH(float)`: same rows once
+floats are rounded to 9 significant digits. `MATCH(ties)`: the query ends in
+`ORDER BY … LIMIT n` and its cut falls inside a group of rows tied on the
+ORDER BY key, so each side kept different tied rows and both are correct (q59).
+It is given only when both results have exactly n rows, every ORDER BY item is
+an ordinal or a bare output column, the last tied group has the same key and
+size on both sides, and every other row is identical — read off the two
+persisted result parquets (`result:` and `base:`) by `verify_ties.py`, which
+also prints a `ties:` line saying why a MISMATCH stood. Under the table each query prints the tick's result
 (status, rows, md5) and two links the node hosts — the same pages the node
 panel's Query tab opens: `mv:` the MV table, `result:` this tick's result, and
 with `--verify` `base:` the original query's answer over base, all paginated in

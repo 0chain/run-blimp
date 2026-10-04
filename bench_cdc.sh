@@ -525,6 +525,16 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       elif [ -n "${I_MD5R[$n]:-}" ] && [ "${I_MD5R[$n]}" != null ] && [ "${I_MD5R[$n]}" = "$bmd5r" ]; then v="MATCH(float)"
       else v="MISMATCH"; fi
       V_RESULT[$n]="$v"; V_RESURL[$n]=$(echo "$B" | J result_url)
+      # ORDER BY ... LIMIT n whose cut falls inside a group of tied rows: either
+      # side may keep different tied rows and both are correct (q59). Compare the
+      # two persisted result parquets; MATCH(ties) only when nothing but that last
+      # tied group differs (verify_ties.py states the rule).
+      if [ "$v" = MISMATCH ] && [ -n "$MV_S3_KEY" ] && [ -n "${I_RESURL[$n]:-}" ] && [ -n "${V_RESURL[$n]}" ]; then
+        tv=$(MV_BUCKET="$MV_BUCKET" MV_S3_ENDPOINT="$MV_S3_ENDPOINT" MV_S3_KEY="$MV_S3_KEY" MV_S3_SECRET="$MV_S3_SECRET" \
+          "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" 2>&1) \
+          && v="MATCH(ties)" && V_RESULT[$n]="$v"
+        echo "   $n: ties: ${tv##*$'\n'}"
+      fi
       echo "   $n: verify: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
     done
   fi
