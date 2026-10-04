@@ -110,7 +110,8 @@ Wiring is saved to `~/.blimp_env` by `--setup`; every command reads it.
 **Running a command with no wiring offers to run `--setup` for you first.**
 
 Rough timing: `--setup` about 10-15 minutes end to end (longer at SF100+),
-`--query` about 5 minutes per query, `--storage` about 30 minutes for all three
+`--query` about 5 minutes per query at SF1 (at SF1000 a cold author plus
+tick is 1-20 minutes depending on the query), `--storage` about 30 minutes for all three
 legs, `--acid` about 5 minutes.
 
 **Zero-touch / CI:** every prompt is skipped when its env var is pre-set —
@@ -465,6 +466,30 @@ panel's **Query** tab.
 `--verify` is off by default: the node does not re-check served answers in
 production (the author verify already proved the MV), so an unflagged run
 measures the production path. Use it to prove a tick's answer is correct.
+
+`UNCHECKED` means phase 4 could not produce a reference: the original query
+over base failed (typically it ran out of memory or spill on a very large
+query), so the tick's answer is unproven, not wrong. Re-run
+`blimp --query --tpc N --verify` on a quiet node with more free disk.
+
+**First tick vs steady state.** Each `--query` run does one append and one tick.
+After a cold author (`--evict`) the first tick is the coldest one: caches are
+empty and helper units may still be building. Run the same query again without
+`--evict` to measure the next tick, which is what every later update costs:
+
+```
+blimp --query --tpc 3 --evict              # author + first tick
+blimp --query --tpc 3 --verify             # next tick (steady state) + post-verify
+```
+
+**Appends stay realistic.** Each tick's fact rows reference dimension keys
+from the table as originally loaded (its first Iceberg snapshot), plus only the
+few dimension rows that tick itself adds. New dimension rows per tick are a
+fixed share of the as-loaded size (`--dim-rate`), and facts reference new keys
+only until they reach `CDC_DIM_GROWTH` of it (default 0.01). Long benchmark runs
+therefore do not inflate dimension cardinalities. Data produced by kits before
+this change can be reset by setting each table's current snapshot back to its
+first one; earlier snapshots are retained, so this is reversible.
 
 Multi-fact batches still work: `SUITES="store_sales:3 19 43;store_returns:1"`.
 Join-CTE queries (q64-class) only see a delta when the append touches **both**
