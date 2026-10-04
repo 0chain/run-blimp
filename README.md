@@ -443,19 +443,22 @@ blimp --query --sql ./my_query.sql             # YOUR SQL file
 blimp --query --sql ./queries/                 # a directory of .sql files
 blimp --query --evict --verify                 # cold start + correctness check
 blimp --query --tick --append-rows 50000       # bigger CDC tick (default 5000)
-./tpc_all                                      # all 99, one query at a time (see below)
+./tpc_batch suites/all-99                      # all 99, one query at a time (see below)
 blimp --query --second-40                      # named batches: --first-10 (default), --second-40,
                                                #   --third-30, --fourth-19 (together = all 99); they stack
 ```
 
-`./tpc_all` runs TPC-DS queries one at a time, each in two blimp runs: a cold
-run (`--evict-family --tick`: evict the query's MV family, author it with the
-author's row-hash verify, append, tick 1), then a steady-state run
-(`--tick --verify`: append, tick 2, compare the answer with the original query
-over base). It prints one line per query — author seconds, the author's verify
-seconds, tick 1, tick 2, MATCH / MISMATCH — and saves the logs and
-`summary.txt` under `./tpc_all_logs` (`TPC_ALL_OUT` to move them).
-`./tpc_all "3 7 19"` runs a subset.
+`./tpc_batch <list-file>` runs a batch of queries one at a time, each in two
+blimp runs: a cold run (`--evict-family --tick`: evict the query's MV family,
+author it with the author's row-hash verify, append, tick 1), then a
+steady-state run (`--tick --verify`: append, tick 2, compare the answer with
+the original query over base). The list file names the queries, whitespace- or
+line-separated, `#` for comments: TPC-DS numbers (`17`), named suites
+(`first-10`), `.sql` files or directories of them (relative to the list file).
+It prints one line per query — author seconds, the author's verify seconds,
+tick 1, tick 2, MATCH / MISMATCH — and saves the logs and `summary.txt` under
+`./tpc_batch_logs` (`TPC_BATCH_OUT` to move them). With no argument it runs
+`suites/all-99`. Split a long run across nodes by giving each its own list.
 
 `--sql` sends the query in your `.sql` file. It can read any table registered
 in the Iceberg catalog — the node's DuckDB loads those tables to author the MV

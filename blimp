@@ -81,7 +81,7 @@ usage(){
                                          the release-50, then the remaining 49 split
                                          30/19. Flags stack, and a batch name also
                                          works as a --tpc token. All 99, one query
-                                         at a time with two ticks each: ./tpc_all
+                                         at a time with two ticks each: ./tpc_batch
                      --tick              then append rows to the source and run the
                                          query again: the node delta-merges them
                      --append-rows N     CDC tick base rows (default 5000, with --tick)
