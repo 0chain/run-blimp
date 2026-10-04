@@ -317,6 +317,11 @@ except Exception: print(-1)' 2>/dev/null)
   # Without it the run stops after phase 1 (author / serve); --verify then
   # checks the phase-1 served result.
   if [ "${TICK:-0}" = 1 ]; then
+  # TICKS=N (default 1): N append+re-run rounds in this one call, so a second
+  # tick does not need a second blimp call (whose phase 1 re-serves an
+  # unchanged MV for nothing).
+  for _tick_i in $(seq 1 "${TICKS:-1}"); do
+  [ "${TICKS:-1}" -gt 1 ] && echo ">> tick $_tick_i/${TICKS}"
   # ---- DRAIN THE DETACHED AUTHORS BEFORE ANYTHING TOUCHES THE SOURCE --------
   # Backstop for a refresh or build started late. AUTHOR_DRAIN_SEC=0 skips it.
   echo ">> draining detached authors before the tick"
@@ -503,6 +508,7 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
+  done  # TICKS
   fi  # TICK
   # ---- phase 4 (--verify): the tick's served result vs the ORIGINAL query ---
   # One plain comparison: run each query's original SQL over base (no_mv, same

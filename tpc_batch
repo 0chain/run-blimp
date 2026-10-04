@@ -1,12 +1,10 @@
 #!/bin/bash
 # tpc_batch — run a batch of queries ONE AT A TIME through blimp, the way the
 # SF1000 benchmark is run. Per query:
-#   1. blimp --query <q> --evict-family --tick   cold: evict the query's MV family,
-#                                                author (+ the author's row-hash
-#                                                verify), append, tick 1
-#   2. blimp --query <q> --tick --verify         steady state: append, tick 2, then
-#                                                compare the tick's answer with the
-#                                                original query over base
+#   TICKS=2 blimp --query <q> --evict-family --tick --verify
+#     one call: evict the query's MV family, author (+ the author's row-hash
+#     verify), append + tick 1, append + tick 2, then compare the tick's answer
+#     with the original query over base
 # and prints one summary line per query.
 #
 # usage: ./tpc_batch <list-file>     (default: suites/all-99)
@@ -49,16 +47,16 @@ while read -r kind q; do
   if [ "$kind" = tpc ]; then n="q$q"; arg="--tpc $q"; else n="$(basename "$q" .sql)"; arg="--sql $q"; fi
   t0=$(date +%s)
   echo "== $n $(date -u +%T)"
-  b "$arg" "--evict-family --tick" "$OUT/${n}_1.log"
-  b "$arg" "--tick --verify"       "$OUT/${n}_2.log"
+  # one call: evict family, author, tick 1, tick 2, verify (TICKS=2)
+  TICKS=2 b "$arg" "--evict-family --tick --verify" "$OUT/${n}_1.log"
   # author = wall seconds from phase 1 to phase 2 of the cold run (covers the
   # author's build, its row-hash verify and the drain of its background work)
   aw=$(awk '/>> phase 1/{a=$1} />> phase 2/{if(a){print $1-a; exit}}' "$OUT/${n}_1.log")
   av=$(grep -m1 -oE "$n: author=[0-9?]+ materialize=[0-9?]+ verify=[0-9?]+" "$OUT/${n}_1.log" | sed 's/.*verify=//')
   case "$av" in ''|'?') ;; *) av=$(awk -v m="$av" 'BEGIN{printf "%.1f", m/1000}') ;; esac
-  t1=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | tail -1 | awk '{print $3}')
-  t2=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_2.log" | tail -1 | awk '{print $3}')
-  v=$(grep -oE "$n: verify: [A-Z()a-z]+" "$OUT/${n}_2.log" | tail -1 | awk '{print $3}')
+  t1=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | head -1 | awk '{print $3}')
+  t2=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | sed -n 2p | awk '{print $3}')
+  v=$(grep -oE "$n: verify: [A-Z()a-z]+" "$OUT/${n}_1.log" | tail -1 | awk '{print $3}')
   printf '%-14s author=%ss verify=%ss tick1=%ss tick2=%ss result=%s wall=%ss\n' \
     "$n" "${aw:-?}" "${av:-?}" "${t1:-?}" "${t2:-?}" "${v:-?}" "$(( $(date +%s) - t0 ))" | tee -a "$SUM"
 done < <(entries "$LIST")
