@@ -531,6 +531,23 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
 done
 sleep 4
 
+# ---- without --tick: the served result only (no append, no merge) ------------
+if [ "${TICK:-0}" != 1 ]; then
+  echo ""
+  echo "=================================== RESULTS ==================================="
+  printf '%-10s %-14s %16s %11s %10s %10s %-12s\n' query fact 'mv_rows x cols' author_ms verify_ms serve_ms verify
+  for n in "${NAMES[@]}"; do
+    printf '%-10s %-14s %16s %11s %10s %10s %-12s\n' "$n" "${FACT[$n]}" "${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}" \
+      "${A_MS[$n]:-?}" "${V_MS[$n]:-0}" "${S_MS[$n]:-?}" "${V_RESULT[$n]:-(no --verify)}"
+  done
+  for n in "${NAMES[@]}"; do
+    u() { [ -n "$1" ] && [ "$1" != null ] && printf '%s' "$1" || printf '%s' "$2"; }
+    echo "  $n: result: status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${I_MD5[$n]:-?}  verify=${V_RESULT[$n]:-(no --verify)}"
+    echo "      mv:     $(u "${I_MVURL[$n]:-}" "none (served from base)")"
+    [ -n "${V_RESULT[$n]:-}" ] && echo "      base:   $(u "${V_RESURL[$n]:-}" "not persisted (gateway without persist_result)")"
+  done
+  echo "DONE"; exit 0
+fi
 # ---- pull per-MV merge_ms + mode from the wave log -----------------------------
 WAVE=$(curl -s -m 30 "$QAPI/admin/mv/wave/report?limit=40" -H "Authorization: Bearer $TOKEN")
 for n in "${NAMES[@]}"; do
