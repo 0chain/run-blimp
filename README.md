@@ -415,7 +415,7 @@ not part of production operation (production is your pipeline + the
 
 | phase | what happens | what you get |
 |---|---|---|
-| 0 (with `--evict`) | drop each query's MV, keep its recipe | a genuinely cold start |
+| 0 (with `--evict` / `--evict-family`) | drop each query's MV (or its whole family), keep its recipe | a genuinely cold start |
 | 1 | run the query → the node authors an MV from your source | `author_ms`, `materialize_ms`, `verify_ms`, `cold_serve` |
 | 2 | append rows to the source, then `POST /admin/source/snapshot_changed` | the appended row counts + new snapshot ids |
 | 3 | run the query again → the node delta-merges the appended rows | `merge_ms`, `mode`, `incr_query` (the warm serve) |
@@ -429,6 +429,8 @@ blimp --query --sql ./my_query.sql          # the same three ways work with your
 blimp --query --tpc 3                      # 1. as-is: serve the MV the node already has (authors only if none), append, tick
 blimp --query --tpc 3 --evict              # 2. cold: evict the MV, re-author it (+ author verify), append, tick
 blimp --query --tpc 3 --evict --verify     # 3. cold + post-verify: as 2, then the tick's answer vs the original query over base
+blimp --query --tpc 3 --evict-family        # cold for the whole family: evict every MV banked under the query
+                                           #   (its chart, branch MVs and answer MVs), not only the matched MV
 ```
 
 ```
