@@ -180,7 +180,14 @@ print('')" "$1" 2>/dev/null; }
 # Two-tier answers regenerate from their chart MV the moment the answer is
 # evicted, so evict-and-rematch until the matcher returns nothing.
 evict_query(){ # evict_query <sql> <name>
-  local rounds=0 busy=0 m t ns e ok rg e2 last=
+  local rounds=0 busy=0 m t ns e ok rg e2 last= ef
+  # Whole family first: the gateway resolves the query's signature from its
+  # text and evicts every MV banked under it (chart, branches, answers),
+  # recipes kept. The per-MV loop below stays as the fallback for gateways
+  # that predate original_sql on /admin/mv/evict.
+  ef=$(curl -s -m 300 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"cascade":True,"confirm":True,"force":True,"keep_recipe":True}))' "$1" "$SOURCE")")
+  echo "   $2: evict family evicted=$(echo "$ef" | J evicted) kept_shared=$(echo "$ef" | J kept_shared) $(echo "$ef" | J error)"
   while :; do
     m=$(curl -s -m 600 "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[3],"label":sys.argv[2]+":match","match_only":True,"skip_verify":True,"skip_passthrough":True}))' "$1" "$2" "$SOURCE")")
