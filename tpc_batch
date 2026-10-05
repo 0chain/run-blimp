@@ -17,6 +17,11 @@
 #      BLIMP_ENV      wiring file, as for blimp
 #      TPC_BATCH_EVICT=0  warm run: keep each query's MVs (default 1: evict the family first)
 #      TPC_BATCH_VERIFY=0 ticks only: skip the phase-4 verify against base
+#      TPC_BATCH_TICK=0   no append/tick: serve (or author) once, then the
+#                         phase-4 verify if on — verify-only:
+#                           TPC_BATCH_EVICT=0 TPC_BATCH_TICK=0 ./tpc_batch L
+#                         author-only (evict the family, no verify):
+#                           TPC_BATCH_TICK=0 TPC_BATCH_VERIFY=0 ./tpc_batch L
 # --tick appends TPC-DS rows: on non-TPC-DS tables phase 2 reports CDC TICK
 # FAILED and the ticks measure an unchanged MV (see README).
 set -u
@@ -54,16 +59,21 @@ while read -r kind q; do
   ev="--evict-family"; [ "${TPC_BATCH_EVICT:-1}" = 0 ] && ev=""
   # TPC_BATCH_VERIFY=0: ticks only, no phase-4 verify against base
   vf="--verify"; [ "${TPC_BATCH_VERIFY:-1}" = 0 ] && vf=""
-  TICKS=2 b "$arg" "$ev --tick $vf" "$OUT/${n}_1.log"
-  # author = wall seconds from phase 1 to phase 2 of the cold run (covers the
-  # author's build, its row-hash verify and the drain of its background work)
-  aw=$(awk '/>> phase 1/{a=$1} />> phase 2/{if(a){print $1-a; exit}}' "$OUT/${n}_1.log")
+  # TPC_BATCH_TICK=0: no append/tick (verify-only or author-only)
+  tk="--tick"; [ "${TPC_BATCH_TICK:-1}" = 0 ] && tk=""
+  TICKS=2 b "$arg" "$ev $tk $vf" "$OUT/${n}_1.log"
+  # author = wall seconds from phase 1 to the next phase (2 with a tick, else 4
+  # or the results): the author's build, its row-hash verify and the drain of
+  # its background work — or the warm serve when nothing was evicted
+  aw=$(awk '/>> phase 1/{a=$1} /(>> phase [24]|= RESULTS =)/{if(a){print $1-a; exit}}' "$OUT/${n}_1.log")
+  # check = wall seconds of the phase-4 verify (the original query over base)
+  cw=$(awk '/>> phase 4/{a=$1} /(= RESULTS =|^[0-9]+ DONE)/{if(a){print $1-a; exit}} END{}' "$OUT/${n}_1.log")
   av=$(grep -m1 -oE "$n: author=[0-9?]+ materialize=[0-9?]+ verify=[0-9?]+" "$OUT/${n}_1.log" | sed 's/.*verify=//')
   case "$av" in ''|'?') ;; *) av=$(awk -v m="$av" 'BEGIN{printf "%.1f", m/1000}') ;; esac
   t1=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | head -1 | awk '{print $3}')
   t2=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | sed -n 2p | awk '{print $3}')
   v=$(grep -oE "$n: verify: [A-Z()a-z]+" "$OUT/${n}_1.log" | tail -1 | awk '{print $3}')
-  printf '%-14s author=%ss verify=%ss tick1=%ss tick2=%ss result=%s wall=%ss\n' \
-    "$n" "${aw:-?}" "${av:-?}" "${t1:-?}" "${t2:-?}" "${v:-?}" "$(( $(date +%s) - t0 ))" | tee -a "$SUM"
+  printf '%-14s author=%ss verify=%ss tick1=%ss tick2=%ss result=%s wall=%ss check=%ss\n' \
+    "$n" "${aw:-?}" "${av:-?}" "${t1:-?}" "${t2:-?}" "${v:-?}" "$(( $(date +%s) - t0 ))" "${cw:-?}" | tee -a "$SUM"
 done < <(entries "$LIST")
 echo; echo "== summary ($(wc -l < "$SUM") queries; logs in $OUT)"; cat "$SUM"
