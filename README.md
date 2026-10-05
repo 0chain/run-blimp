@@ -66,6 +66,20 @@ node so origin reads never leave it; a different network or cloud works but
 adds hops and, across providers, egress cost on every read.
 
 
+## Quick test — one TPC-DS query
+
+1. Install: `git clone https://github.com/0chain/run-blimp && cd run-blimp`
+2. Connect to the node once (~10-15 min; asks for the cluster ID and token, saves `~/.blimp_env`): `./blimp --setup`
+3. Run a query (q3 here): `./blimp --query --tpc 3 --tick`
+   - `--tick` appends rows and measures how fast the answer updates (delta merge).
+   - `--evict-family` forces a cold author first.
+   - `--verify` also checks the tick's answer against the original query over base (MATCH / MISMATCH); it costs one full original-query run.
+4. Several queries: `echo "3 7 19" > list.txt && ./tpc_batch list.txt` — one line per query: `author= verify= tick1= tick2= result= wall=`.
+   `TPC_BATCH_EVICT=0` reuses existing MVs; `TPC_BATCH_VERIFY=0` skips the check.
+5. Watch live on the node panel's **Query** tab: each run shows its **flow** (plain-language steps) and a **raw steps** toggle.
+
+Report per query: author, tick1, tick2, result — flag any MISMATCH and any tick slower than StarRocks for that query.
+
 ## Install
 
 `blimp` is a self-contained CLI — install it once, then it bootstraps its own
