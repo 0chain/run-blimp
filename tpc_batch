@@ -15,6 +15,7 @@
 #   queries/            a directory: every .sql file in it
 # env: TPC_BATCH_OUT  log directory (default ./tpc_batch_logs)
 #      BLIMP_ENV      wiring file, as for blimp
+#      TPC_BATCH_EVICT=0  warm run: keep each query's MVs (default 1: evict the family first)
 # --tick appends TPC-DS rows: on non-TPC-DS tables phase 2 reports CDC TICK
 # FAILED and the ticks measure an unchanged MV (see README).
 set -u
@@ -48,7 +49,9 @@ while read -r kind q; do
   t0=$(date +%s)
   echo "== $n $(date -u +%T)"
   # one call: evict family, author, tick 1, tick 2, verify (TICKS=2)
-  TICKS=2 b "$arg" "--evict-family --tick --verify" "$OUT/${n}_1.log"
+  # TPC_BATCH_EVICT=0: warm run — keep the query's MVs (no --evict-family)
+  ev="--evict-family"; [ "${TPC_BATCH_EVICT:-1}" = 0 ] && ev=""
+  TICKS=2 b "$arg" "$ev --tick --verify" "$OUT/${n}_1.log"
   # author = wall seconds from phase 1 to phase 2 of the cold run (covers the
   # author's build, its row-hash verify and the drain of its background work)
   aw=$(awk '/>> phase 1/{a=$1} />> phase 2/{if(a){print $1-a; exit}}' "$OUT/${n}_1.log")
