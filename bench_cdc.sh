@@ -53,6 +53,31 @@ else
   [ -z "${SUITES:-}" ] && DERIVE_FACT=1
   SUITES="${SUITES:-store_sales:47 59 88 13 9}"
 fi
+declare -A V_TICK1
+verify_served() { # <name> <label suffix> <printed tag>: the served result vs the original over base
+  local n="$1" B bst brows bmd5 bmd5r tmd5 v tv
+    B=$(curl -s -m "${VERIFY_CAP_S:-3600}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True,"persist_result":True}))' "${SQL[$n]}" "$SOURCE" "$n:verify$2")")
+    bst=$(echo "$B" | J status); brows=$(echo "$B" | J rows); bmd5=$(echo "$B" | J md5); bmd5r=$(echo "$B" | J md5_rounded)
+    tmd5="${I_MD5[$n]:-}"; [ "$tmd5" = null ] && tmd5=""; [ "$bmd5" = null ] && bmd5=""
+    if [ -z "$tmd5" ] || [ -z "$bmd5" ]; then v="UNCHECKED"
+    elif [ "$tmd5" = "$bmd5" ]; then v="MATCH"
+    elif [ -n "${I_MD5R[$n]:-}" ] && [ "${I_MD5R[$n]}" != null ] && [ "${I_MD5R[$n]}" = "$bmd5r" ]; then v="MATCH(float)"
+    else v="MISMATCH"; fi
+    V_RESULT[$n]="$v"; V_RESURL[$n]=$(echo "$B" | J result_url)
+    # ORDER BY ... LIMIT n whose cut falls inside a group of tied rows: either
+    # side may keep different tied rows and both are correct (q59). Compare the
+    # two persisted result parquets; MATCH(ties) only when nothing but that last
+    # tied group differs (verify_ties.py states the rule).
+    if [ "$v" = MISMATCH ] && [ -n "$MV_S3_KEY" ] && [ -n "${I_RESURL[$n]:-}" ] && [ -n "${V_RESURL[$n]}" ]; then
+      tv=$(MV_BUCKET="$MV_BUCKET" MV_S3_ENDPOINT="$MV_S3_ENDPOINT" MV_S3_KEY="$MV_S3_KEY" MV_S3_SECRET="$MV_S3_SECRET" \
+        "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" 2>&1) \
+        && v="MATCH(ties)" && V_RESULT[$n]="$v"
+      echo "   $n: ties: ${tv##*$'\n'}"
+    fi
+    echo "   $n: verify$3: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
+}
 declare -A SQL FACT QFILE QTABLES; NAMES=()
 # ANY SQL, ANY DATASET (blimp --query --sql <file|dir>): SQL_FILES lists .sql
 # files (a directory expands to its *.sql). The query's tables and its FACT are
@@ -508,6 +533,13 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
+  # EVERY TICK IS CHECKED (user mandate 2026-10-07): a tick that is not the last
+  # is compared with the original over base here, before the next append
+  # changes the source — phase 4 below checks only the last tick.
+  if [ "${VERIFY:-0}" = 1 ] && [ "$_tick_i" -lt "${TICKS:-1}" ] && [ "${VERIFY_EACH_TICK:-1}" = 1 ]; then
+    echo ">> tick $_tick_i verify — served result vs original query over base"
+    for n in $FNAMES; do verify_served "$n" "-t$_tick_i" "(tick $_tick_i)"; V_TICK1[$n]="${V_RESULT[$n]}"; done
+  fi
   done  # TICKS
   fi  # TICK
   # ---- phase 4 (--verify): the tick's served result vs the ORIGINAL query ---
@@ -521,27 +553,9 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
   if [ "${VERIFY:-0}" = 1 ]; then
     echo ">> phase 4: verify — served result vs original query over base"
     for n in $FNAMES; do
-      B=$(curl -s -m "${VERIFY_CAP_S:-3600}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True,"persist_result":True}))' "${SQL[$n]}" "$SOURCE" "$n:verify")")
-      bst=$(echo "$B" | J status); brows=$(echo "$B" | J rows); bmd5=$(echo "$B" | J md5); bmd5r=$(echo "$B" | J md5_rounded)
-      tmd5="${I_MD5[$n]:-}"; [ "$tmd5" = null ] && tmd5=""; [ "$bmd5" = null ] && bmd5=""
-      if [ -z "$tmd5" ] || [ -z "$bmd5" ]; then v="UNCHECKED"
-      elif [ "$tmd5" = "$bmd5" ]; then v="MATCH"
-      elif [ -n "${I_MD5R[$n]:-}" ] && [ "${I_MD5R[$n]}" != null ] && [ "${I_MD5R[$n]}" = "$bmd5r" ]; then v="MATCH(float)"
-      else v="MISMATCH"; fi
-      V_RESULT[$n]="$v"; V_RESURL[$n]=$(echo "$B" | J result_url)
-      # ORDER BY ... LIMIT n whose cut falls inside a group of tied rows: either
-      # side may keep different tied rows and both are correct (q59). Compare the
-      # two persisted result parquets; MATCH(ties) only when nothing but that last
-      # tied group differs (verify_ties.py states the rule).
-      if [ "$v" = MISMATCH ] && [ -n "$MV_S3_KEY" ] && [ -n "${I_RESURL[$n]:-}" ] && [ -n "${V_RESURL[$n]}" ]; then
-        tv=$(MV_BUCKET="$MV_BUCKET" MV_S3_ENDPOINT="$MV_S3_ENDPOINT" MV_S3_KEY="$MV_S3_KEY" MV_S3_SECRET="$MV_S3_SECRET" \
-          "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" 2>&1) \
-          && v="MATCH(ties)" && V_RESULT[$n]="$v"
-        echo "   $n: ties: ${tv##*$'\n'}"
-      fi
-      echo "   $n: verify: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
+      verify_served "$n" "" ""
+      # a tick-1 verdict that was not a match overrides the final one
+      case "${V_TICK1[$n]:-MATCH}" in MATCH*) ;; *) V_RESULT[$n]="TICK1-${V_TICK1[$n]}"; echo "   $n: verify: ${V_RESULT[$n]} (tick 1 served a wrong or unchecked answer)";; esac
     done
   fi
 done
