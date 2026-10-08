@@ -81,7 +81,26 @@ def snapshot(fs, bucket, tables):
             for t in tables}
 
 
-def verdict(fs, bucket, tables, pre):
+def verdict(fs, bucket, tables, pre, wait_s=None):
+    """A tick's delta part is written locally and uploaded by a queue, so the
+    first read of parts.json can predate it (q14 SF10 2026-10-08: two real parts,
+    gate read UNCHANGED 0). An UNCHANGED table is re-read until DELTA_GATE_WAIT_S
+    (default 30) passes; every other verdict is final on first read."""
+    import time
+    if wait_s is None:
+        wait_s = float(os.environ.get("DELTA_GATE_WAIT_S", "30"))
+    out = _verdict_once(fs, bucket, tables, pre)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        pending = [t for t, r in out.items() if r["verdict"] == "UNCHANGED"]
+        if not pending:
+            break
+        time.sleep(3)
+        out.update(_verdict_once(fs, bucket, pending, pre))
+    return out
+
+
+def _verdict_once(fs, bucket, tables, pre):
     out = {}
     for t in tables:
         before = pre.get(t) or {"parts": [], "etag": ""}

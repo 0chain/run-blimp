@@ -579,6 +579,11 @@ if [ "${TICK:-0}" != 1 ]; then
   echo "DONE"; exit 0
 fi
 # ---- pull per-MV merge_ms + mode from the wave log -----------------------------
+# The gateway's wave-log modes that fold a delta into the MV (no rebuild), and
+# those that found nothing to fold.
+MERGE_MODES="incremental keylocal keylocal-anchor companion partition-part subtract answer_chart answer_legs"
+NOOP_MODES="empty-delta-noop keylocal-noop ri-prune-noop compaction-noop empty-wave-noop no-delta"
+is_mode_in() { case " $2 " in *" $1 "*) return 0;; esac; return 1; }
 WAVE=$(curl -s -m 30 "$QAPI/admin/mv/wave/report?limit=40" -H "Authorization: Bearer $TOKEN")
 for n in "${NAMES[@]}"; do
   t="${MVTBL[$n]##*.}"
@@ -589,9 +594,13 @@ for n in "${NAMES[@]}"; do
   # real refresh exists.
   read m md < <(echo "$WAVE" | python3 -c "
 import json,sys
+MERGE_MODES=tuple('$MERGE_MODES'.split())
 w=json.load(sys.stdin).get('waves',[])
 rows=[x for x in w if (x.get('mv_table','').split('.')[-1])=='$t']
-real=[x for x in rows if x.get('mode') in ('incremental','full')]
+# Every gateway refresh mode that did work (a merge of any kind, or a
+# rebuild) — not only 'incremental': key-local / companion / partition merges
+# were read as 'full re-author' (q16/q95 KEY-LOCAL merges, SF10 2026-10-08).
+real=[x for x in rows if x.get('mode') in MERGE_MODES+('full','rebuild','rebaseline','fallback')]
 x=(real or rows or [{}])[0]
 print(x.get('merge_ms', x.get('materialize_ms','')) or '-', x.get('mode','-'))")
   MERGE[$n]="$m"; MODE[$n]="$md"
@@ -658,10 +667,12 @@ echo "Do NOT report a merge_ms whose verdict is EMPTY or UNCHANGED as a result."
 for n in "${NAMES[@]}"; do
   if [ -z "${MVTBL[$n]:-}" ] || [ "${MVTBL[$n]}" = "none" ]; then
     echo "  $n: no MV — served from base"
-  elif [ "${MODE[$n]:-}" != "incremental" ]; then
-    echo "  $n: MV ${MVTBL[$n]} — refreshed by full re-author (mode='${MODE[$n]:--}')"
-  else
+  elif is_mode_in "${MODE[$n]:-}" "$MERGE_MODES"; then
     echo "  $n: MV ${MVTBL[$n]} — delta-merged"
+  elif is_mode_in "${MODE[$n]:-}" "$NOOP_MODES"; then
+    echo "  $n: MV ${MVTBL[$n]} — delta-merged (empty delta, mode='${MODE[$n]}')"
+  else
+    echo "  $n: MV ${MVTBL[$n]} — refreshed by full re-author (mode='${MODE[$n]:--}')"
   fi
 done
 echo "DONE"
