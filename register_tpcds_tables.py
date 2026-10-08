@@ -49,7 +49,7 @@ def main():
     ap.add_argument("--source-bucket", required=True, help="S3 bucket holding the TPC-DS parquet")
     ap.add_argument("--region", default="ap-south-1")
     ap.add_argument("--namespace", default="tpcds")
-    ap.add_argument("--tables", default="", help="comma-separated subset (default: all 24)")
+    ap.add_argument("--tables", default="", help="comma-separated tables (default: the 24 TPC-DS tables; 'auto' = every top-level prefix holding parquet)")
     ap.add_argument("--s3-endpoint", default="", help="custom S3 endpoint (MinIO etc.); blank = AWS")
     # Nessie serves Iceberg REST under a BRANCH prefix (default "main"); the
     # tabulario/iceberg-rest catalog serves the root and takes no prefix. Passing
@@ -62,7 +62,8 @@ def main():
     ap.add_argument("--s3-secret", default="", help="S3 secret key")
     args = ap.parse_args()
 
-    tables = [t.strip() for t in args.tables.split(",") if t.strip()] or TPCDS_TABLES
+    auto = args.tables.strip() == "auto"
+    tables = [] if auto else ([t.strip() for t in args.tables.split(",") if t.strip()] or TPCDS_TABLES)
 
     # Fool-proofing for AWS S3 (skipped for MinIO / custom --s3-endpoint):
     # 1. Trust the SOURCE bucket's ACTUAL region over --region (customers get it
@@ -109,6 +110,19 @@ def main():
         fs_kw["key"] = args.s3_key
         fs_kw["secret"] = args.s3_secret
     fs = s3fs.S3FileSystem(**fs_kw)
+    if auto:
+        # every top-level prefix of the bucket that holds parquet is a table;
+        # the warehouse prefix (catalog metadata) is not
+        wh_dir = args.warehouse.split("/", 3)[3].split("/")[0] if args.warehouse.startswith(f"s3://{args.source_bucket}/") else ""
+        for d in fs.ls(args.source_bucket, detail=True):
+            name = d["name"].rstrip("/").split("/")[-1]
+            if d.get("type") != "directory" or name == wh_dir or name.startswith((".", "_")):
+                continue
+            if any(p.endswith(".parquet") for p in fs.find(d["name"], maxdepth=None)):
+                tables.append(name)
+        if not tables:
+            sys.exit(f"no table prefixes with parquet under s3://{args.source_bucket}/")
+        print(f"  tables found: {', '.join(tables)}")
     ok = 0
     for tbl in tables:
         prefix = f"{args.source_bucket}/{tbl}/"

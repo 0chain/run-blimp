@@ -58,6 +58,13 @@ usage(){
                      Every answer is overridable up-front via the env
                      (CATALOG_CHOICE / SOURCE_CHOICE / BUILD_DATASET / BLIMP_SF),
                      so a scripted run is non-interactive.
+  blimp --register   Register YOUR parquet in the node's Iceberg catalog and point
+                     the gateway at it (no copy; schema read from the parquet):
+                       blimp --register --bucket B[/prefix] [--namespace NS] [--tables a,b]
+                         [--s3-endpoint URL --s3-key K --s3-secret S]
+                     Tables default to every top-level prefix of B holding parquet.
+  blimp --unregister Drop a namespace's tables from the catalog (files untouched):
+                       blimp --unregister [--namespace NS] [--tables a,b] [--yes]
   blimp --storage    Test: storage suite.
   blimp --acid       Test: ACID / linearizability — a Jepsen-style porcupine
                      check that concurrent writers + readers never observe a
@@ -143,6 +150,11 @@ S3_SECRET=${S3_SECRET:-}
 GW_AK=${GW_AK:-}
 GW_SK=${GW_SK:-}
 BLIMP_PY=${BLIMP_PY:-}
+# How setup reached the catalog and the data, so --register can re-wire the
+# gateway the same way without re-asking.
+CATALOG_CHOICE=${CATALOG_CHOICE:-}
+SOURCE_TARGET=${SOURCE_TARGET:-}
+ICEBERG_WAREHOUSE=${ICEBERG_WAREHOUSE:-}
 E
   bold "saved wiring -> $ENVF"
 }
@@ -853,6 +865,239 @@ ensure_deps(){
   export BLIMP_PY
 }
 
+# register_source_tables [tables] — register the parquet under
+# s3://$ORIGIN_BUCKET/<table>/ into the catalog as $NAMESPACE.<table> (add_files,
+# no copy). [tables]: comma list, "auto" (every top-level prefix holding
+# parquet), or empty for the 24 TPC-DS tables. Shared by --setup and --register.
+register_source_tables(){
+  local tables="${1:-}"
+  local cat_url="${ICEBERG_URL_LOCAL:-${ICEBERG_URL:-http://localhost:8181}}"
+  local pfx="${ICEBERG_PREFIX:-}" pfx_flag=""
+  [ -n "$pfx" ] && pfx_flag="--prefix $pfx"
+  # Nessie takes the warehouse NAME (it resolves it server-side); a plain REST
+  # catalog takes the s3:// path. Sending the path to Nessie is a hard 500.
+  local reg_wh="$WAREHOUSE"
+  [ -n "${ICEBERG_WAREHOUSE:-}" ] && reg_wh="$ICEBERG_WAREHOUSE"
+  # Registration runs on the HOST, so it needs an address the host can reach:
+  # not the gateway's docker-internal minioserver:9000, and not a fleet
+  # hostname that resolves to this node's own un-hairpinnable public IP.
+  # endpoint_local() probes and rewrites only when loopback actually serves it.
+  local reg_ep=""
+  case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")";; esac
+  # The fleet endpoint is key-authenticated, so pass it and the keys through
+  # explicitly instead of relying on this box's IAM role.
+  local reg_keys=""
+  case "${SOURCE_TARGET:-}" in
+    fleet|gateway)
+      reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")"
+      reg_keys="--s3-key $S3_KEY --s3-secret $S3_SECRET" ;;
+  esac
+  # --register names the data's S3 itself: pass its endpoint and keys as given.
+  if [ "${REGISTER_EXPLICIT_S3:-0}" = 1 ]; then
+    [ -n "${S3_ENDPOINT:-}" ] && reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")"
+    [ -n "${S3_KEY:-}" ] && reg_keys="--s3-key $S3_KEY --s3-secret $S3_SECRET"
+  fi
+  # shellcheck disable=SC2086  # reg_ep/reg_keys/pfx_flag are intentional flag pairs
+  AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+    "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog "$cat_url" \
+    --warehouse "$reg_wh" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
+    --namespace "$NAMESPACE" ${tables:+--tables "$tables"} $reg_ep $reg_keys $pfx_flag 2>&1
+}
+
+# wire_gateway_source — point the gateway's live source at $NAMESPACE in
+# $ORIGIN_BUCKET over POST /admin/source/configure (no restart). Shared by
+# --setup and --register.
+wire_gateway_source(){
+  if [ -n "${GW:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
+    bold "== wiring the cluster over the admin API (no SSH) =="
+    # s3_endpoint MUST be sent (the gateway otherwise assumes AWS S3).
+    # via_router is sent explicitly and is off unless VIA_ROUTER=1: source scans
+    # should not fill the read-through cache.
+    # FLEET SOURCE: the gateway reads it from ITS OWN S3 (localhost:9000 with its
+    # own root keys), not the public fleet address this CLI uploaded through.
+    HOOK_EP="${S3_ENDPOINT:-}"; HOOK_KEY="${S3_KEY:-}"; HOOK_SEC="${S3_SECRET:-}"
+    # `gateway` lands here too: the data is on this node's own S3, so the gateway
+    # must read it on its own loopback rather than back out through its public
+    # address — the same reasoning as for the fleet upload path.
+    case "${SOURCE_TARGET:-}" in fleet|gateway)
+      # The gateway's own root keys are needed now (idempotent; see heal_wiring).
+      [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || heal_wiring
+      HOOK_EP="http://localhost:9000"
+      HOOK_KEY="${GW_AK:-$HOOK_KEY}"; HOOK_SEC="${GW_SK:-$HOOK_SEC}"
+      bold "  source endpoint for the gateway: $HOOK_EP (its own zs3 — the published URL is the upload path only)"
+    ;; esac
+    # CATALOG URL FOR THE GATEWAY. With the gateway's own Nessie (option 1) this
+    # CLI reaches it on the HOST port, but the gateway runs in a container where
+    # that address is loopback to itself. Send the gateway its own catalog
+    # address (read from the co-located container); the CLI's address stays for
+    # the registrar/seeder, which run here.
+    HOOK_IRC="$ICEBERG_URL"
+    if [ "${CATALOG_CHOICE:-}" = 1 ]; then
+      local gwirc; gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
+      if [ -n "$gwirc" ]; then
+        HOOK_IRC="$gwirc"
+        bold "  catalog URL for the gateway: $gwirc (its own Nessie, container address)"
+      fi
+    fi
+    HOOK_BODY=$(HB_IRC="$HOOK_IRC" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
+      HB_BKT="$ORIGIN_BUCKET" HB_KEY="$HOOK_KEY" HB_SEC="$HOOK_SEC" HB_REG="$REGION" \
+      HB_EP="$HOOK_EP" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
+      python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
+    HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
+      -H "Authorization: Bearer $CLUSTER_TOKEN" -H "Content-Type: application/json" \
+      -d "$HOOK_BODY" || true)
+    case "$HOOK_RESP" in
+      *'"status": "ok"'*|*'"status":"ok"'*)
+        SOURCE=customer; export SOURCE; save_env
+        bold "  ✓ cluster wired: source=customer ns=$NAMESPACE bucket=$ORIGIN_BUCKET (live, no restart)";;
+      *)
+        echo "  ! API wiring unavailable ($(printf %s "$HOOK_RESP" | head -c 120)) — use the UI/manual steps below";;
+    esac
+  fi
+}
+
+# catalog_ns_url <ns> — the REST URL of a namespace in the wired catalog
+# (Nessie serves every route under its branch prefix).
+catalog_ns_url(){
+  local cat_url="${ICEBERG_URL_LOCAL:-${ICEBERG_URL:-http://localhost:8181}}"
+  printf '%s/v1%s/namespaces/%s' "$cat_url" "${ICEBERG_PREFIX:+/$ICEBERG_PREFIX}" "$1"
+}
+
+# catalog_list_tables <ns> — the table names in a namespace, one per line.
+catalog_list_tables(){
+  curl -s -m 20 "$(catalog_ns_url "$1")/tables" | "${BLIMP_PY:-python3}" -c 'import json,sys
+try: print("\n".join(i["name"] for i in json.load(sys.stdin).get("identifiers",[])))
+except Exception: pass'
+}
+
+# blimp --register — register YOUR parquet in the node's Iceberg catalog and
+# point the gateway at it. The data stays where it is (add_files, no copy).
+#   --bucket B[/P]     bucket (and optional prefix) holding s3://B[/P]/<table>/**/*.parquet
+#   --namespace NS     catalog namespace (default: the last path element)
+#   --tables a,b       tables to register (default: every top-level prefix
+#                      under the bucket that holds parquet)
+#   --s3-endpoint URL  the bucket's S3 endpoint (blank = AWS S3)
+#   --s3-key K --s3-secret S   keys for that endpoint (blank = IAM role)
+cmd_register(){
+  need_env
+  local bucket="" ns="" tables="auto" ep="${S3_ENDPOINT:-}" key="${S3_KEY:-}" sec="${S3_SECRET:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bucket)      bucket="${2:?--bucket needs a value}"; shift ;;
+      --namespace)   ns="${2:?--namespace needs a value}"; shift ;;
+      --tables)      tables="${2:?--tables needs a value}"; shift ;;
+      --s3-endpoint) ep="${2:?--s3-endpoint needs a value}"; shift ;;
+      --s3-key)      key="${2:?--s3-key needs a value}"; shift ;;
+      --s3-secret)   sec="${2:?--s3-secret needs a value}"; shift ;;
+      *) die "--register: unknown flag $1 (see blimp --help)" ;;
+    esac; shift
+  done
+  [ -n "$bucket" ] || die "usage: blimp --register --bucket <bucket>[/prefix] [--namespace NS] [--tables a,b] [--s3-endpoint URL --s3-key K --s3-secret S]"
+  bucket="${bucket#s3://}"; bucket="${bucket%/}"
+  local root="${bucket%%/*}"
+  # A catalog with a fixed PATH warehouse (a plain REST catalog) writes table
+  # metadata there whatever the registrar asks, and the gateway reads catalog
+  # metadata only from the data bucket (setup's guardrail 1): data in another
+  # bucket registers but every query over it 404s on its metadata. Nessie's
+  # warehouse is a name, so the check does not apply to it.
+  if [ -z "${ICEBERG_WAREHOUSE:-}" ]; then
+    local cwh; cwh=$(curl -s -m 10 "${ICEBERG_URL_LOCAL:-${ICEBERG_URL:-}}/v1/config" 2>/dev/null | "${BLIMP_PY:-python3}" -c 'import json,sys
+try: print(json.load(sys.stdin).get("defaults",{}).get("warehouse",""))
+except Exception: print("")' 2>/dev/null)
+    case "$cwh" in s3://*)
+      local wb; wb=$(echo "$cwh" | sed -E 's#^s3://([^/]+).*#\1#')
+      [ "$wb" = "$root" ] || die "the catalog keeps its metadata in s3://$wb and the gateway reads metadata only from the data bucket — put the data under a prefix of that bucket and pass --bucket $wb/<prefix>, or wire your own catalog with blimp --setup"
+      WAREHOUSE="$cwh" ;;
+    esac
+  fi
+  ORIGIN_BUCKET="$root"; NAMESPACE="${ns:-${bucket##*/}}"
+  S3_ENDPOINT="$ep"; S3_KEY="$key"; S3_SECRET="$sec"
+  # The data is the caller's own bucket now, not the node's TPC-DS standup.
+  SOURCE_TARGET=external
+  # A path warehouse co-locates inside the data bucket (guardrail 1); a Nessie
+  # warehouse is a name and stays as setup chose it.
+  [ -n "${ICEBERG_WAREHOUSE:-}" ] || [ -n "${cwh:-}" ] || WAREHOUSE="s3://$root/wh"
+  export ORIGIN_BUCKET NAMESPACE S3_ENDPOINT S3_KEY S3_SECRET SOURCE_TARGET WAREHOUSE
+  bold "== registering s3://$bucket ($tables) as namespace $NAMESPACE =="
+  local before; before=$(catalog_list_tables "$NAMESPACE")
+  # the registrar lists s3://<bucket>[/prefix]/<table>/ — the prefix rides in its bucket arg
+  ORIGIN_BUCKET="$bucket" REGISTER_EXPLICIT_S3=1 register_source_tables "$tables" || die "registration failed — nothing re-wired"
+  # A catalog that does not publish its warehouse (/v1/config empty — the
+  # tabulario REST catalog) is checked after the fact: where it actually put a
+  # new table's metadata. Outside the data bucket, the new tables are dropped
+  # again (catalog entries only) and the gateway is left as it was.
+  if [ -z "${ICEBERG_WAREHOUSE:-}" ] && [ -z "${cwh:-}" ]; then
+    local added t1 mloc mb
+    added=$(comm -13 <(printf '%s\n' "$before" | sort) <(catalog_list_tables "$NAMESPACE" | sort) | grep . | paste -sd, -)
+    t1="${added%%,*}"
+    if [ -n "$t1" ]; then
+      mloc=$(curl -s -m 20 "$(catalog_ns_url "$NAMESPACE")/tables/$t1" | "${BLIMP_PY:-python3}" -c 'import json,sys
+try: print(json.load(sys.stdin).get("metadata-location",""))
+except Exception: print("")' 2>/dev/null)
+      mb=$(echo "$mloc" | sed -E 's#^s3a?://([^/]+).*#\1#')
+      if [ -n "$mb" ] && [ "$mb" != "$mloc" ] && [ "$mb" != "$root" ]; then
+        # a namespace this call created goes too; an existing one keeps its other tables
+        if [ -z "$before" ]; then cmd_unregister --namespace "$NAMESPACE" --yes >/dev/null 2>&1
+        else cmd_unregister --namespace "$NAMESPACE" --tables "$added" --yes >/dev/null 2>&1; fi
+        die "the catalog put the table metadata in s3://$mb, and the gateway reads metadata only from the data bucket — the new tables were removed again. Put the data under a prefix of that bucket (--bucket $mb/<prefix>), or wire your own catalog with blimp --setup"
+      fi
+    fi
+  fi
+  wire_gateway_source
+  save_env
+  bold "  run your SQL with:  TPC_BATCH_TICK=0 $HERE/tpc_batch <list>   (or blimp --query --sql <file|dir>)"
+}
+
+# blimp --unregister — drop a namespace's tables from the catalog. Catalog
+# entries only (purgeRequested=false): the parquet files are never deleted.
+#   --namespace NS   namespace to clear (default: the wired $NAMESPACE)
+#   --tables a,b     only these tables (default: every table, then the namespace)
+#   --yes            do not ask for confirmation
+cmd_unregister(){
+  need_env
+  local ns="${NAMESPACE:-}" only="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --namespace) ns="${2:?--namespace needs a value}"; shift ;;
+      --tables)    only="${2:?--tables needs a value}"; shift ;;
+      --yes|-y)    yes=1 ;;
+      *) die "--unregister: unknown flag $1 (see blimp --help)" ;;
+    esac; shift
+  done
+  [ -n "$ns" ] || die "usage: blimp --unregister [--namespace NS] [--tables a,b] [--yes]"
+  local all; all=$(catalog_list_tables "$ns")
+  local drop="$all"
+  [ -n "$only" ] && drop=$(printf '%s\n' "$all" | grep -xF -f <(tr ',' '\n' <<<"$only"))
+  if [ -z "$drop" ]; then
+    # an empty namespace (e.g. left by an interrupted register) is dropped too
+    local nc=""; [ -z "$only" ] && nc=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X DELETE "$(catalog_ns_url "$ns")")
+    if [ "${nc:0:1}" = 2 ]; then
+      bold "  namespace $ns held no tables — dropped it"
+    else
+      bold "  nothing to unregister in namespace $ns"
+    fi
+    return 0
+  fi
+  bold "== unregistering $(printf '%s\n' "$drop" | grep -c .) table(s) from namespace $ns =="
+  printf '  %s\n' $drop
+  echo "  (catalog entries only — the parquet files are not deleted)"
+  if [ "$yes" != 1 ]; then
+    printf 'Proceed? [y/N] ' >&2; local yn; read -r yn </dev/tty 2>/dev/null || yn=n
+    case "$yn" in y|Y|yes) ;; *) die "aborted — nothing unregistered" ;; esac
+  fi
+  local t code fails=0
+  for t in $drop; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X DELETE "$(catalog_ns_url "$ns")/tables/$t?purgeRequested=false")
+    case "$code" in 2*) echo "  dropped $ns.$t" ;; *) echo "  ! $ns.$t: HTTP $code"; fails=$((fails+1)) ;; esac
+  done
+  # Every table gone: drop the namespace too, so a re-register starts clean.
+  if [ -z "$only" ] && [ "$fails" = 0 ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X DELETE "$(catalog_ns_url "$ns")")
+    case "$code" in 2*) echo "  dropped namespace $ns" ;; *) echo "  ! namespace $ns: HTTP $code" ;; esac
+  fi
+  [ "$fails" = 0 ]
+}
+
 cmd_setup(){
   bold "== blimp --setup — connect a Blimp cluster to this node's data =="
   ensure_deps
@@ -967,31 +1212,9 @@ cmd_setup(){
     if [ "${have:-0}" -ge 24 ]; then
       bold "  ✓ $NAMESPACE already has $have tables registered — skipping registration"
     else
-    # Nessie takes the warehouse NAME (it resolves it server-side); a plain REST
-    # catalog takes the s3:// path. Sending the path to Nessie is a hard 500.
-    local reg_wh="$WAREHOUSE"
-    [ -n "${ICEBERG_WAREHOUSE:-}" ] && reg_wh="$ICEBERG_WAREHOUSE"
-    bold "registering the 24 TPC-DS SF${BLIMP_SF:-1} tables into $cat_url (warehouse $reg_wh)"
-    # Registration runs on the HOST, so it needs an address the host can reach:
-    # not the gateway's docker-internal minioserver:9000, and not a fleet
-    # hostname that resolves to this node's own un-hairpinnable public IP.
-    # endpoint_local() probes and rewrites only when loopback actually serves it.
-    local reg_ep=""
-    case "$S3_ENDPOINT" in *:9000*) reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")";; esac
-    # The fleet endpoint is key-authenticated, so pass it and the keys through
-    # explicitly instead of relying on this box's IAM role.
-    local reg_keys=""
-    case "${SOURCE_TARGET:-}" in
-      fleet|gateway)
-        reg_ep="--s3-endpoint $(endpoint_local "$S3_ENDPOINT")"
-        reg_keys="--s3-key $S3_KEY --s3-secret $S3_SECRET" ;;
-    esac
-    # shellcheck disable=SC2086  # reg_ep/reg_keys/pfx_flag are intentional flag pairs
-    AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
-      "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog "$cat_url" \
-      --warehouse "$reg_wh" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
-      --namespace "$NAMESPACE" $reg_ep $reg_keys $pfx_flag 2>&1 | tail -3 \
-      || bold "  (auto-register had issues — re-run register_tpcds_tables.py manually)"
+    bold "registering the 24 TPC-DS SF${BLIMP_SF:-1} tables into $cat_url"
+    register_source_tables "" | tail -3 \
+      || bold "  (auto-register had issues — re-run 'blimp --register')"
     fi
   fi
 
@@ -1012,52 +1235,7 @@ cmd_setup(){
   # POST /admin/source/configure sets the gateway's live source — effective on
   # the next query, no restart. Bearer = the fleet token. Falls back to the
   # manual UI instructions below when the endpoint is absent or unreachable.
-  if [ -n "${GW:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
-    bold "== wiring the cluster over the admin API (no SSH) =="
-    # s3_endpoint MUST be sent (the gateway otherwise assumes AWS S3).
-    # via_router is sent explicitly and is off unless VIA_ROUTER=1: source scans
-    # should not fill the read-through cache.
-    # FLEET SOURCE: the gateway reads it from ITS OWN S3 (localhost:9000 with its
-    # own root keys), not the public fleet address this CLI uploaded through.
-    HOOK_EP="${S3_ENDPOINT:-}"; HOOK_KEY="${S3_KEY:-}"; HOOK_SEC="${S3_SECRET:-}"
-    # `gateway` lands here too: the data is on this node's own S3, so the gateway
-    # must read it on its own loopback rather than back out through its public
-    # address — the same reasoning as for the fleet upload path.
-    case "${SOURCE_TARGET:-}" in fleet|gateway)
-      # The gateway's own root keys are needed now (idempotent; see heal_wiring).
-      [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] || heal_wiring
-      HOOK_EP="http://localhost:9000"
-      HOOK_KEY="${GW_AK:-$HOOK_KEY}"; HOOK_SEC="${GW_SK:-$HOOK_SEC}"
-      bold "  source endpoint for the gateway: $HOOK_EP (its own zs3 — the published URL is the upload path only)"
-    ;; esac
-    # CATALOG URL FOR THE GATEWAY. With the gateway's own Nessie (option 1) this
-    # CLI reaches it on the HOST port, but the gateway runs in a container where
-    # that address is loopback to itself. Send the gateway its own catalog
-    # address (read from the co-located container); the CLI's address stays for
-    # the registrar/seeder, which run here.
-    HOOK_IRC="$ICEBERG_URL"
-    if [ "${CATALOG_CHOICE:-}" = 1 ]; then
-      local gwirc; gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
-      if [ -n "$gwirc" ]; then
-        HOOK_IRC="$gwirc"
-        bold "  catalog URL for the gateway: $gwirc (its own Nessie, container address)"
-      fi
-    fi
-    HOOK_BODY=$(HB_IRC="$HOOK_IRC" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
-      HB_BKT="$ORIGIN_BUCKET" HB_KEY="$HOOK_KEY" HB_SEC="$HOOK_SEC" HB_REG="$REGION" \
-      HB_EP="$HOOK_EP" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \
-      python3 -c 'import json,os;b={"source":"customer","iceberg_url":os.environ["HB_IRC"],"warehouse":os.environ["HB_WH"],"namespace":os.environ["HB_NS"],"bucket":os.environ["HB_BKT"],"s3_endpoint":os.environ["HB_EP"],"s3_key":os.environ["HB_KEY"],"s3_secret":os.environ["HB_SEC"],"s3_region":os.environ["HB_REG"],"via_router":os.environ.get("HB_VR")=="1"};b.update({"router_base":os.environ["HB_RB"]} if os.environ.get("HB_VR")=="1" and os.environ.get("HB_RB") else {});print(json.dumps(b))' 2>/dev/null)
-    HOOK_RESP=$(curl -s -m 30 -X POST "http://$GW:9000/admin/source/configure" \
-      -H "Authorization: Bearer $CLUSTER_TOKEN" -H "Content-Type: application/json" \
-      -d "$HOOK_BODY" || true)
-    case "$HOOK_RESP" in
-      *'"status": "ok"'*|*'"status":"ok"'*)
-        SOURCE=customer; export SOURCE; save_env
-        bold "  ✓ cluster wired: source=customer ns=$NAMESPACE bucket=$ORIGIN_BUCKET (live, no restart)";;
-      *)
-        echo "  ! API wiring unavailable ($(printf %s "$HOOK_RESP" | head -c 120)) — use the UI/manual steps below";;
-    esac
-  fi
+  wire_gateway_source
   echo; bold "================= POINT THE BLIMP CLUSTER AT THIS SOURCE ================="
   cat <<OUT
   In the cluster UI → Query Optimizer → Production (BYO Iceberg source):
@@ -1429,7 +1607,7 @@ pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
 for f in "$@"; do
   # --update / --update-log take their own sub-arguments (service lists,
   # --tag svc=tag, --dry-run, an update id); cmd_update validates them.
-  case "$CMD" in --update|update|--update-log) break ;; esac
+  case "$CMD" in --update|update|--update-log|--register|register|--unregister|unregister) break ;; esac
   if [ -n "$pending" ]; then
     printf -v "$pending" '%s' "$f"; export "$pending"; pending=""; continue
   fi
@@ -1752,6 +1930,8 @@ case "$CMD" in
   --immutable|immutable)   cmd_immutable "${1:-}" ;;
   --gc|gc)            cmd_gc ;;
   --query|query)      cmd_query ;;
+  --register|register)     cmd_register "$@" ;;
+  --unregister|unregister) cmd_unregister "$@" ;;
   ""|-h|--help|help)  usage ;;
   *)                  echo "unknown command: $CMD"; echo; usage; exit 2 ;;
 esac

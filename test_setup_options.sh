@@ -422,6 +422,79 @@ grep -qF 'EC_CONC="${WARP_CONC:-$EC_CONC}"' "$RC" \
 grep -qF 'OSZ="${WARP_OBJ_SIZE:-96MiB}"' "$RC" \
   && ok "warp object size 96MiB (matches the panel)" || bad "warp object size drifted"
 
+# ==================================================== --register / --unregister
+case_ "--register / --unregister — catalog calls and gateway re-wiring"
+reset
+TMPD=$(mktemp -d); CALLS="$TMPD/calls"; : > "$CALLS"
+ENVF="$TMPD/env"
+need_env(){ :; }              # wiring is set in-process below; no heal_wiring network calls
+gateway_env(){ :; }
+endpoint_local(){ printf '%s' "$1"; }
+# fake registrar: records its argv
+cat > "$TMPD/py" <<'X'
+#!/usr/bin/env bash
+case "$1" in -c) exec python3 "$@" ;; esac
+echo "REG $*" >> "$CALLS_FILE"
+X
+chmod +x "$TMPD/py"; export CALLS_FILE="$CALLS"; BLIMP_PY="$TMPD/py"
+curl(){
+  local url="" meth=GET a body="" prev=""
+  for a in "$@"; do
+    case "$prev" in -X) meth="$a" ;; -d) body="$a" ;; esac
+    case "$a" in http*) url="$a" ;; esac; prev="$a"
+  done
+  echo "$meth $url $body" >> "$CALLS"
+  case "$meth $url" in
+    "GET "*"/namespaces/tpcds/tables") printf '{"identifiers":[{"namespace":["tpcds"],"name":"store_sales"},{"namespace":["tpcds"],"name":"item"}]}' ;;
+    "DELETE "*) printf '204' ;;
+    "POST "*"/admin/source/configure") printf '{"status": "ok"}' ;;
+    "GET "*"/v1/config") printf '{"defaults":{"warehouse":"s3://whbkt/wh"}}' ;;
+  esac
+  return 0
+}
+ICEBERG_URL=http://gw.example:19122/iceberg ICEBERG_URL_LOCAL=http://localhost:19122/iceberg ICEBERG_PREFIX=main ICEBERG_WAREHOUSE=mv WAREHOUSE=mv
+NAMESPACE=tpcds ORIGIN_BUCKET=tpcds1000 S3_ENDPOINT=http://localhost:9000 SOURCE_TARGET=gateway
+
+( cmd_unregister --yes ) >/dev/null 2>&1; rc=$?
+eq "$rc" 0 "unregister --yes exits 0"
+eq "$(grep -c '^DELETE .*/namespaces/tpcds/tables/.*purgeRequested=false' "$CALLS")" 2 "each table dropped without purge"
+grep -q '^DELETE http://localhost:19122/iceberg/v1/main/namespaces/tpcds $' "$CALLS" \
+  && ok "namespace dropped after its last table (Nessie prefix kept)" || bad "namespace not dropped"
+: > "$CALLS"
+( cmd_unregister --yes --tables item ) >/dev/null 2>&1
+eq "$(grep -c '^DELETE' "$CALLS")" 1 "--tables drops only the named table, keeps the namespace"
+: > "$CALLS"
+( cmd_unregister ) </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" != 0 ] && [ "$(grep -c '^DELETE' "$CALLS")" = 0 ] && ok "no --yes and no answer: nothing dropped" || bad "dropped without confirmation"
+
+: > "$CALLS"
+( cmd_register --bucket mydata --tables orders,lineitem --s3-endpoint http://minio:9000 --s3-key K --s3-secret S ) >/dev/null 2>&1; rc=$?
+eq "$rc" 0 "register exits 0"
+reg=$(grep '^REG' "$CALLS")
+case "$reg" in *"--source-bucket mydata"*"--namespace mydata"*"--tables orders,lineitem"*"--s3-endpoint http://minio:9000"*"--s3-key K --s3-secret S"*"--prefix main"*) ok "registrar gets bucket, namespace (= bucket), tables, endpoint, keys, Nessie prefix" ;; *) bad "registrar args: $reg" ;; esac
+case "$reg" in *"--warehouse mv "*) ok "Nessie warehouse name kept" ;; *) bad "warehouse: $reg" ;; esac
+grep -q '/admin/source/configure.*"namespace": "mydata".*"bucket": "mydata"' "$CALLS" \
+  && ok "gateway re-wired to the new namespace and bucket" || bad "gateway not re-wired: $(grep configure "$CALLS")"
+grep -q '^NAMESPACE=mydata$' "$ENVF" && grep -q '^ORIGIN_BUCKET=mydata$' "$ENVF" \
+  && ok "wiring saved" || bad "wiring not saved"
+: > "$CALLS"
+( cmd_register --bucket b2 ) >/dev/null 2>&1
+grep -q -- '--tables auto' "$CALLS" && ok "tables default to auto discovery" || bad "no auto default"
+( cmd_register ) >/dev/null 2>&1 && bad "register without --bucket succeeded" || ok "register requires --bucket"
+# a plain REST catalog keeps its metadata in its own warehouse bucket: data in
+# another bucket is refused; a prefix of the warehouse bucket is accepted
+unset ICEBERG_WAREHOUSE; : > "$CALLS"
+( cmd_register --bucket otherbkt ) >/dev/null 2>&1 && bad "data outside the catalog's warehouse bucket was registered" || ok "data outside the warehouse bucket is refused"
+grep -q '^REG' "$CALLS" && bad "the registrar ran after the refusal" || ok "nothing registered on refusal"
+: > "$CALLS"
+( cmd_register --bucket whbkt/sf10 --s3-endpoint http://minio:9000 ) >/dev/null 2>&1; rc=$?
+eq "$rc" 0 "a prefix of the warehouse bucket registers"
+reg=$(grep '^REG' "$CALLS")
+case "$reg" in *"--warehouse s3://whbkt/wh "*"--source-bucket whbkt/sf10"*"--namespace sf10"*) ok "registrar lists the prefix, namespace = last path element, catalog's warehouse" ;; *) bad "prefix registrar args: $reg" ;; esac
+grep -q '/admin/source/configure.*"namespace": "sf10".*"bucket": "whbkt"' "$CALLS" \
+  && ok "gateway wired to the warehouse bucket (not bucket/prefix)" || bad "gateway wiring: $(grep configure "$CALLS")"
+rm -rf "$TMPD"
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 # Exit non-zero on failure so CI and `blimp --selftest` actually gate on this.
 [ "$FAIL" -eq 0 ]
