@@ -399,7 +399,13 @@ except Exception: print(-1)' 2>/dev/null)
     # derive key/date pools from this run's queries' dimension predicates
     # (query_pools.py) so the appended rows land inside the filters.
     POOLS_ARG=""
-    if [ "${CDC_TARGET_POOLS:-1}" != "0" ]; then
+    # The seeder follows the dataset: a TPC-H namespace (a query reads the
+    # catalog's lineitem) appends orders+lineitems with seed_tpch.py; the
+    # TPC-DS seeder and its query pools are TPC-DS-shaped.
+    SEEDER=seed_tpcds.py
+    for n in "${NAMES[@]}"; do printf ' %s ' "${QTABLES[$n]:-}" | grep -qw lineitem && SEEDER=seed_tpch.py; done
+    [ "$SEEDER" = seed_tpch.py ] && echo "   seeder: seed_tpch.py (TPC-H namespace)"
+    if [ "${CDC_TARGET_POOLS:-1}" != "0" ] && [ "$SEEDER" = seed_tpcds.py ]; then
       pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query, --sql or TPC-DS
       if [ -z "$pf" ]; then
         echo "   pools: no query SQL loaded — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
@@ -414,7 +420,7 @@ except Exception: print(-1)' 2>/dev/null)
       fi
     fi
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
-      "$PY3" "$HERE/seed_tpcds.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
+      "$PY3" "$HERE/$SEEDER" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
       --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG \
       ${EXTRA_TABLES:+--extra-tables "$EXTRA_TABLES"} \
       ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} ${CDC_DIM_GROWTH:+--dim-growth "$CDC_DIM_GROWTH"} \
