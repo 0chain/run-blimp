@@ -1,4 +1,3 @@
--- variant of TPC-DS q55: coarser
 SELECT
   i_brand AS brand,
   SUM(ss_ext_sales_price) AS ext_price
@@ -13,4 +12,4 @@ GROUP BY
   i_brand
 ORDER BY
   ext_price DESC
-LIMIT 100;
+LIMIT 100

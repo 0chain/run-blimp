@@ -1,4 +1,3 @@
--- variant of TPC-DS q61: filter
 SELECT
   promotions,
   total,
@@ -44,4 +43,4 @@ FROM (
 ORDER BY
   promotions,
   total
-LIMIT 100;
+LIMIT 100

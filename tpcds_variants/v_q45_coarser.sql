@@ -1,4 +1,3 @@
--- variant of TPC-DS q45: coarser
 SELECT
   ca_zip,
   SUM(ws_sales_price)
@@ -24,4 +23,4 @@ GROUP BY
   ca_zip
 ORDER BY
   ca_zip
-LIMIT 100;
+LIMIT 100

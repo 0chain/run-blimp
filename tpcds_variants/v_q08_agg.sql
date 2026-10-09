@@ -1,4 +1,3 @@
--- variant of TPC-DS q8: agg
 SELECT
   s_store_name,
   COUNT(ss_net_profit)
@@ -441,4 +440,4 @@ GROUP BY
   s_store_name
 ORDER BY
   s_store_name
-LIMIT 100;
+LIMIT 100

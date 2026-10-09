@@ -1,4 +1,3 @@
--- variant of TPC-DS q67: rank
 SELECT
   *
 FROM (
@@ -57,4 +56,4 @@ ORDER BY
   s_store_id NULLS FIRST,
   sumsales NULLS FIRST,
   rk NULLS FIRST
-LIMIT 100;
+LIMIT 100

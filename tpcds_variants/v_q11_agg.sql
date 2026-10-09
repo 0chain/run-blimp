@@ -1,4 +1,3 @@
--- variant of TPC-DS q11: agg
 WITH year_total AS (
   SELECT
     c_customer_id AS customer_id,
@@ -86,4 +85,4 @@ ORDER BY
   t_s_secyear.customer_first_name NULLS FIRST,
   t_s_secyear.customer_last_name NULLS FIRST,
   t_s_secyear.customer_preferred_cust_flag NULLS FIRST
-LIMIT 100;
+LIMIT 100

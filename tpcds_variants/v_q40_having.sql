@@ -1,4 +1,3 @@
--- variant of TPC-DS q40: having
 SELECT
   w_state,
   i_item_id,
@@ -39,4 +38,4 @@ HAVING
 ORDER BY
   w_state,
   i_item_id
-LIMIT 100;
+LIMIT 100

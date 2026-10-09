@@ -1,4 +1,3 @@
--- variant of TPC-DS q83: rank
 WITH sr_items AS (
   SELECT
     i_item_id AS item_id,
@@ -99,4 +98,4 @@ WHERE
 ORDER BY
   sr_items.item_id NULLS FIRST,
   sr_item_qty NULLS FIRST
-LIMIT 100;
+LIMIT 100

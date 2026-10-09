@@ -1,4 +1,3 @@
--- variant of TPC-DS q49: years
 SELECT
   channel,
   item,
@@ -143,4 +142,4 @@ ORDER BY
   4 NULLS FIRST,
   5 NULLS FIRST,
   2 NULLS FIRST
-LIMIT 100;
+LIMIT 100

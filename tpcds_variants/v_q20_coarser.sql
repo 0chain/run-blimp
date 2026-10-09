@@ -1,4 +1,3 @@
--- variant of TPC-DS q20: coarser
 SELECT
   i_item_id,
   i_item_desc,
@@ -23,4 +22,4 @@ ORDER BY
   i_item_id NULLS FIRST,
   i_item_desc NULLS FIRST,
   revenueratio NULLS FIRST
-LIMIT 100;
+LIMIT 100

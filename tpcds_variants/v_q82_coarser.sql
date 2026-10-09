@@ -1,4 +1,3 @@
--- variant of TPC-DS q82: coarser
 SELECT
   i_item_id,
   i_item_desc
@@ -16,4 +15,4 @@ GROUP BY
   i_item_desc
 ORDER BY
   i_item_id
-LIMIT 100;
+LIMIT 100

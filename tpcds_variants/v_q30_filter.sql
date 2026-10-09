@@ -1,4 +1,3 @@
--- variant of TPC-DS q30: filter
 WITH customer_total_return AS (
   SELECT
     wr_returning_customer_sk AS ctr_customer_sk,
@@ -56,4 +55,4 @@ ORDER BY
   c_email_address NULLS FIRST,
   c_last_review_date_sk NULLS FIRST,
   ctr_total_return NULLS FIRST
-LIMIT 100;
+LIMIT 100

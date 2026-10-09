@@ -1,4 +1,3 @@
--- variant of TPC-DS q89: filter
 SELECT
   *
 FROM (
@@ -58,4 +57,4 @@ ORDER BY
   6,
   7,
   8
-LIMIT 100;
+LIMIT 100

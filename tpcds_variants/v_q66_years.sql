@@ -1,4 +1,3 @@
--- variant of TPC-DS q66: years
 SELECT
   w_warehouse_name,
   w_warehouse_sq_ft,
@@ -158,4 +157,4 @@ GROUP BY
   year_
 ORDER BY
   w_warehouse_name NULLS FIRST
-LIMIT 100;
+LIMIT 100

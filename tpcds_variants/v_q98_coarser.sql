@@ -1,4 +1,3 @@
--- variant of TPC-DS q98: coarser
 SELECT
   i_item_id,
   i_item_desc,
@@ -22,4 +21,4 @@ ORDER BY
   i_class NULLS FIRST,
   i_item_id NULLS FIRST,
   i_item_desc NULLS FIRST,
-  revenueratio NULLS FIRST;
+  revenueratio NULLS FIRST

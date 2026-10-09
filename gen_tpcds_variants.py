@@ -199,7 +199,9 @@ def main():
             seen.add(norm)
             kept[t] += 1
             with open(os.path.join(a.out, f"v_q{n:02d}_{t}.sql"), "w") as f:
-                f.write(f"-- variant of TPC-DS q{n}: {t}\n{sql};\n")
+                # No leading comment: the gateway accepts only a statement that
+                # starts with SELECT/WITH (the file name carries q and transform).
+                f.write(f"{sql}\n")
     print(" ".join(f"{t}={kept[t]}" for t in TRANSFORMS), f"total={sum(kept.values())}")
 
 

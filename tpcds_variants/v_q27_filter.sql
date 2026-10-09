@@ -1,4 +1,3 @@
--- variant of TPC-DS q27: filter
 WITH results AS (
   SELECT
     i_item_id,
@@ -70,4 +69,4 @@ FROM (
 ORDER BY
   i_item_id NULLS FIRST,
   s_state NULLS FIRST
-LIMIT 100;
+LIMIT 100

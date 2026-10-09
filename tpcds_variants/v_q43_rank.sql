@@ -1,4 +1,3 @@
--- variant of TPC-DS q43: rank
 SELECT
   s_store_name,
   s_store_id,
@@ -47,4 +46,4 @@ ORDER BY
   thu_sales,
   fri_sales,
   sat_sales
-LIMIT 100;
+LIMIT 100

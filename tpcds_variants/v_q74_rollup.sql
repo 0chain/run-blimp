@@ -1,4 +1,3 @@
--- variant of TPC-DS q74: rollup
 WITH year_total AS (
   SELECT
     c_customer_id AS customer_id,
@@ -68,4 +67,4 @@ WHERE
   END
 ORDER BY
   1 NULLS FIRST
-LIMIT 100;
+LIMIT 100

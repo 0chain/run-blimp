@@ -1,4 +1,3 @@
--- variant of TPC-DS q26: years
 SELECT
   i_item_id,
   AVG(cs_quantity) AS agg1,
@@ -22,4 +21,4 @@ GROUP BY
   i_item_id
 ORDER BY
   i_item_id
-LIMIT 100;
+LIMIT 100

@@ -1,4 +1,3 @@
--- variant of TPC-DS q44: topn
 SELECT
   asceding.rnk,
   i1.i_product_name AS best_performing,
@@ -70,4 +69,4 @@ WHERE
   AND i2.i_item_sk = descending.item_sk
 ORDER BY
   asceding.rnk DESC
-LIMIT 200;
+LIMIT 200

@@ -1,4 +1,3 @@
--- variant of TPC-DS q51: topn
 WITH web_v1 AS (
   SELECT
     ws_item_sk AS item_sk,
@@ -70,4 +69,4 @@ WHERE
 ORDER BY
   item_sk DESC NULLS FIRST,
   d_date NULLS FIRST
-LIMIT 200;
+LIMIT 200

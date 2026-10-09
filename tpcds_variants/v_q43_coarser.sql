@@ -1,4 +1,3 @@
--- variant of TPC-DS q43: coarser
 SELECT
   s_store_id,
   SUM(CASE WHEN (
@@ -39,4 +38,4 @@ ORDER BY
   thu_sales,
   fri_sales,
   sat_sales
-LIMIT 100;
+LIMIT 100

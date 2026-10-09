@@ -1,4 +1,3 @@
--- variant of TPC-DS q48: filter
 SELECT
   SUM(ss_quantity)
 FROM store_sales, store, customer_demographics, customer_address, date_dim
@@ -48,4 +47,4 @@ WHERE
       )
     )
   )
-  AND d_moy <= 6;
+  AND d_moy <= 6

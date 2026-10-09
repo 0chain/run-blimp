@@ -1,4 +1,3 @@
--- variant of TPC-DS q22: rank
 SELECT
   i_product_name,
   i_brand,
@@ -24,4 +23,4 @@ ORDER BY
   i_brand NULLS FIRST,
   i_class NULLS FIRST,
   i_category NULLS FIRST
-LIMIT 100;
+LIMIT 100

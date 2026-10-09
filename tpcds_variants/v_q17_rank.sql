@@ -1,4 +1,3 @@
--- variant of TPC-DS q17: rank
 SELECT
   i_item_id,
   i_item_desc,
@@ -39,4 +38,4 @@ ORDER BY
   i_item_id NULLS FIRST,
   i_item_desc NULLS FIRST,
   s_state NULLS FIRST
-LIMIT 100;
+LIMIT 100

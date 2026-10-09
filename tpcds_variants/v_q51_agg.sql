@@ -1,4 +1,3 @@
--- variant of TPC-DS q51: agg
 WITH web_v1 AS (
   SELECT
     ws_item_sk AS item_sk,
@@ -70,4 +69,4 @@ WHERE
 ORDER BY
   item_sk NULLS FIRST,
   d_date NULLS FIRST
-LIMIT 100;
+LIMIT 100

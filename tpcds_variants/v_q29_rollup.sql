@@ -1,4 +1,3 @@
--- variant of TPC-DS q29: rollup
 SELECT
   i_item_id,
   i_item_desc,
@@ -36,4 +35,4 @@ ORDER BY
   i_item_desc,
   s_store_id,
   s_store_name
-LIMIT 100;
+LIMIT 100

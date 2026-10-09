@@ -1,4 +1,3 @@
--- variant of TPC-DS q48: years
 SELECT
   SUM(ss_quantity)
 FROM store_sales, store, customer_demographics, customer_address, date_dim
@@ -45,4 +44,4 @@ WHERE
       AND ca_state IN ('VA', 'CA', 'MS')
       AND ss_net_profit BETWEEN 50 AND 25000
     )
-  );
+  )

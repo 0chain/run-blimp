@@ -1,4 +1,3 @@
--- variant of TPC-DS q21: rank
 SELECT
   *
 FROM (
@@ -54,4 +53,4 @@ WHERE
 ORDER BY
   w_warehouse_name NULLS FIRST,
   i_item_id NULLS FIRST
-LIMIT 100;
+LIMIT 100

@@ -1,4 +1,3 @@
--- variant of TPC-DS q95: topn
 WITH ws_wh AS (
   SELECT
     ws1.ws_order_number,
@@ -35,4 +34,4 @@ WHERE
   )
 ORDER BY
   COUNT(DISTINCT ws_order_number) DESC
-LIMIT 10;
+LIMIT 10

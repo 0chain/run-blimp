@@ -1,4 +1,3 @@
--- variant of TPC-DS q86: having
 SELECT
   SUM(ws_net_paid) AS total_sum,
   i_category,
@@ -24,4 +23,4 @@ ORDER BY
   lochierarchy DESC NULLS FIRST,
   CASE WHEN GROUPING(i_category) + GROUPING(i_class) = 0 THEN i_category END NULLS FIRST,
   rank_within_parent NULLS FIRST
-LIMIT 100;
+LIMIT 100

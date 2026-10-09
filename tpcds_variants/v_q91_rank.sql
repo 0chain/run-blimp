@@ -1,4 +1,3 @@
--- variant of TPC-DS q91: rank
 SELECT
   cc_call_center_id AS Call_Center,
   cc_name AS Call_Center_Name,
@@ -32,4 +31,4 @@ GROUP BY
   cd_marital_status,
   cd_education_status
 ORDER BY
-  SUM(cr_net_loss) DESC;
+  SUM(cr_net_loss) DESC

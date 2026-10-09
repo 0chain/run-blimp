@@ -1,4 +1,3 @@
--- variant of TPC-DS q15: filter
 SELECT
   ca_zip,
   SUM(cs_sales_price)
@@ -21,4 +20,4 @@ GROUP BY
   ca_zip
 ORDER BY
   ca_zip NULLS FIRST
-LIMIT 100;
+LIMIT 100

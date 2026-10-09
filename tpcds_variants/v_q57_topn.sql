@@ -1,4 +1,3 @@
--- variant of TPC-DS q57: topn
 WITH v1 AS (
   SELECT
     i_category,
@@ -73,4 +72,4 @@ ORDER BY
   7,
   8,
   9
-LIMIT 10;
+LIMIT 10

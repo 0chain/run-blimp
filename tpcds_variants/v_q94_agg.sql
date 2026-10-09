@@ -1,4 +1,3 @@
--- variant of TPC-DS q94: agg
 SELECT
   COUNT(DISTINCT ws_order_number) AS "order count",
   COUNT(ws_ext_ship_cost) AS "total shipping cost",
@@ -28,4 +27,4 @@ WHERE
   )
 ORDER BY
   COUNT(DISTINCT ws_order_number)
-LIMIT 100;
+LIMIT 100

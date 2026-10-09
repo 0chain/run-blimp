@@ -1,4 +1,3 @@
--- variant of TPC-DS q15: having
 SELECT
   ca_zip,
   SUM(cs_sales_price)
@@ -20,4 +19,4 @@ HAVING
   COUNT(*) > 1
 ORDER BY
   ca_zip NULLS FIRST
-LIMIT 100;
+LIMIT 100

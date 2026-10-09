@@ -1,4 +1,3 @@
--- variant of TPC-DS q2: years
 WITH wscs AS (
   SELECT
     sold_date_sk,
@@ -83,4 +82,4 @@ FROM (
 WHERE
   d_week_seq1 = d_week_seq2 - 53
 ORDER BY
-  d_week_seq1 NULLS FIRST;
+  d_week_seq1 NULLS FIRST

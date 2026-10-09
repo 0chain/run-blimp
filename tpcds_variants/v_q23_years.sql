@@ -1,4 +1,3 @@
--- variant of TPC-DS q23: years
 WITH frequent_ss_items AS (
   SELECT
     itemdesc,
@@ -91,4 +90,4 @@ ORDER BY
   c_last_name NULLS FIRST,
   c_first_name NULLS FIRST,
   sales NULLS FIRST
-LIMIT 100;
+LIMIT 100

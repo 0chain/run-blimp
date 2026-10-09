@@ -1,4 +1,3 @@
--- variant of TPC-DS q64: agg
 WITH cs_ui AS (
   SELECT
     cs_item_sk,
@@ -108,4 +107,4 @@ ORDER BY
   cs1.store_name,
   cs2.cnt,
   cs1.s1,
-  cs2.s1;
+  cs2.s1

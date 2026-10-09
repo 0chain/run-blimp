@@ -1,4 +1,3 @@
--- variant of TPC-DS q99: rollup
 SELECT
   w_substr,
   sm_type,
@@ -67,4 +66,4 @@ ORDER BY
   w_substr NULLS FIRST,
   sm_type NULLS FIRST,
   cc_name_lower NULLS FIRST
-LIMIT 100;
+LIMIT 100

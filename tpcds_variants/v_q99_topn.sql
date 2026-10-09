@@ -1,4 +1,3 @@
--- variant of TPC-DS q99: topn
 SELECT
   w_substr,
   sm_type,
@@ -65,4 +64,4 @@ ORDER BY
   w_substr DESC NULLS FIRST,
   sm_type NULLS FIRST,
   cc_name_lower NULLS FIRST
-LIMIT 50;
+LIMIT 50

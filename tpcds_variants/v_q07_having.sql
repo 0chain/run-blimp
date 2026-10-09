@@ -1,4 +1,3 @@
--- variant of TPC-DS q7: having
 SELECT
   i_item_id,
   AVG(ss_quantity) AS agg1,
@@ -24,4 +23,4 @@ HAVING
   COUNT(*) > 1
 ORDER BY
   i_item_id
-LIMIT 100;
+LIMIT 100

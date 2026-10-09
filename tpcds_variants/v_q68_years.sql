@@ -1,4 +1,3 @@
--- variant of TPC-DS q68: years
 SELECT
   c_last_name,
   c_first_name,
@@ -42,4 +41,4 @@ WHERE
 ORDER BY
   c_last_name NULLS FIRST,
   ss_ticket_number NULLS FIRST
-LIMIT 100;
+LIMIT 100

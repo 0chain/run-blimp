@@ -1,4 +1,3 @@
--- variant of TPC-DS q77: topn
 WITH ss AS (
   SELECT
     s_store_sk,
@@ -120,4 +119,4 @@ ORDER BY
   channel DESC NULLS FIRST,
   id NULLS FIRST,
   returns_ DESC
-LIMIT 200;
+LIMIT 200

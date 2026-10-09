@@ -1,4 +1,3 @@
--- variant of TPC-DS q42: topn
 SELECT
   dt.d_year,
   item.i_category_id,
@@ -20,4 +19,4 @@ ORDER BY
   dt.d_year,
   item.i_category_id,
   item.i_category
-LIMIT 25;
+LIMIT 25

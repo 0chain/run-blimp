@@ -1,4 +1,3 @@
--- variant of TPC-DS q34: having
 SELECT
   c_last_name,
   c_first_name,
@@ -48,4 +47,4 @@ ORDER BY
   c_first_name NULLS FIRST,
   c_salutation NULLS FIRST,
   c_preferred_cust_flag DESC NULLS FIRST,
-  ss_ticket_number NULLS FIRST;
+  ss_ticket_number NULLS FIRST

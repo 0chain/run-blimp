@@ -1,4 +1,3 @@
--- variant of TPC-DS q76: rollup
 SELECT
   channel,
   col_name,
@@ -57,4 +56,4 @@ ORDER BY
   d_year NULLS FIRST,
   d_qoy NULLS FIRST,
   i_category NULLS FIRST
-LIMIT 100;
+LIMIT 100

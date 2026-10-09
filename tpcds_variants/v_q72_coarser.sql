@@ -1,4 +1,3 @@
--- variant of TPC-DS q72: coarser
 SELECT
   i_item_desc,
   w_warehouse_name,
@@ -60,4 +59,4 @@ ORDER BY
   total_cnt DESC NULLS FIRST,
   i_item_desc NULLS FIRST,
   w_warehouse_name NULLS FIRST
-LIMIT 100;
+LIMIT 100

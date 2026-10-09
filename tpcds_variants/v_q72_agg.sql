@@ -1,4 +1,3 @@
--- variant of TPC-DS q72: agg
 SELECT
   i_item_desc,
   w_warehouse_name,
@@ -63,4 +62,4 @@ ORDER BY
   i_item_desc NULLS FIRST,
   w_warehouse_name NULLS FIRST,
   d1.d_week_seq NULLS FIRST
-LIMIT 100;
+LIMIT 100

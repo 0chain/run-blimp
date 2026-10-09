@@ -1,4 +1,3 @@
--- variant of TPC-DS q46: agg
 SELECT
   c_last_name,
   c_first_name,
@@ -43,4 +42,4 @@ ORDER BY
   ca_city NULLS FIRST,
   bought_city NULLS FIRST,
   ss_ticket_number NULLS FIRST
-LIMIT 100;
+LIMIT 100

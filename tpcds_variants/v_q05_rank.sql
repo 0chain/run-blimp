@@ -1,4 +1,3 @@
--- variant of TPC-DS q5: rank
 WITH ssr AS (
   SELECT
     s_store_id,
@@ -146,4 +145,4 @@ GROUP BY
 ORDER BY
   channel NULLS FIRST,
   id NULLS FIRST
-LIMIT 100;
+LIMIT 100

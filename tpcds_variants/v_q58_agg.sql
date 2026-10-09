@@ -1,4 +1,3 @@
--- variant of TPC-DS q58: agg
 WITH ss_items AS (
   SELECT
     i_item_id AS item_id,
@@ -105,4 +104,4 @@ WHERE
 ORDER BY
   ss_items.item_id NULLS FIRST,
   ss_item_rev NULLS FIRST
-LIMIT 100;
+LIMIT 100

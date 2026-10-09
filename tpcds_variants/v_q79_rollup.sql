@@ -1,4 +1,3 @@
--- variant of TPC-DS q79: rollup
 SELECT
   c_last_name,
   c_first_name,
@@ -41,4 +40,4 @@ ORDER BY
   SUBSTRING(s_city, 1, 30) NULLS FIRST,
   profit NULLS FIRST,
   ss_ticket_number
-LIMIT 100;
+LIMIT 100

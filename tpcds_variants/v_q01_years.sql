@@ -1,4 +1,3 @@
--- variant of TPC-DS q1: years
 WITH customer_total_return AS (
   SELECT
     sr_customer_sk AS ctr_customer_sk,
@@ -27,4 +26,4 @@ WHERE
   AND ctr1.ctr_customer_sk = c_customer_sk
 ORDER BY
   c_customer_id
-LIMIT 100;
+LIMIT 100

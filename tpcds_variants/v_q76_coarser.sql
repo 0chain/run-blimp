@@ -1,4 +1,3 @@
--- variant of TPC-DS q76: coarser
 SELECT
   channel,
   col_name,
@@ -52,4 +51,4 @@ ORDER BY
   col_name NULLS FIRST,
   d_qoy NULLS FIRST,
   i_category NULLS FIRST
-LIMIT 100;
+LIMIT 100

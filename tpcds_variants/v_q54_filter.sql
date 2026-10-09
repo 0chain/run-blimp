@@ -1,4 +1,3 @@
--- variant of TPC-DS q54: filter
 WITH my_customers AS (
   SELECT DISTINCT
     c_customer_sk,
@@ -69,4 +68,4 @@ ORDER BY
   SEGMENT NULLS FIRST,
   num_customers NULLS FIRST,
   segment_base
-LIMIT 100;
+LIMIT 100

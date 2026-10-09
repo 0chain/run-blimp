@@ -1,4 +1,3 @@
--- variant of TPC-DS q52: having
 SELECT
   dt.d_year,
   item.i_brand_id AS brand_id,
@@ -21,4 +20,4 @@ ORDER BY
   dt.d_year,
   ext_price DESC,
   brand_id
-LIMIT 100;
+LIMIT 100

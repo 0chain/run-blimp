@@ -1,4 +1,3 @@
--- variant of TPC-DS q85: topn
 SELECT
   SUBSTRING(r_reason_desc, 1, 20),
   AVG(ws_quantity) AS avg1,
@@ -62,4 +61,4 @@ ORDER BY
   AVG(ws_quantity),
   AVG(wr_refunded_cash),
   AVG(wr_fee)
-LIMIT 25;
+LIMIT 25

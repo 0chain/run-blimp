@@ -1,4 +1,3 @@
--- variant of TPC-DS q37: coarser
 SELECT
   i_item_id,
   i_current_price
@@ -16,4 +15,4 @@ GROUP BY
   i_current_price
 ORDER BY
   i_item_id
-LIMIT 100;
+LIMIT 100

@@ -1,4 +1,3 @@
--- variant of TPC-DS q19: coarser
 SELECT
   i_brand AS brand,
   i_manufact_id,
@@ -24,4 +23,4 @@ ORDER BY
   i_brand,
   i_manufact_id,
   i_manufact
-LIMIT 100;
+LIMIT 100

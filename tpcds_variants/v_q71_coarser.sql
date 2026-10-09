@@ -1,4 +1,3 @@
--- variant of TPC-DS q71: coarser
 SELECT
   i_brand AS brand,
   t_hour,
@@ -45,4 +44,4 @@ GROUP BY
   t_minute
 ORDER BY
   ext_price DESC NULLS FIRST,
-  t_hour NULLS FIRST;
+  t_hour NULLS FIRST

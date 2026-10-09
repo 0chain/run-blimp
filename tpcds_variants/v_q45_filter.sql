@@ -1,4 +1,3 @@
--- variant of TPC-DS q45: filter
 SELECT
   ca_zip,
   ca_city,
@@ -30,4 +29,4 @@ GROUP BY
 ORDER BY
   ca_zip,
   ca_city
-LIMIT 100;
+LIMIT 100

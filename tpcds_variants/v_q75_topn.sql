@@ -1,4 +1,3 @@
--- variant of TPC-DS q75: topn
 WITH all_sales AS (
   SELECT
     d_year,
@@ -99,4 +98,4 @@ WHERE
 ORDER BY
   sales_cnt_diff DESC,
   sales_amt_diff
-LIMIT 25;
+LIMIT 25

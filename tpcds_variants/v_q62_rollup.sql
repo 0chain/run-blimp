@@ -1,4 +1,3 @@
--- variant of TPC-DS q62: rollup
 SELECT
   w_substr,
   sm_type,
@@ -67,4 +66,4 @@ ORDER BY
   1 NULLS FIRST,
   2 NULLS FIRST,
   3 NULLS FIRST
-LIMIT 100;
+LIMIT 100

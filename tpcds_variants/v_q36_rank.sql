@@ -1,4 +1,3 @@
--- variant of TPC-DS q36: rank
 WITH results AS (
   SELECT
     SUM(ss_net_profit) AS ss_net_profit,
@@ -69,4 +68,4 @@ ORDER BY
   lochierarchy DESC NULLS FIRST,
   CASE WHEN lochierarchy = 0 THEN i_category END NULLS FIRST,
   rank_within_parent NULLS FIRST
-LIMIT 100;
+LIMIT 100

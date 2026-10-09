@@ -1,4 +1,3 @@
--- variant of TPC-DS q63: rollup
 SELECT
   *
 FROM (
@@ -58,4 +57,4 @@ ORDER BY
   i_manager_id,
   avg_monthly_sales,
   sum_sales
-LIMIT 100;
+LIMIT 100

@@ -1,4 +1,3 @@
--- variant of TPC-DS q19: rollup
 SELECT
   i_brand_id AS brand_id,
   i_brand AS brand,
@@ -29,4 +28,4 @@ ORDER BY
   i_brand_id,
   i_manufact_id,
   i_manufact
-LIMIT 100;
+LIMIT 100

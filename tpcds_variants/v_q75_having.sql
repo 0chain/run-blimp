@@ -1,4 +1,3 @@
--- variant of TPC-DS q75: having
 WITH all_sales AS (
   SELECT
     d_year,
@@ -101,4 +100,4 @@ WHERE
 ORDER BY
   sales_cnt_diff,
   sales_amt_diff
-LIMIT 100;
+LIMIT 100

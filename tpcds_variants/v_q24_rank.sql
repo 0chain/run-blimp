@@ -1,4 +1,3 @@
--- variant of TPC-DS q24: rank
 WITH ssales AS (
   SELECT
     c_last_name,
@@ -57,4 +56,4 @@ HAVING
 ORDER BY
   c_last_name,
   c_first_name,
-  s_store_name;
+  s_store_name

@@ -1,4 +1,3 @@
--- variant of TPC-DS q45: years
 SELECT
   ca_zip,
   ca_city,
@@ -27,4 +26,4 @@ GROUP BY
 ORDER BY
   ca_zip,
   ca_city
-LIMIT 100;
+LIMIT 100

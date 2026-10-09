@@ -1,4 +1,3 @@
--- variant of TPC-DS q3: agg
 SELECT
   dt.d_year,
   item.i_brand_id AS brand_id,
@@ -18,4 +17,4 @@ ORDER BY
   dt.d_year,
   sum_agg DESC,
   brand_id
-LIMIT 100;
+LIMIT 100

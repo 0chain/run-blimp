@@ -1,4 +1,3 @@
--- variant of TPC-DS q7: topn
 SELECT
   i_item_id,
   AVG(ss_quantity) AS agg1,
@@ -22,4 +21,4 @@ GROUP BY
   i_item_id
 ORDER BY
   i_item_id DESC
-LIMIT 10;
+LIMIT 10

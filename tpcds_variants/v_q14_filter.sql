@@ -1,4 +1,3 @@
--- variant of TPC-DS q14: filter
 WITH cross_items AS (
   SELECT
     i_item_sk AS ss_item_sk
@@ -171,4 +170,4 @@ ORDER BY
   i_brand_id NULLS FIRST,
   i_class_id NULLS FIRST,
   i_category_id NULLS FIRST
-LIMIT 100;
+LIMIT 100

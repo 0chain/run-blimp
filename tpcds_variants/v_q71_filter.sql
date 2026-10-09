@@ -1,4 +1,3 @@
--- variant of TPC-DS q71: filter
 SELECT
   i_brand_id AS brand_id,
   i_brand AS brand,
@@ -50,4 +49,4 @@ GROUP BY
 ORDER BY
   ext_price DESC NULLS FIRST,
   i_brand_id NULLS FIRST,
-  t_hour NULLS FIRST;
+  t_hour NULLS FIRST

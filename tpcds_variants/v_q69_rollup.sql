@@ -1,4 +1,3 @@
--- variant of TPC-DS q69: rollup
 SELECT
   cd_gender,
   cd_marital_status,
@@ -59,4 +58,4 @@ ORDER BY
   cd_education_status,
   cd_purchase_estimate,
   cd_credit_rating
-LIMIT 100;
+LIMIT 100

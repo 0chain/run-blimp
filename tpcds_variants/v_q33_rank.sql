@@ -1,4 +1,3 @@
--- variant of TPC-DS q33: rank
 WITH ss AS (
   SELECT
     i_manufact_id,
@@ -84,4 +83,4 @@ GROUP BY
   i_manufact_id
 ORDER BY
   total_sales
-LIMIT 100;
+LIMIT 100

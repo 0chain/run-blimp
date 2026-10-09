@@ -1,4 +1,3 @@
--- variant of TPC-DS q60: filter
 WITH ss AS (
   SELECT
     i_item_id,
@@ -87,4 +86,4 @@ GROUP BY
 ORDER BY
   i_item_id,
   total_sales
-LIMIT 100;
+LIMIT 100

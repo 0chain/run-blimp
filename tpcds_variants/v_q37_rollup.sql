@@ -1,4 +1,3 @@
--- variant of TPC-DS q37: rollup
 SELECT
   i_item_id,
   i_item_desc,
@@ -20,4 +19,4 @@ GROUP BY
   )
 ORDER BY
   i_item_id
-LIMIT 100;
+LIMIT 100

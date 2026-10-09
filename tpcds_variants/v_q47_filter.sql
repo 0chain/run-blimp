@@ -1,4 +1,3 @@
--- variant of TPC-DS q47: filter
 WITH v1 AS (
   SELECT
     i_category,
@@ -85,4 +84,4 @@ ORDER BY
   8,
   9,
   10
-LIMIT 100;
+LIMIT 100

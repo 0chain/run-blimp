@@ -1,4 +1,3 @@
--- variant of TPC-DS q40: coarser
 SELECT
   i_item_id,
   SUM(
@@ -34,4 +33,4 @@ GROUP BY
   i_item_id
 ORDER BY
   i_item_id
-LIMIT 100;
+LIMIT 100

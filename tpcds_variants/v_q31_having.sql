@@ -1,4 +1,3 @@
--- variant of TPC-DS q31: having
 WITH ss AS (
   SELECT
     ca_county,
@@ -89,4 +88,4 @@ WHERE
     ELSE NULL
   END
 ORDER BY
-  ss1.ca_county;
+  ss1.ca_county

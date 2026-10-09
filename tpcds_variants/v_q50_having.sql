@@ -1,4 +1,3 @@
--- variant of TPC-DS q50: having
 SELECT
   s_store_name,
   s_company_id,
@@ -86,4 +85,4 @@ ORDER BY
   s_county,
   s_state,
   s_zip
-LIMIT 100;
+LIMIT 100
