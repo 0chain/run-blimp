@@ -1490,7 +1490,7 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
 
 
 def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random,
-                   str_domains=None):
+                   str_domains=None, own_key=None):
     """Generate EVERY column of a NON-sales table (inventory, customer, item, ...)
     from its live schema. No per-table row template: every physical column is
     synthesized so the strict null guard holds for these tables too.
@@ -1511,7 +1511,7 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
     owners, _qs = row_owners(names, n)
     for name, kind in columns:
         d = dim_for(name)
-        if name == own_key_of(table) or (d is not None and d[0] == table):
+        if name == own_key_of(table) or name == own_key or (d is not None and d[0] == table):
             out[name] = [key_base + i for i in range(n)]            # own PK
         elif d is not None and d[0] == "date_dim":
             prov = {}
@@ -1633,6 +1633,29 @@ def _namespace_columns(cat, namespace):
     return out
 
 
+def table_own_key(t, columns):
+    """The table's own key when the TPC-DS suffix map does not name it (any
+    other schema: TPC-H customer's c_custkey): the Iceberg identifier field when
+    the table declares one, else its leading integer column — the key column
+    of every dbgen table. Without it the append issued keys from 1, re-using
+    keys old facts already reference: TPC-H q13's appended customers collided
+    with existing c_custkey values and the merge had to semi-join all 150M
+    orders on every tick (node 65, SF100, 2026-10-11)."""
+    try:
+        ids = list(t.schema().identifier_field_names())
+    except Exception:
+        ids = []
+    names = [c for c, _ in columns]
+    # a foreign key is never the table's own key (inventory leads with
+    # inv_date_sk, a date_dim reference)
+    for c in ids:
+        if c in names and dim_for(c) is None:
+            return c
+    if columns and columns[0][1] in ("i", "l") and dim_for(columns[0][0]) is None:
+        return columns[0][0]
+    return None
+
+
 def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache,
                  strict=True, verbose=True):
     """Append `n` fully-populated rows to any non-sales table that EXISTS in the
@@ -1661,6 +1684,8 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
         own = own_key_of(table)
         if own and any(c == own for c, _ in columns):
             keycol = own
+    if keycol is None:
+        keycol = table_own_key(t, columns)
     if keycol:
         _, mx = catalog_bounds(cat, namespace, table, keycol)
         if mx is None:
@@ -1697,7 +1722,8 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
             print(f"   {table}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
     cols = gen_table_cols(table, columns, n, date_lo=date_lo, date_hi=date_hi,
                           dim_hi=dim_hi_cache, key_base=kb,
-                          str_domains=load_string_domains(t, columns, verbose=verbose))
+                          str_domains=load_string_domains(t, columns, verbose=verbose),
+                          own_key=keycol)
     if verbose:
         flush_date_reports()
     data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
