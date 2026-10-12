@@ -1912,7 +1912,13 @@ print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get
     sleep 5
     log=$(curl -s -m 20 "$base/update/log?id=$id" -H "Authorization: Bearer $tok"); n=$(printf '%s\n' "$log" | grep -c .)
     [ "$n" -gt "$seen" ] && { printf '%s\n' "$log" | tail -n +"$((seen+1))" | grep -E '\[update\]|\[rclone\]|FAIL|rolled back' | sed 's/^/  /'; seen=$n; }
-    st=$(curl -s -m 20 "$base/update/state?id=$id" -H "Authorization: Bearer $tok" | sed -n 's/.*"status": *"\([a-z]*\)".*/\1/p')
+    # The TOP-LEVEL status. A greedy sed matched the LAST "status" in the body —
+    # the last step's, "pending" while an earlier step runs — so a multi-service
+    # update (`--update agent,feldera`) ended the poll early and reported
+    # "pending" (node 65, 2026-10-13).
+    st=$(curl -s -m 20 "$base/update/state?id=$id" -H "Authorization: Bearer $tok" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("status",""))
+except Exception: pass' 2>/dev/null)
     [ -n "$st" ] || st=running
   done
   echo "== update $id: $st ==  (full log: blimp --update-log $id)"
