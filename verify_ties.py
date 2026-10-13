@@ -80,10 +80,42 @@ def order_by_limit(sql):
     return [it.strip() for it in items], int(m.group(1))
 
 
-def resolve(items, columns):
+def select_projections(sql):
+    """{normalized expression: output name} for the outermost SELECT list's
+    items — `dt.d_year` (output d_year), `item.i_brand_id AS brand_id`."""
+    s = strip_sql(sql).strip().rstrip(";").strip()
+    mask = top_level(s)
+    sel = [m for m in re.finditer(r"\bselect\b", s, re.I) if mask[m.start()]]
+    frm = [m for m in re.finditer(r"\bfrom\b", s, re.I) if mask[m.start()]]
+    if not sel or not frm:
+        return {}
+    start = sel[-1].end()
+    ends = [m.start() for m in frm if m.start() > start]
+    if not ends:
+        return {}
+    body, bmask = s[start:ends[0]], mask[start:ends[0]]
+    items, cur = [], ""
+    for c, top in zip(body, bmask):
+        if c == "," and top:
+            items.append(cur); cur = ""
+        else:
+            cur += c
+    items.append(cur)
+    out = {}
+    for it in items:
+        it = re.sub(r"^\s*distinct\s+", "", it.strip(), flags=re.I)
+        m = re.fullmatch(r"(.+?)\s+(?:as\s+)?(\w+)", it, re.I | re.S)
+        expr, name = (m.group(1), m.group(2)) if m and not re.fullmatch(r"\w+(\.\w+)?", it) else (it, it.split(".")[-1])
+        out[re.sub(r"\s+", "", expr).lower()] = name.lower()
+    return out
+
+
+def resolve(items, columns, sql=""):
     """Result column indexes for the ORDER BY items, or None when any item is
-    not an ordinal or an output column name (an expression we cannot read)."""
+    not an ordinal, an output column name, or an expression the SELECT list
+    projects verbatim (an expression we cannot read)."""
     lower = [c.lower() for c in columns]
+    proj = select_projections(sql) if sql else {}
     idx = []
     for it in items:
         e = re.sub(r"\s+nulls\s+(first|last)$", "", it, flags=re.I)
@@ -96,6 +128,14 @@ def resolve(items, columns):
             # A bare name is the output column (the engine binds ORDER BY names to
             # output aliases first); a qualified t.c may be a different column.
             name = e.strip('"').lower()
+            if lower.count(name) != 1:
+                return None
+            k = lower.index(name)
+        elif re.sub(r"\s+", "", e).lower() in proj:
+            # A qualified name or expression the SELECT list projects as is
+            # (`dt.d_year`, v_q03_cube) IS that output column — no other
+            # column can be meant. Anything else stays unresolved.
+            name = proj[re.sub(r"\s+", "", e).lower()]
             if lower.count(name) != 1:
                 return None
             k = lower.index(name)
@@ -124,7 +164,7 @@ def tie_verdict(sql, served, base):
     (cs, a), (cb, b) = served, base
     if [c.lower() for c in cs] != [c.lower() for c in cb]:
         return False, "different result columns"
-    idx = resolve(items, cs)
+    idx = resolve(items, cs, sql)
     if idx is None:
         return False, "ORDER BY items %s do not all resolve to result columns" % items
     if not (len(a) == len(b) == n):
