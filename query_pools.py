@@ -45,7 +45,7 @@ Usage:
       --warehouse s3://my-bucket/wh --namespace tpcds \
       [--s3-endpoint http://host:9000] [--s3-key … --s3-secret …] --out pools.json
 """
-import argparse, json, re, sys
+import argparse, json, os, re, sys
 
 # Column prefix → (dimension table, key column). Test fixture: the bench knows
 # the TPC-DS naming; product code never carries such a map.
@@ -294,7 +294,14 @@ def duck_connect(a):
         ep = re.sub(r"^https?://", "", a.s3_endpoint)
         ssl = "true" if a.s3_endpoint.startswith("https") else "false"
         con.execute("CREATE OR REPLACE SECRET src (TYPE S3, KEY_ID '%s', SECRET '%s', ENDPOINT '%s', URL_STYLE 'path', USE_SSL %s)"
-                    % (a.s3_key, a.s3_secret, ep, ssl))
+                    % (a.s3_key or "minioadmin", a.s3_secret or "minioadmin", ep, ssl))
+    elif a.s3_key:
+        # AWS S3: without a secret DuckDB reads anonymously and every dim lookup
+        # fails, which leaves the tick with no pools.
+        con.execute("CREATE OR REPLACE SECRET src (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s')"
+                    % (a.s3_key, a.s3_secret, a.s3_region))
+    else:
+        con.execute("CREATE OR REPLACE SECRET src (TYPE S3, PROVIDER credential_chain, REGION '%s')" % a.s3_region)
     con.execute("CREATE OR REPLACE SECRET ic (TYPE ICEBERG, ENDPOINT '%s', TOKEN '')" % a.catalog)
     con.execute("ATTACH '%s' AS src (TYPE ICEBERG, SECRET ic)" % a.warehouse)
     return con
@@ -335,8 +342,12 @@ def main():
     ap.add_argument("--warehouse", required=True)
     ap.add_argument("--namespace", required=True)
     ap.add_argument("--s3-endpoint", default="")
-    ap.add_argument("--s3-key", default="minioadmin")
-    ap.add_argument("--s3-secret", default="minioadmin")
+    # Same credentials the seeder writes with (AWS_* env, set by bench_cdc.sh);
+    # minioadmin only as the local-MinIO fallback, the AWS credential chain
+    # when no key is set.
+    ap.add_argument("--s3-key", default=os.environ.get("AWS_ACCESS_KEY_ID", ""))
+    ap.add_argument("--s3-secret", default=os.environ.get("AWS_SECRET_ACCESS_KEY", ""))
+    ap.add_argument("--s3-region", default=os.environ.get("AWS_REGION") or "us-east-1")
     ap.add_argument("--limit", type=int, default=20000)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()

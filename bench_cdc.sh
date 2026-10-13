@@ -411,10 +411,13 @@ except Exception: print(-1)' 2>/dev/null)
         echo "   pools: no query SQL loaded — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
       elif ! POOLPY=$(pool_python) || [ -z "$POOLPY" ]; then
         echo "   pools: no python with a working duckdb module ($PY3, python3) — UNIFORM draws; any MV that bakes a date filter merges 0 rows"
-      elif "$POOLPY" "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
+      elif AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" AWS_REGION="$REGION" \
+             "$POOLPY" "$HERE/query_pools.py" $pf --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" \
              ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} --out "$POOLS_JSON" 2>"$POOLS_LOG"; then
         POOLS_ARG="--key-pools $POOLS_JSON"
-        grep -E '^pools:|-> ' "$POOLS_LOG" | sed "s/^/   pools: /"
+        # skip / NO usable pool lines too: a failed dim lookup is not an error
+        # exit, and printing only the summary hid why pools came back empty.
+        grep -E '^pools:|-> |skip |NO usable pool' "$POOLS_LOG" | sed "s/^/   pools: /"
       else
         echo "   pools: derivation failed (UNIFORM draws) — $(tail -1 "$POOLS_LOG")"
       fi
