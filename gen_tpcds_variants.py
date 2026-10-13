@@ -25,6 +25,9 @@ outermost SELECT):
   inlist     drop the last value of an IN list of >= 3 literals
   nolimit    drop the outermost LIMIT (the whole ordered result)
   combo      two transforms applied together (years+having, filter+agg, ...)
+             --all-combos emits every applicable pair as <prefix><NN>_c_<a>_<b>
+             instead of one random pick: TPC-H's 22 queries admit few single
+             transforms (126 variants vs 793 over TPC-DS's 99).
 
   dates      shift every DATE 'YYYY-MM-DD' literal by one year (TPC-H's spelling)
 
@@ -241,6 +244,13 @@ COMBOS = [("years", "having"), ("dates", "having"), ("dates", "inlist"), ("filte
           ("coarser", "rank"), ("between", "having"), ("inlist", "caseagg"), ("filter", "coarser")]
 
 
+# Extra pairs for --all-combos: TPC-H shifts DATE literals, not years, so the
+# year-based pairs above never apply to it.
+EXTRA_COMBOS = [("dates", "agg"), ("dates", "rank"), ("dates", "distinct"), ("dates", "coarser"),
+                ("dates", "caseagg"), ("dates", "rollup"), ("coarser", "having"), ("agg", "rank"),
+                ("caseagg", "having"), ("rollup", "rank"), ("topn", "agg"), ("nolimit", "having")]
+
+
 def t_combo(tree, rnd):
     a, b = rnd.choice(COMBOS)
     return FN[a](tree, rnd) and FN[b](tree, rnd)
@@ -260,6 +270,8 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--transforms", default="", help="comma list (default all)")
+    ap.add_argument("--max-per-query", type=int, default=0, help="cap the variants emitted per query in this run (0 = no cap)")
+    ap.add_argument("--all-combos", action="store_true", help="emit every applicable combo pair per query (<prefix><NN>_c_<a>_<b>.sql)")
     ap.add_argument("--skip-existing", default="", help="dir of earlier variants: never re-emit a (query, transform) already there")
     a = ap.parse_args()
     rnd = random.Random(a.seed)
@@ -281,16 +293,25 @@ def main():
 
     os.makedirs(a.out, exist_ok=True)
     seen, kept = set(), {t: 0 for t in TRANSFORMS}
+    per_q = {}
     for f in (os.listdir(a.skip_existing) if a.skip_existing and os.path.isdir(a.skip_existing) else []):
         seen.add(re.sub(r"\s+", " ", open(os.path.join(a.skip_existing, f)).read().strip()))
     order = list(base)
     todo = [x for x in a.transforms.split(",") if x] or TRANSFORMS
+    if a.all_combos:
+        pairs = COMBOS + EXTRA_COMBOS
+        todo = [f"c_{x}_{y}" for x, y in pairs]
+        for x, y in pairs:
+            FN[f"c_{x}_{y}"] = (lambda x, y: lambda tree, rnd: FN[x](tree, rnd) and FN[y](tree, rnd))(x, y)
+        kept.update({t: 0 for t in todo})
     prior = set(os.listdir(a.skip_existing)) if a.skip_existing and os.path.isdir(a.skip_existing) else set()
     for t in todo:
         rnd.shuffle(order)
         for n in order:
             if kept[t] >= a.per_transform:
                 break
+            if a.max_per_query and per_q.get(n, 0) >= a.max_per_query:
+                continue
             try:
                 tree = sqlglot.parse_one(base[n], read="duckdb")
             except Exception:
@@ -317,6 +338,7 @@ def main():
                     continue
             seen.add(norm)
             kept[t] += 1
+            per_q[n] = per_q.get(n, 0) + 1
             with open(os.path.join(a.out, f"{prefix}{n:02d}_{t}.sql"), "w") as f:
                 # No leading comment: the gateway accepts only a statement that
                 # starts with SELECT/WITH (the file name carries q and transform).
