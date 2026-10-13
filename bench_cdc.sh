@@ -144,7 +144,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL V_RESULT V_RESURL MERGE MODE MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL V_RESULT V_RESURL MERGE MODE REASON MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # EVERY call passes skip_verify — the production path. The author's own
@@ -601,7 +601,7 @@ for n in "${NAMES[@]}"; do
   # advances (drift-poll rechecks). Take the newest REAL refresh row
   # (incremental/full); fall back to the newest row of any mode only if no
   # real refresh exists.
-  read m md < <(echo "$WAVE" | python3 -c "
+  IFS=$'\t' read -r m md rsn < <(echo "$WAVE" | python3 -c "
 import json,sys
 MERGE_MODES=tuple('$MERGE_MODES'.split())
 w=json.load(sys.stdin).get('waves',[])
@@ -611,8 +611,8 @@ rows=[x for x in w if (x.get('mv_table','').split('.')[-1])=='$t']
 # were read as 'full re-author' (q16/q95 KEY-LOCAL merges, SF10 2026-10-08).
 real=[x for x in rows if x.get('mode') in MERGE_MODES+('full','rebuild','rebaseline','fallback')]
 x=(real or rows or [{}])[0]
-print(x.get('merge_ms', x.get('materialize_ms','')) or '-', x.get('mode','-'))")
-  MERGE[$n]="$m"; MODE[$n]="$md"
+print(x.get('merge_ms', x.get('materialize_ms','')) or '-', x.get('mode','-'), ' '.join((x.get('reason') or '').split())[:300] or '-', sep='\t')")
+  MERGE[$n]="$m"; MODE[$n]="$md"; REASON[$n]="$rsn"
   # Lazy CDC: the query-time inline merge_ms is authoritative — the wave log
   # only sees proactive merges, which the lazy default no longer performs.
   if [ -n "${I_MERGE[$n]:-}" ] && [ "${I_MERGE[$n]}" != "null" ]; then
@@ -682,6 +682,9 @@ for n in "${NAMES[@]}"; do
     echo "  $n: MV ${MVTBL[$n]} — delta-merged (empty delta, mode='${MODE[$n]}')"
   else
     echo "  $n: MV ${MVTBL[$n]} — refreshed by full re-author (mode='${MODE[$n]:--}')"
+    # The gateway logs WHY it did not merge (wave-log reason); without it a
+    # rebaseline is unexplained from the bench side (customer q3, 2026-10-13).
+    [ -n "${REASON[$n]:-}" ] && [ "${REASON[$n]}" != "-" ] && echo "      reason: ${REASON[$n]}"
   fi
 done
 echo "DONE"
