@@ -156,6 +156,21 @@ run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
     -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[6],"label":sys.argv[2],"skip_verify":True}))' "$1" "$2" "${3:-0}" "" "${VERIFY:-0}" "$SOURCE" "${EVICT:-0}")"
 }
 
+# ---- no cloud instance-metadata probe on a custom S3 endpoint -----------------
+# Every Python S3 client here (pyarrow under pyiceberg, s3fs/botocore) asks the
+# EC2 instance-metadata endpoint for a region/credentials when the host has no
+# ~/.aws/config. Off AWS that address drops packets, and pyarrow's S3
+# filesystem init waited ~4 s per seeder process per table: node 37's tick
+# spent 46-50 s in add_files and 150 s in catalog_bounds (plan_files 8.0 s vs
+# 0.024 s with the probe off; 144 has ~/.aws/config and paid nothing,
+# 2026-10-15). A MinIO/custom endpoint never needs it; on real AWS (no custom
+# endpoint, or an amazonaws.com one) the probe may be the credential source,
+# so it stays on there.
+case "${S3_ENDPOINT:-}" in
+  ""|*amazonaws.com*) ;;
+  *) export AWS_EC2_METADATA_DISABLED="${AWS_EC2_METADATA_DISABLED:-true}" ;;
+esac
+
 # ---- MV content signature + THE DELTA GATE -----------------------------------
 # A merge over an empty delta reports a normal merge_ms, and row counts do not
 # move when appended rows land in existing groups. mv_delta_rows.py snapshots
