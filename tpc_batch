@@ -73,7 +73,9 @@ while read -r kind q; do
   t1=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | head -1 | awk '{print $3}')
   t2=$(grep -oE "$n: tick: [0-9.]+" "$OUT/${n}_1.log" | sed -n 2p | awk '{print $3}')
   v=$(grep -oE "$n: verify: [A-Z()a-z]+" "$OUT/${n}_1.log" | tail -1 | awk '{print $3}')
-  printf '%-14s author=%ss verify=%ss tick1=%ss tick2=%ss result=%s wall=%ss check=%ss\n' \
-    "$n" "${aw:-?}" "${av:-?}" "${t1:-?}" "${t2:-?}" "${v:-?}" "$(( $(date +%s) - t0 ))" "${cw:-?}" | tee -a "$SUM"
+  # ticks whose gateway trace recorded a scale fallback (bench_cdc.sh prints them)
+  fb=$(grep -c "$n: SCALE-FALLBACK" "$OUT/${n}_1.log"); fbf=""; [ "${fb:-0}" -gt 0 ] && fbf=" fallback=$fb"
+  printf '%-14s author=%ss verify=%ss tick1=%ss tick2=%ss result=%s wall=%ss check=%ss%s\n' \
+    "$n" "${aw:-?}" "${av:-?}" "${t1:-?}" "${t2:-?}" "${v:-?}" "$(( $(date +%s) - t0 ))" "${cw:-?}" "$fbf" | tee -a "$SUM"
 done < <(entries "$LIST")
 echo; echo "== summary ($(wc -l < "$SUM") queries; logs in $OUT)"; cat "$SUM"

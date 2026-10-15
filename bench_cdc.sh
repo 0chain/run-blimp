@@ -534,6 +534,10 @@ rows=d.get("mv_rows") or sys.argv[2] or "?"; cols=d.get("mv_cols") or sys.argv[3
 tbl=(d.get("mv_table") or "").split(".")[-1] or "none"
 if not p: print("   %s: tick: ? (no phase totals in the response — gateway predates them)" % n)
 else: print("   %s: tick: %.2f seconds  merge: %d ms, serve: %d ms, build: %d ms, author: %d ms, other: %d ms  MV: %s rows x %s cols (%s)" % (n,tick/1000.0,m,s,b,a,max(0,tick-m-s-b-a),rows,cols,tbl))
+# A Δ-proportional path that fell back to a whole read (gateway scale_fallback
+# steps): flagged on the tick, not left in the gateway log.
+fb=[str(x.get("detail","")) for x in (d.get("author_trace") or []) if x.get("phase")=="scale_fallback"]
+for x in fb: print("   %s: SCALE-FALLBACK %s" % (n, x[:300]))
 ' "$n" "${MV_ROWS[$n]:-}" "${MV_COLS[$n]:-}"
   done
 
