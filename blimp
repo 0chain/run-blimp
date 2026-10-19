@@ -1898,6 +1898,10 @@ if st:
 print("  updatable:", ", ".join(d.get("updatable",[])), " active update:", d.get("active_update") or "none")'
     return $?
   fi
+  # zs3 with no --tag goes to the floating :latest (the promoted prod image a
+  # new node pulls), never the tag the node already runs — a node on a dated
+  # latest-<sha> re-pulled it forever (2026-10-19). --tag zs3=<tag> still pins.
+  case ",$tags," in *,zs3=*) ;; *) case ",$what," in *,zs3,*|*,all,*) tags="${tags:+$tags,}zs3=latest" ;; esac ;; esac
   local tagjson="{}"
   [ -n "$tags" ] && tagjson=$(printf '%s' "$tags" | python3 -c 'import sys,json;print(json.dumps(dict(kv.split("=",1) for kv in sys.stdin.read().strip().split(",") if kv)))')
   local body id r
