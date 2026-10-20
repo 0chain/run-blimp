@@ -16,6 +16,8 @@
 # env: TPC_BATCH_OUT  log directory (default ./tpc_batch_logs)
 #      BLIMP_ENV      wiring file, as for blimp
 #      TPC_BATCH_EVICT=0  warm run: keep each query's MVs (default 1: evict the family first)
+#      EVICT_FAMILY_AFTER=1 evict each query's family again once it is measured
+#                         (long lists on a full disk; recipes kept)
 #      TPC_BATCH_VERIFY=0 ticks only: skip the phase-4 verify against base
 #      TPC_BATCH_TICK=0   no append/tick: serve (or author) once, then the
 #                         phase-4 verify if on — verify-only:

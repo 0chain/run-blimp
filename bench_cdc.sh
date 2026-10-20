@@ -586,6 +586,15 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       case "${V_TICK1[$n]:-MATCH}" in MATCH*) ;; *) V_RESULT[$n]="TICK1-${V_TICK1[$n]}"; echo "   $n: verify: ${V_RESULT[$n]} (tick 1 served a wrong or unchecked answer)";; esac
     done
   fi
+  # EVICT_FAMILY_AFTER=1: the query is measured — evict its family again so a
+  # long list does not keep every query's MVs (and their blobber copies) on the
+  # node. A 350-variant SF1000 pass filled node 37 to 98% with MVs no later
+  # query reads: authors then failed their store PUT (mv_put_disk_short) and
+  # ticks re-authored (2026-10-20). Recipes are kept, like phase 0.
+  if [ "${EVICT_FAMILY_AFTER:-0}" = "1" ]; then
+    echo ">> phase 5: evict family after the measurement (recipe kept)"
+    for n in $FNAMES; do evict_family "${SQL[$n]}" "$n"; done
+  fi
 done
 sleep 4
 
