@@ -62,6 +62,8 @@ reset_sources(){
         -H "Content-Type: application/json" -d "{\"namespace\":\"${NAMESPACE:-tpcds}\",\"table\":\"$tb\",\"trigger\":\"tpc_batch-reset\"}" >/dev/null
     done )
   echo "== reset before $1: $(grep -c '^rollback ' "$log") table(s) rolled back, $(sed -n 's/^pruned //p' "$log")"
+  # TPC_BATCH_RESET_SETTLE_S: seconds to wait after the gateway is told
+  [ "${TPC_BATCH_RESET_SETTLE_S:-0}" -gt 0 ] 2>/dev/null && sleep "$TPC_BATCH_RESET_SETTLE_S"
 }
 nq=0
 
