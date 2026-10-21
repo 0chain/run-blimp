@@ -221,10 +221,11 @@ print('')" "$1" 2>/dev/null; }
 # evicted, so evict-and-rematch until the matcher returns nothing.
 # --evict-family: the gateway resolves the query's signature from its text and
 # evicts every MV banked under it (chart, branches, answers), recipes kept.
-evict_family(){ # evict_family <sql> <name>
-  local ef
+evict_family(){ # evict_family <sql> <name> [purge]  — purge: drop the recipes too
+  local ef purge=False
+  [ "${3:-}" = purge ] && purge=True
   ef=$(curl -s -m 300 "$QAPI/admin/mv/evict" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"cascade":True,"confirm":True,"force":True,"keep_recipe":True}))' "$1" "$SOURCE")")
+    -d "$(python3 -c 'import json,sys;p=sys.argv[3]=="True";print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"cascade":True,"confirm":True,"force":True,"keep_recipe":not p,"purge_recipe":p}))' "$1" "$SOURCE" "$purge")")
   echo "   $2: evict family evicted=$(echo "$ef" | J evicted) kept_shared=$(echo "$ef" | J kept_shared) $(echo "$ef" | J error)"
 }
 evict_query(){ # evict_query <sql> <name>
@@ -603,10 +604,14 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
   # long list does not keep every query's MVs (and their blobber copies) on the
   # node. A 350-variant SF1000 pass filled node 37 to 98% with MVs no later
   # query reads: authors then failed their store PUT (mv_put_disk_short) and
-  # ticks re-authored (2026-10-20). Recipes are kept, like phase 0.
+  # ticks re-authored (2026-10-20). The RECIPES go too: a kept recipe from an
+  # earlier image is replayed by the next run of the query instead of a fresh
+  # author, so a fix under test never reaches it (v_h16_c_rollup_having
+  # replayed a pre-fix answer recipe on node 65, 2026-10-21).
   if [ "${EVICT_FAMILY_AFTER:-0}" = "1" ]; then
-    echo ">> phase 5: evict family after the measurement (recipe kept)"
-    for n in $FNAMES; do evict_family "${SQL[$n]}" "$n"; done
+    echo ">> phase 5: evict family after the measurement (recipes purged)"
+    for n in $FNAMES; do evict_family "${SQL[$n]}" "$n" purge; done
+    "$PY3" "$HERE/mv_orphans.py" 2>/dev/null || python3 "$HERE/mv_orphans.py" 2>/dev/null || true
   fi
 done
 sleep 4
