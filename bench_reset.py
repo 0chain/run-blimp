@@ -88,6 +88,7 @@ for name in sorted(first):
 # 3. prune data files no remaining snapshot references
 if not prune:
     print("prune skipped (--no-prune)")
+    print("tables rolled back:", " ".join(rolled))
     sys.exit(0)
 import boto3
 s3 = boto3.client("s3", endpoint_url=env.get("S3_ENDPOINT") or None, region_name=env.get("REGION", "us-east-1"),
