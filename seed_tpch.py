@@ -12,8 +12,13 @@ them is a wrong delta, not a smaller one:
   - flags, statuses and dates follow dbgen (returnflag/linestatus by the
     1995-06-17 cut, ship/commit/receipt offsets from the order date);
   - o_totalprice and o_orderstatus are derived from the order's own lines.
-Dimension tables (customer, part, supplier, partsupp, nation, region) are not
-appended: every key the new rows reference already exists.
+Dimension tables (customer, supplier, nation, region) are not appended: every
+key the new rows reference already exists. PART and PARTSUPP are appended when
+the bench names them in --extra-tables (a query reads them): new parts above
+the current max p_partkey, dbgen's value domains, and dbgen's four partsupp rows
+per part (PART_SUPP_BRIDGE over the existing suppliers). Without them a query
+over partsupp/part/supplier (q16's family) ticked with nothing changed — every
+tick merged 0 rows (node 65, 2026-10-21).
 
 Catalog/write plumbing is seed_tpcds.py's (catalog_bounds, scan_dim_hi,
 _write_and_add): same bounds cache, same null guard, same schema conform.
@@ -101,6 +106,41 @@ def build(n_orders, okey0, C, P, S, clerks, rnd):
     return o, l
 
 
+COLORS = ("almond antique aquamarine azure beige bisque black blanched blue blush brown burlywood burnished "
+          "chartreuse chiffon chocolate coral cornflower cornsilk cream cyan dark deep dim dodger drab firebrick "
+          "floral forest frosted gainsboro ghost goldenrod green grey honeydew hot indian ivory khaki lace lavender "
+          "lawn lemon light lime linen magenta maroon medium metallic midnight mint misty moccasin navajo navy olive "
+          "orange orchid pale papaya peach peru pink plum powder puff purple red rose rosy royal saddle salmon sandy "
+          "seashell sienna sky slate smoke snow spring steel tan thistle tomato turquoise violet wheat white yellow").split()
+TYPE1 = ["STANDARD", "SMALL", "MEDIUM", "LARGE", "ECONOMY", "PROMO"]
+TYPE2 = ["ANODIZED", "BURNISHED", "PLATED", "POLISHED", "BRUSHED"]
+TYPE3 = ["TIN", "NICKEL", "BRASS", "STEEL", "COPPER"]
+CONT1 = ["SM", "LG", "MED", "JUMBO", "WRAP"]
+CONT2 = ["CASE", "BOX", "BAG", "JAR", "PKG", "PACK", "CAN", "DRUM"]
+
+
+def build_parts(n_parts, pkey0, S, rnd):
+    """dbgen's PART and PARTSUPP rows for parts pkey0..pkey0+n_parts-1."""
+    p = {k: [] for k in ("p_partkey", "p_name", "p_mfgr", "p_brand", "p_type", "p_size",
+                         "p_container", "p_retailprice", "p_comment")}
+    ps = {k: [] for k in ("ps_partkey", "ps_suppkey", "ps_availqty", "ps_supplycost", "ps_comment")}
+    for pk in range(pkey0, pkey0 + n_parts):
+        m = rnd.randint(1, 5)
+        for k, v in (("p_partkey", pk), ("p_name", " ".join(rnd.sample(COLORS, 5))),
+                     ("p_mfgr", "Manufacturer#%d" % m), ("p_brand", "Brand#%d%d" % (m, rnd.randint(1, 5))),
+                     ("p_type", " ".join((rnd.choice(TYPE1), rnd.choice(TYPE2), rnd.choice(TYPE3)))),
+                     ("p_size", rnd.randint(1, 50)), ("p_container", rnd.choice(CONT1) + " " + rnd.choice(CONT2)),
+                     ("p_retailprice", retail_price(pk)), ("p_comment", f"cdc part {pk}")):
+            p[k].append(v)
+        for i in range(4):
+            for k, v in (("ps_partkey", pk), ("ps_suppkey", supp_for(pk, i, S)),
+                         ("ps_availqty", rnd.randint(1, 9999)),
+                         ("ps_supplycost", (decimal.Decimal(rnd.randint(100, 100000)) / 100).quantize(D2)),
+                         ("ps_comment", f"cdc partsupp {pk}-{i}")):
+                ps[k].append(v)
+    return p, ps
+
+
 def to_table(cols, t):
     import pyarrow as pa
     from pyiceberg.io.pyarrow import schema_to_pyarrow
@@ -126,6 +166,8 @@ def main():
     ap.add_argument("--s3-region", default="us-east-1"); ap.add_argument("--s3-endpoint", default="")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--extra-tables", default="", help="tables the queries read besides the facts; part/partsupp are appended")
+    ap.add_argument("--parts", type=int, default=0, help="new parts per tick when part/partsupp are appended (default rows/100)")
     a, ignored = ap.parse_known_args()
     if ignored:
         print(f"   (TPC-DS-only options ignored: {' '.join(x for x in ignored if x.startswith('--'))})")
@@ -155,9 +197,16 @@ def main():
     print(f"== TPC-H CDC tick: +{n_orders} orders (keys {okey0}..{okey0 + n_orders - 1}) over "
           f"customer 1..{C}, part 1..{P}, supplier 1..{S} ==")
     o, l = build(n_orders, okey0, C, P, S, clerks, rnd)
+    writes = [("orders", o), ("lineitem", l)]
+    extra = {x.strip().lower() for x in a.extra_tables.replace(",", " ").split() if x.strip()}
+    if extra & {"part", "partsupp"}:
+        n_parts = a.parts or max(1, a.rows // 100)
+        p, ps = build_parts(n_parts, P + 1, S, rnd)
+        print(f"   +{n_parts} parts (keys {P + 1}..{P + n_parts}) with {4 * n_parts} partsupp rows")
+        writes += [("part", p), ("partsupp", ps)]
     import time
     t0 = time.time()
-    for table, cols in (("orders", o), ("lineitem", l)):
+    for table, cols in writes:
         t = cat.load_table((ns, table))
         data = to_table(cols, t)
         sd._write_and_add(fs, t, data, data.num_rows, f"{ns}.{table}")

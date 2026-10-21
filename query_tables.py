@@ -80,11 +80,17 @@ def table_rows(base, ns, table):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sql-file", action="append", required=True)
+    ap.add_argument("--sql-file", action="append", default=[])
     ap.add_argument("--catalog"); ap.add_argument("--prefix", default=None); ap.add_argument("--warehouse", default="")
     ap.add_argument("--namespace", default="")
     ap.add_argument("--list-refs", action="store_true", help="print the SQL's table references and exit")
+    ap.add_argument("--namespace-has", default="", help="print yes/no: does the namespace hold this table, and exit")
     a = ap.parse_args()
+    if a.namespace_has:
+        if not a.catalog or not a.namespace:
+            print("--catalog and --namespace are required", file=sys.stderr); return 2
+        known = catalog_tables(catalog_base(a.catalog, a.prefix, a.warehouse), a.namespace)
+        print("yes" if a.namespace_has in known else "no"); return 0
     if a.list_refs:
         for f in a.sql_file:
             print(json.dumps({"file": f, "refs": sql_refs(open(f).read())}))

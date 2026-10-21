@@ -414,12 +414,25 @@ except Exception: print(-1)' 2>/dev/null)
     # derive key/date pools from this run's queries' dimension predicates
     # (query_pools.py) so the appended rows land inside the filters.
     POOLS_ARG=""
-    # The seeder follows the dataset: a TPC-H namespace (a query reads the
-    # catalog's lineitem) appends orders+lineitems with seed_tpch.py; the
-    # TPC-DS seeder and its query pools are TPC-DS-shaped.
+    # The seeder follows the dataset: a TPC-H namespace (the catalog holds
+    # lineitem) appends with seed_tpch.py; the TPC-DS seeder and its query
+    # pools are TPC-DS-shaped.
+    # The NAMESPACE decides, not the queries: a TPC-H query that reads no
+    # lineitem (q16's partsupp/part/supplier, q22's customer/orders) fell to
+    # the TPC-DS seeder, which wrote store_sales/catalog_sales/web_sales INTO
+    # the TPC-H namespace and never touched the query's tables — every such
+    # tick merged 0 rows and still printed a sub-0.1 s MATCH (node 65,
+    # 2026-10-21).
     SEEDER=seed_tpcds.py
-    for n in "${NAMES[@]}"; do printf ' %s ' "${QTABLES[$n]:-}" | grep -qw lineitem && SEEDER=seed_tpch.py; done
-    [ "$SEEDER" = seed_tpch.py ] && echo "   seeder: seed_tpch.py (TPC-H namespace)"
+    if [ "$("$PY3" "$HERE/query_tables.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" ${ICEBERG_PREFIX:+--prefix "$ICEBERG_PREFIX"} \
+          --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" --namespace-has lineitem 2>/dev/null)" = yes ]; then SEEDER=seed_tpch.py; fi
+    if [ "$SEEDER" = seed_tpch.py ]; then
+      # The TPC-DS extras list names TPC-DS tables; the TPC-H seeder takes the
+      # tables this run's queries read (part/partsupp are appended from it).
+      EXTRA_TABLES=""; for n in "${NAMES[@]}"; do EXTRA_TABLES="$EXTRA_TABLES ${QTABLES[$n]:-}"; done
+      EXTRA_TABLES="$(printf '%s\n' $EXTRA_TABLES | sort -u | tr '\n' ' ' | sed 's/ $//')"
+      echo "   seeder: seed_tpch.py (TPC-H namespace; query tables: ${EXTRA_TABLES:-none})"
+    fi
     if [ "${CDC_TARGET_POOLS:-1}" != "0" ] && [ "$SEEDER" = seed_tpcds.py ]; then
       pf=""; for n in "${NAMES[@]}"; do [ -f "${QFILE[$n]}" ] && pf="$pf --sql-file ${QFILE[$n]}"; done   # every loaded query, --sql or TPC-DS
       if [ -z "$pf" ]; then
