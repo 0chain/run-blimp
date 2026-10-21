@@ -294,8 +294,11 @@ for ft in $(facts_of); do
     echo ">> phase 0: evict (cold state, recipe kept)"
     for n in $FNAMES; do evict_query "${SQL[$n]}" "$n"; done
   fi
-  # drain_authors waits until the gateway reports no in-flight requests AND no
-  # detached authors, so a tick never appends into a build still in progress.
+  # drain_authors waits until the gateway reports no in-flight requests, no
+  # detached authors and no background work a request left running
+  # (background_in_flight: detached flights, write-behind store PUTs, the
+  # answer built for the next touch; gateways without the field report 0), so
+  # a tick never appends into a build still in progress.
   # AUTHOR_DRAIN_SEC=0 disables the wait entirely.
   drain_authors() {
     local maxs="${AUTHOR_DRAIN_SEC:-5400}" what="${1:-authors}"
@@ -307,7 +310,7 @@ for ft in $(facts_of); do
             | "$PY3" -c 'import json,sys
 try:
     d=json.load(sys.stdin)
-    print(len(d.get("active") or []) + int(d.get("authors_in_flight") or 0))
+    print(len(d.get("active") or []) + int(d.get("authors_in_flight") or 0) + int(d.get("background_in_flight") or 0))
 except Exception: print(-1)' 2>/dev/null)
       [ -z "$act" ] && act=-1
       now=$(date +%s); el=$((now-t0))
@@ -599,6 +602,16 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       # a tick-1 verdict that was not a match overrides the final one
       case "${V_TICK1[$n]:-MATCH}" in MATCH*) ;; *) V_RESULT[$n]="TICK1-${V_TICK1[$n]}"; echo "   $n: verify: ${V_RESULT[$n]} (tick 1 served a wrong or unchecked answer)";; esac
     done
+  fi
+  # ---- phase 4b: drain what the query left running before the next one starts.
+  # A request returns while work it started continues (the answer built for
+  # the next touch, write-behind PUTs, compactions, background rebaselines);
+  # tpc_batch then started the next query on top of it, and over a 10-hour
+  # SF10 batch on a 12-vCPU pd-ssd node that overlap competed with every later
+  # author for CPU, spill and disk (2026-10-21). DRAIN_AFTER=0 skips it.
+  if [ "${DRAIN_AFTER:-1}" = 1 ]; then
+    echo ">> phase 4b: drain the query's background work"
+    drain_authors "background work"
   fi
   # EVICT_FAMILY_AFTER=1: the query is measured — evict its family again so a
   # long list does not keep every query's MVs (and their blobber copies) on the

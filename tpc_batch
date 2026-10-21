@@ -16,8 +16,17 @@
 # env: TPC_BATCH_OUT  log directory (default ./tpc_batch_logs)
 #      BLIMP_ENV      wiring file, as for blimp
 #      TPC_BATCH_EVICT=0  warm run: keep each query's MVs (default 1: evict the family first)
-#      EVICT_FAMILY_AFTER=1 evict each query's family again once it is measured
-#                         (long lists on a full disk; recipes kept)
+#      EVICT_FAMILY_AFTER=0 keep each query's family once it is measured
+#                         (default 1: evict it — a long list otherwise keeps
+#                         every query's MVs, and shared ones go stale)
+#      TPC_BATCH_RESET_EVERY=N reset the source tables to their base load before
+#                         every N-th query (default 10; 0 = never): roll every
+#                         table back to its first snapshot, expire the
+#                         abandoned snapshots and delete the data files they
+#                         appended (bench_reset.py; log in $TPC_BATCH_OUT), then
+#                         tell the gateway which tables moved. Without it a
+#                         99-query batch reads ~200 ticks of appends by the end.
+#      TPC_BATCH_RESET_PRUNE=0 reset without deleting the appended files
 #      TPC_BATCH_VERIFY=0 ticks only: skip the phase-4 verify against base
 #      TPC_BATCH_TICK=0   no append/tick: serve (or author) once, then the
 #                         phase-4 verify if on — verify-only:
@@ -33,6 +42,28 @@ LIST="${1:-$HERE/suites/all-99}"
 LDIR="$(cd "$(dirname "$LIST")" && pwd)"
 OUT="${TPC_BATCH_OUT:-./tpc_batch_logs}"; mkdir -p "$OUT"
 SUM="$OUT/summary.txt"; : > "$SUM"
+export EVICT_FAMILY_AFTER="${EVICT_FAMILY_AFTER:-1}"
+ENVF="${BLIMP_ENV:-$HOME/.blimp_env}"
+PY3="${BLIMP_PY:-$HOME/.blimp_venv/bin/python3}"; [ -x "$PY3" ] || PY3=python3
+
+# reset_sources <label>: base data back, appended files gone, gateway told.
+# Runs between queries only: bench_cdc's phase 4b drained the previous query's
+# background work, so nothing is still reading the files it deletes.
+reset_sources(){
+  local log="$OUT/reset_$1.log" np="" tables
+  [ "${TPC_BATCH_RESET_PRUNE:-1}" = 0 ] && np="--no-prune"
+  if ! "$PY3" "$HERE/bench_reset.py" "$ENVF" apply $np > "$log" 2>&1; then
+    echo "== reset before $1 FAILED (see $log) — continuing on the current data"; return
+  fi
+  tables=$(sed -n 's/^tables rolled back: //p' "$log")
+  ( set -a; . "$ENVF"; set +a
+    for tb in $tables; do
+      curl -s -m 60 "http://${GW:-127.0.0.1}:9000/admin/source/snapshot_changed" -H "Authorization: Bearer ${CLUSTER_TOKEN:-}" \
+        -H "Content-Type: application/json" -d "{\"namespace\":\"${NAMESPACE:-tpcds}\",\"table\":\"$tb\",\"trigger\":\"tpc_batch-reset\"}" >/dev/null
+    done )
+  echo "== reset before $1: $(grep -c '^rollback ' "$log") table(s) rolled back, $(sed -n 's/^pruned //p' "$log")"
+}
+nq=0
 
 # entries: "tpc <n>" or "sql <path>", in list order
 entries(){
@@ -54,6 +85,9 @@ b(){ "$HERE/blimp" --query $1 $2 2>&1 | while IFS= read -r l; do printf '%(%s)T 
 
 while read -r kind q; do
   if [ "$kind" = tpc ]; then n="q$q"; arg="--tpc $q"; else n="$(basename "$q" .sql)"; arg="--sql $q"; fi
+  RE="${TPC_BATCH_RESET_EVERY:-10}"
+  if [ "$RE" -gt 0 ] 2>/dev/null && [ "$nq" -gt 0 ] && [ $((nq % RE)) -eq 0 ]; then reset_sources "$n"; fi
+  nq=$((nq+1))
   t0=$(date +%s)
   echo "== $n $(date -u +%T)"
   # one call: evict family, author, tick 1, tick 2, verify (TICKS=2)
