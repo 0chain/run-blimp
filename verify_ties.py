@@ -18,6 +18,14 @@ THE RULE (all must hold, else the MISMATCH stands)
     - every row outside that group is identical on both sides.
 Floats compare at 9 significant digits, as the gateway's md5_rounded does.
 
+FLOAT NOISE FIRST. md5_rounded rounds every float to 9 significant digits, and a
+value on a rounding boundary flips with its last bit: v_q57_agg's served and base
+answers were the same 100 rows to 15 digits, yet 44.78453125 rounded to ...313 on
+one side and ...312 on the other and phase 4 said MISMATCH (node 144, SF10,
+2026-10-22). Before the tie rule, the two results are compared value by value:
+same row count, same non-float fields, floats within a relative 1e-9. That
+verdict prints "float: ..." and the bench reports MATCH(float).
+
 Usage:
     verify_ties.py --sql "<query>" --served A.parquet --base B.parquet
     verify_ties.py --sql "<query>" --served-url <result_url> --base-url <result_url>
@@ -149,10 +157,37 @@ def norm(v):
     return float("%.9g" % v) if isinstance(v, float) else v
 
 
-def read_rows(path, fs=None):
+def read_raw(path, fs=None):
     import pyarrow.parquet as pq
     t = pq.read_table(fs.open(path, "rb") if fs else path)
-    return t.column_names, [tuple(norm(v) for v in r.values()) for r in t.to_pylist()]
+    return t.column_names, [tuple(r.values()) for r in t.to_pylist()]
+
+
+def read_rows(path, fs=None):
+    cols, rows = read_raw(path, fs)
+    return cols, [tuple(norm(v) for v in r) for r in rows]
+
+
+def close(x, y, rel=1e-9):
+    if isinstance(x, float) and isinstance(y, float):
+        return x == y or abs(x - y) <= rel * max(abs(x), abs(y), 1.0)
+    return x == y
+
+
+def float_verdict(served, base):
+    """(ok, reason): the same rows, floats equal to a relative 1e-9. Rows are
+    paired in result order first, then (an order the float noise moved within
+    equal keys) after sorting both sides on their 6-significant-digit image."""
+    (cs, a), (cb, b) = served, base
+    if [c.lower() for c in cs] != [c.lower() for c in cb] or len(a) != len(b):
+        return False, "float: different columns or row counts"
+    same = lambda xs, ys: all(len(r) == len(s) and all(close(u, v) for u, v in zip(r, s)) for r, s in zip(xs, ys))
+    if same(a, b):
+        return True, "float: %d rows equal within 1e-9 (relative) in result order" % len(a)
+    img = lambda r: tuple(("%.6g" % v) if isinstance(v, float) else ("" if v is None else str(v)) for v in r)
+    if same(sorted(a, key=img), sorted(b, key=img)):
+        return True, "float: %d rows equal within 1e-9 (relative) as a multiset" % len(a)
+    return False, "float: values differ beyond 1e-9"
 
 
 def tie_verdict(sql, served, base):
@@ -212,7 +247,9 @@ def main():
                 break
             time.sleep(5)
     try:
-        ok, why = tie_verdict(a.sql, read_rows(served, fs), read_rows(base, fs))
+        ok, why = float_verdict(read_raw(served, fs), read_raw(base, fs))
+        if not ok:
+            ok, why = tie_verdict(a.sql, read_rows(served, fs), read_rows(base, fs))
     except Exception as e:
         ok, why = False, "unreadable result parquet: %s" % e
     print(why)

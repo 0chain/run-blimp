@@ -73,7 +73,7 @@ verify_served() { # <name> <label suffix> <printed tag>: the served result vs th
     if [ "$v" = MISMATCH ] && [ -n "$MV_S3_KEY" ] && [ -n "${I_RESURL[$n]:-}" ] && [ -n "${V_RESURL[$n]}" ]; then
       tv=$(MV_BUCKET="$MV_BUCKET" MV_S3_ENDPOINT="$MV_S3_ENDPOINT" MV_S3_KEY="$MV_S3_KEY" MV_S3_SECRET="$MV_S3_SECRET" \
         "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" 2>&1) \
-        && v="MATCH(ties)" && V_RESULT[$n]="$v"
+        && { case "${tv##*$'\n'}" in float:*) v="MATCH(float)";; *) v="MATCH(ties)";; esac; V_RESULT[$n]="$v"; }
       echo "   $n: ties: ${tv##*$'\n'}"
     fi
     echo "   $n: verify$3: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
