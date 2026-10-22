@@ -897,6 +897,9 @@ def _catalog_bounds(cat, namespace, table, col, min_rows=0, snapshot_id=None):
         return None, None
 
 
+SCAN_DIM_HI_ERR = {}  # (namespace, table, col) -> why the last scan returned None
+
+
 def scan_dim_hi(cat, namespace, table, col, snapshot_id=None):
     import time as _t
     _t0 = _t.time()
@@ -950,7 +953,10 @@ def _scan_dim_hi(cat, namespace, table, col, snapshot_id=None):
             return None
         best = _fold(arrow.column(col), best)
         return int(best) if best is not None else None
-    except Exception:
+    except Exception as e:
+        # Kept for the caller's FATAL: "no scannable max" alone hid whether the
+        # table is empty or its data files are unreachable from this host.
+        SCAN_DIM_HI_ERR[(namespace, table, col)] = f"{type(e).__name__}: {e}"[:300]
         return None
 
 
@@ -1706,7 +1712,9 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
                 f"existing ones. Appending would REUSE keys and break the "
                 f"referential-integrity premise the delta merge depends on "
                 f"(a re-used key is reachable from pre-append facts). Fix the "
-                f"table's statistics, or exclude it from CDC_EXTRA_TABLES.")
+                f"table's statistics, or exclude it from CDC_EXTRA_TABLES."
+                + (f" The scan failed: {SCAN_DIM_HI_ERR[(namespace, table, keycol)]}"
+                   if (namespace, table, keycol) in SCAN_DIM_HI_ERR else ""))
         # ABOVE EVERY KEY THE FACTS ALREADY REFERENCE, not only above the
         # dimension's own max: a fact row that referenced a key before its
         # dimension row existed (an unbounded derived date did, see date_after)

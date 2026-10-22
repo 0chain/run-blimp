@@ -187,8 +187,14 @@ node_token(){ cat /opt/0chain/zs3server/environment/admin_token 2>/dev/null | tr
 # will dial the address.
 gateway_env(){
   command -v docker >/dev/null 2>&1 || return 0
-  docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-    | sed -n "s/^$1=//p" | head -1
+  # A user outside the docker group gets nothing from a plain inspect, and an
+  # empty answer read as "the gateway has no catalog URL" (CATALOG_CHOICE=1
+  # then died on the loopback guard while minioserver carried
+  # ZS3_ICEBERG_REST_URL — a self-hosted node, 2026-10-22). Try sudo -n too.
+  local ea
+  ea=$(docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null) \
+    || ea=$(sudo -n docker inspect minioserver --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)
+  printf '%s\n' "$ea" | sed -n "s/^$1=//p" | head -1
 }
 
 # heal_wiring — self-heal stale wiring after a cluster REDEPLOY, which rotates the
@@ -377,7 +383,10 @@ choose_catalog(){
     "stand up an Iceberg REST catalog on THIS box (:8181)" \
     "point at an Iceberg REST catalog I already have")
   case "$c" in
-    1) ICEBERG_URL="http://$GW:19122/iceberg"
+    1) # An ICEBERG_URL passed in is the gateway's own catalog address (it was
+       # silently overwritten here); the CLI still uses loopback below.
+       ICEBERG_URL_GW="${ICEBERG_URL:-}"; export ICEBERG_URL_GW
+       ICEBERG_URL="http://$GW:19122/iceberg"
        ICEBERG_PREFIX="${ICEBERG_PREFIX:-main}"
        # Raw Nessie (:19122) is bound to localhost on the node (never exposed).
        # On-node register/seed/query reach it via loopback — which also sidesteps
@@ -940,7 +949,9 @@ wire_gateway_source(){
     # 2026-10-22, where the gateway env carried neither variable).
     HOOK_IRC="$ICEBERG_URL"
     if [ "${CATALOG_CHOICE:-}" = 1 ]; then
-      local gwirc; gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
+      local gwirc; gwirc="${ICEBERG_URL_GW:-}"
+      case "$gwirc" in http://127.*|http://localhost*|https://127.*|https://localhost*) gwirc="" ;; esac
+      [ -n "$gwirc" ] || gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
       if [ -z "$gwirc" ]; then
         gwirc=$(gateway_env ZS3_NESSIE_URL)
         gwirc="${gwirc%/*}"; case "$gwirc" in */iceberg) ;; *) gwirc="" ;; esac
@@ -959,7 +970,7 @@ wire_gateway_source(){
     fi
     case "$HOOK_IRC" in
       http://127.*|http://localhost*|https://127.*|https://localhost*)
-        die "the catalog URL for the gateway is $HOOK_IRC — loopback, which the gateway container cannot reach. Set ZS3_ICEBERG_REST_URL on minioserver (zs3-init does: http://zus-nessie:19120/iceberg) or pass a container-reachable ICEBERG_URL." ;;
+        die "the catalog URL for the gateway is $HOOK_IRC — loopback, which the gateway container cannot reach. minioserver's env could not be read as $(id -un) (docker group or sudo -n), and no ICEBERG_URL was passed. Pass ICEBERG_URL=http://zus-nessie:19120/iceberg (with CATALOG_CHOICE=1 it is used for the gateway only), or run as a docker-group user." ;;
     esac
     HOOK_BODY=$(HB_IRC="$HOOK_IRC" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
       HB_BKT="$ORIGIN_BUCKET" HB_KEY="$HOOK_KEY" HB_SEC="$HOOK_SEC" HB_REG="$REGION" \
