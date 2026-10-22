@@ -136,6 +136,11 @@ def resolve(items, columns, sql=""):
             # A bare name is the output column (the engine binds ORDER BY names to
             # output aliases first); a qualified t.c may be a different column.
             name = e.strip('"').lower()
+            if lower.count(name) != 1 and name in proj:
+                # A source column the SELECT list projects under an alias
+                # (`i_brand_id AS brand_id`, ORDER BY i_brand_id — v_q55_cube)
+                # is that output column.
+                name = proj[name]
             if lower.count(name) != 1:
                 return None
             k = lower.index(name)
