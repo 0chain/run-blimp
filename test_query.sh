@@ -20,7 +20,7 @@ Q_DIR="${Q_DIR:-$HOME/tpcds_queries}"
 # ---- 0. generate the TPC-DS 99 query files (idempotent) ---------------------
 if [ ! -f "$Q_DIR/q3.sql" ]; then
   command -v duckdb >/dev/null 2>&1 || {
-    curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o /tmp/d.zip \
+    curl -fsSL https://github.com/duckdb/duckdb/releases/download/${BLIMP_DUCKDB_VERSION:-v1.5.5}/duckdb_cli-linux-amd64.zip -o /tmp/d.zip \
       && (cd /tmp && unzip -oq d.zip && sudo mv duckdb /usr/local/bin/); }
   mkdir -p "$Q_DIR"
   QJ="$(mktemp -t tpcds_q.XXXXXX)"

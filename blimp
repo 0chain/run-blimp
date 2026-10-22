@@ -931,14 +931,36 @@ wire_gateway_source(){
     # that address is loopback to itself. Send the gateway its own catalog
     # address (read from the co-located container); the CLI's address stays for
     # the registrar/seeder, which run here.
+    # The address comes, in order, from the gateway's own env (ZS3_ICEBERG_REST_URL,
+    # else ZS3_NESSIE_URL without its branch), else from the Nessie container on
+    # the gateway's docker network (zus-nessie, container port 19120). A loopback
+    # URL is never sent: inside the gateway container it is the gateway itself,
+    # so the source binding fails closed ("catalog listing unavailable",
+    # "dial tcp 127.0.0.1:19122: connection refused" — a fresh GCP node,
+    # 2026-10-22, where the gateway env carried neither variable).
     HOOK_IRC="$ICEBERG_URL"
     if [ "${CATALOG_CHOICE:-}" = 1 ]; then
       local gwirc; gwirc=$(gateway_env ZS3_ICEBERG_REST_URL)
+      if [ -z "$gwirc" ]; then
+        gwirc=$(gateway_env ZS3_NESSIE_URL)
+        gwirc="${gwirc%/*}"; case "$gwirc" in */iceberg) ;; *) gwirc="" ;; esac
+      fi
+      if [ -z "$gwirc" ] && command -v docker >/dev/null 2>&1 \
+         && docker inspect zus-nessie >/dev/null 2>&1; then
+        local gnet nnet
+        gnet=$(docker inspect minioserver --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
+        nnet=$(docker inspect zus-nessie --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
+        for n in $gnet; do case " $nnet " in *" $n "*) gwirc="http://zus-nessie:19120/iceberg"; break ;; esac; done
+      fi
       if [ -n "$gwirc" ]; then
         HOOK_IRC="$gwirc"
         bold "  catalog URL for the gateway: $gwirc (its own Nessie, container address)"
       fi
     fi
+    case "$HOOK_IRC" in
+      http://127.*|http://localhost*|https://127.*|https://localhost*)
+        die "the catalog URL for the gateway is $HOOK_IRC — loopback, which the gateway container cannot reach. Set ZS3_ICEBERG_REST_URL on minioserver (zs3-init does: http://zus-nessie:19120/iceberg) or pass a container-reachable ICEBERG_URL." ;;
+    esac
     HOOK_BODY=$(HB_IRC="$HOOK_IRC" HB_WH="$WAREHOUSE" HB_NS="$NAMESPACE" \
       HB_BKT="$ORIGIN_BUCKET" HB_KEY="$HOOK_KEY" HB_SEC="$HOOK_SEC" HB_REG="$REGION" \
       HB_EP="$HOOK_EP" HB_VR="${VIA_ROUTER:-0}" HB_RB="${ROUTER_BASE:-}" \

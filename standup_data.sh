@@ -38,7 +38,7 @@ warehouse web_page web_returns web_sales web_site"
 if ! command -v duckdb >/dev/null; then
   log "installing duckdb CLI (needed to generate SF${SF})"
   case "$(uname -m)" in aarch64|arm64) D=aarch64;; *) D=amd64;; esac
-  curl -fsSL "https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-${D}.zip" -o /tmp/duckdb.zip \
+  curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${BLIMP_DUCKDB_VERSION:-v1.5.5}/duckdb_cli-linux-${D}.zip" -o /tmp/duckdb.zip \
     && unzip -oq /tmp/duckdb.zip -d /tmp && sudo mv /tmp/duckdb /usr/local/bin/ 2>/dev/null || mv /tmp/duckdb "$HOME/.local/bin/" 2>/dev/null
   command -v duckdb >/dev/null || die "could not install duckdb"
 fi
