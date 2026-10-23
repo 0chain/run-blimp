@@ -1492,8 +1492,21 @@ def _columns_of(t, fact):
     return out
 
 
-def _write_and_add(fs, t, data, n, label, strict=True):
-    """Conform, write the delta parquet ourselves, and add_files it."""
+def demanded_nulls(columns, n):
+    """{column: rows whose owning query demands `column IS NULL`} — the NULLs
+    _write_and_add must accept (q76's `ss_store_sk IS NULL` rows)."""
+    owners = row_owners([c for c, _ in columns], n)[0]
+    out = {}
+    for o in owners:
+        for col, c in ((o or {}).get("fact") or {}).items():
+            if c.get("null"):
+                out[col] = out.get(col, 0) + 1
+    return out
+
+
+def _write_and_add(fs, t, data, n, label, strict=True, allow_nulls=None):
+    """Conform, write the delta parquet ourselves, and add_files it.
+    allow_nulls: {column: count} of NULLs an owning query's IS NULL demands."""
     import uuid, pyarrow as pa, pyarrow.parquet as pq
     data = conform_to_table_schema(data, t, n, strict=strict)
     key = f"{t.location().rstrip('/')}/data/seed-{uuid.uuid4().hex}.parquet"
@@ -1512,7 +1525,13 @@ def _write_and_add(fs, t, data, n, label, strict=True):
     # not a smaller delta, it is a delta the merge cannot see — and once it is
     # in the table there is nothing downstream that will tell you, because the
     # merge reports a normal merge_ms over zero rows. Refuse to publish one.
-    nulls = {c: data[c].null_count for c in data.column_names if data[c].null_count}
+    # A NULL an owning query DEMANDS (`ss_store_sk IS NULL`, q76) is the
+    # delta that query merges, not a lost key: up to that many are accepted.
+    # Refusing them failed the whole tick once the predicates held (node 144,
+    # 2026-10-23: "NULL values in {'ss_store_sk': 5000}", no rows appended).
+    ok = allow_nulls or {}
+    nulls = {c: data[c].null_count for c in data.column_names
+             if data[c].null_count and data[c].null_count > ok.get(c, 0)}
     if nulls:
         raise SystemExit(f"FATAL: {label}: NULL values in {nulls} — a NULL join key "
                          "silently empties the delta; refusing to add_files")
@@ -1713,7 +1732,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                                         date_lo=date_lo, date_hi=date_hi,
                                         dim_hi=dim_hi_cache, sales_columns=columns)
     data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
-    _write_and_add(fs, t, data, n, f"{namespace}.{fact}", strict=strict)
+    _write_and_add(fs, t, data, n, f"{namespace}.{fact}", strict=strict,
+                   allow_nulls=demanded_nulls(columns, n))
 
     # PROVE the manifest can see the keys we just issued. If it cannot, the NEXT
     # append reads a stale max and reissues these exact ticket/order numbers, and

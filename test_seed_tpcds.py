@@ -1503,6 +1503,16 @@ class TestFactPredicatesOnOwnedRows(unittest.TestCase):
             S.GEO_FRACTION = saved
         self.assertTrue(all(v is None for v in cols["ss_store_sk"]), cols["ss_store_sk"][:5])
 
+    def test_demanded_nulls_count_the_owned_is_null_rows(self):
+        """The NULL-key guard must accept the NULLs q76's IS NULL demands — it
+        failed the whole tick instead (node 144, 2026-10-23)."""
+        S.KEY_POOLS["queries"] = [
+            {"name": "qnull", "date_by_col": {}, "date_sk": [], "dims": {},
+             "fact": {"ss_store_sk": {"null": True}}},
+            {"name": "qother", "date_by_col": {}, "date_sk": [], "dims": {},
+             "fact": {"ss_quantity": {"lo": 1.0}}}]
+        self.assertEqual(S.demanded_nulls(S.FACT_COLUMNS["store_sales"], 10), {"ss_store_sk": 5})
+
     def test_owned_returns_rows_satisfy_after_the_parent_overwrite(self):
         """q49 shape (node 144, 2026-10-23): the returns row's predicates must hold
         on the FINAL row, after keys/dates/money are copied from the parent sale —
