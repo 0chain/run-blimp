@@ -1518,3 +1518,129 @@ class TestFactPredicatesOnOwnedRows(unittest.TestCase):
                                    float(sales["ss_ext_sales_price"][i]) - float(sales["ss_coupon_amt"][i]), places=2)
             self.assertAlmostEqual(float(sales["ss_ext_sales_price"][i]),
                                    sales["ss_quantity"][i] * float(sales["ss_sales_price"][i]), places=1)
+
+
+# q84's shape: the fact reaches its filtered dimensions only through a
+# dimension-to-dimension link (sr_cdemo_sk = cd_demo_sk = c_current_cdemo_sk).
+Q84_SQL = """
+SELECT c_customer_id AS customer_id
+FROM customer, customer_address, customer_demographics, household_demographics,
+     income_band, store_returns
+WHERE ca_city = 'Edgewood'
+  AND c_current_addr_sk = ca_address_sk
+  AND ib_lower_bound >= 38128
+  AND ib_upper_bound <= 38128 + 50000
+  AND ib_income_band_sk = hd_income_band_sk
+  AND cd_demo_sk = c_current_cdemo_sk
+  AND hd_demo_sk = c_current_hdemo_sk
+  AND sr_cdemo_sk = cd_demo_sk
+ORDER BY c_customer_id
+LIMIT 100
+"""
+
+
+class TestDimensionToDimensionLinkPools(PoolSeedingCase):
+    """q84 on node 144 (2026-10-23): the customer pool held the Edgewood
+    customers but sr_cdemo_sk was drawn uniformly, so no appended return joined
+    a pooled customer and every tick merged an empty delta."""
+
+    def test_links_name_the_fact_joined_instance(self):
+        links = QP.dim_links(Q84_SQL)
+        self.assertIn(("customer_demographics", "", "customer", "c_current_cdemo_sk"), links)
+        self.assertIn(("income_band", "", "household_demographics", "hd_income_band_sk"), links)
+        self.assertEqual(QP.dim_join_columns(Q84_SQL, "customer_demographics"),
+                         {"": ["sr_cdemo_sk"]})
+
+    def test_q84_pool_is_the_pooled_customers_cdemo_and_returns_draw_it(self):
+        try:
+            import duckdb
+        except ImportError:
+            raise unittest.SkipTest("duckdb not installed")
+        import sys
+        con = duckdb.connect()
+        con.execute("ATTACH ':memory:' AS src; CREATE SCHEMA src.ns;")
+        con.execute("CREATE TABLE src.ns.customer_address AS SELECT i AS ca_address_sk, "
+                    "CASE WHEN i % 7 = 0 THEN 'Edgewood' ELSE 'Oakland' END AS ca_city "
+                    "FROM range(1, 2001) t(i)")
+        con.execute("CREATE TABLE src.ns.customer AS SELECT i AS c_customer_sk, "
+                    "'C' || i AS c_customer_id, (i * 13) % 2000 + 1 AS c_current_addr_sk, "
+                    "(i * 31) % 50000 + 1 AS c_current_cdemo_sk, i % 7200 + 1 AS c_current_hdemo_sk "
+                    "FROM range(1, 5001) t(i)")
+        con.execute("CREATE TABLE src.ns.customer_demographics AS SELECT i AS cd_demo_sk "
+                    "FROM range(1, 50001) t(i)")
+        con.execute("CREATE TABLE src.ns.household_demographics AS SELECT i AS hd_demo_sk, "
+                    "i % 20 + 1 AS hd_income_band_sk FROM range(1, 7201) t(i)")
+        con.execute("CREATE TABLE src.ns.income_band AS SELECT i AS ib_income_band_sk, "
+                    "(i - 1) * 10000 AS ib_lower_bound, i * 10000 AS ib_upper_bound "
+                    "FROM range(1, 21) t(i)")
+        tmp = tempfile.mkdtemp()
+        sqlf, out = os.path.join(tmp, "q84.sql"), os.path.join(tmp, "pools.json")
+        with open(sqlf, "w") as f:
+            f.write(Q84_SQL)
+        argv, connect = sys.argv, QP.duck_connect
+        QP.duck_connect = lambda a: con
+        sys.argv = ["query_pools.py", "--sql-file", sqlf, "--catalog", "x",
+                    "--warehouse", "x", "--namespace", "ns", "--out", out]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                QP.main()
+        finally:
+            sys.argv, QP.duck_connect = argv, connect
+        with open(out) as f:
+            pools = json.load(f)
+        q84 = pools["queries"][0]
+        cust = q84["dims"]["customer"]
+        want = sorted(k for (k,) in con.execute(
+            "SELECT DISTINCT c_current_cdemo_sk FROM src.ns.customer WHERE c_customer_sk IN (%s)"
+            % ",".join(map(str, cust))).fetchall())
+        self.assertEqual(q84["dims"].get("customer_demographics"), want,
+                         "the fact's cdemo pool is the pooled customers' c_current_cdemo_sk")
+
+        # Seeding: another query owns store_sales rows with its own cdemo pool,
+        # so a returns row on a non-q84 parent would copy a foreign key.
+        other = list(range(60000, 60400))
+        pools["queries"].append({"name": "qX", "date_by_col": {}, "date_sk": [],
+                                 "dims": {"customer_demographics": other}})
+        pools["dims"]["customer_demographics"] = sorted(set(want) | set(other))
+        self.install(pools)
+        rnd = random.Random(5)
+        sales = S.gen_fact_cols("store_sales", S.FACT_COLUMNS["store_sales"], 600,
+                                date_lo=2451545, date_hi=2452640, dim_hi={},
+                                key_base=1, rnd=rnd)
+        rcols = S.FACT_COLUMNS["store_returns"]
+        rets = S.gen_referential_returns("store_sales", sales, rcols, 60,
+                                         date_lo=2451545, date_hi=2452640, dim_hi={}, rnd=rnd)
+        owners, _ = S.row_owners([c for c, _ in rcols], 60)
+        pool = set(want)
+        owned = [j for j, o in enumerate(owners) if o and o["name"] == "q84"]
+        self.assertTrue(owned)
+        self.assertEqual([j for j in owned if rets["sr_cdemo_sk"][j] not in pool], [],
+                         "every q84-owned return's sr_cdemo_sk joins a pooled customer")
+        # and its parent sale carries the same key
+        by_tkt = {(i, t): c for i, t, c in zip(sales["ss_item_sk"], sales["ss_ticket_number"],
+                                               sales["ss_cdemo_sk"])}
+        for j in owned:
+            self.assertEqual(by_tkt[(rets["sr_item_sk"][j], rets["sr_ticket_number"][j])],
+                             rets["sr_cdemo_sk"][j])
+
+    def test_owned_returns_take_their_owners_parent(self):
+        """No duckdb: the seeding half alone, with the derived pool installed."""
+        cd84, other = list(range(1, 300)), list(range(60000, 60400))
+        self.install({"date_sk": [], "date_by_col": {},
+                      "dims": {"customer_demographics": cd84 + other},
+                      "queries": [
+                          {"name": "q84", "date_by_col": {}, "date_sk": [],
+                           "dims": {"customer_demographics": cd84}},
+                          {"name": "qX", "date_by_col": {}, "date_sk": [],
+                           "dims": {"customer_demographics": other}}]})
+        rnd = random.Random(9)
+        sales = S.gen_fact_cols("store_sales", S.FACT_COLUMNS["store_sales"], 600,
+                                date_lo=2451545, date_hi=2452640, dim_hi={},
+                                key_base=1, rnd=rnd)
+        rcols = S.FACT_COLUMNS["store_returns"]
+        rets = S.gen_referential_returns("store_sales", sales, rcols, 60,
+                                         date_lo=2451545, date_hi=2452640, dim_hi={}, rnd=rnd)
+        owners, _ = S.row_owners([c for c, _ in rcols], 60)
+        bad = [j for j, o in enumerate(owners)
+               if o and rets["sr_cdemo_sk"][j] not in set(o["dims"]["customer_demographics"])]
+        self.assertEqual(bad, [])

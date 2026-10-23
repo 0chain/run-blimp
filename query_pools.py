@@ -36,7 +36,9 @@ seed_tpcds.py --key-pools <file> assigns each appended row to ONE query
 (round-robin) and draws that row's date and dimension keys from that query's
 pools, uniform where no pool exists. Dimensions reached only through customer
 (customer_address, customer_demographics, household_demographics via
-c_current_*_sk) narrow the customer pool. Anything the parser cannot read
+c_current_*_sk) narrow the customer pool; a dimension the fact joins whose
+key equals another pooled dimension's column (sr_cdemo_sk = cd_demo_sk =
+c_current_cdemo_sk) takes that column over the pooled rows. Anything the parser cannot read
 is skipped, never guessed; an empty pool for a dimension means "no
 constraint" for that dimension.
 
@@ -401,6 +403,65 @@ def dim_join_columns(sql, dim):
     return out
 
 
+# DIMENSION-TO-DIMENSION LINKS. q84 reaches its fact only through
+# `sr_cdemo_sk = cd_demo_sk = c_current_cdemo_sk`: customer_demographics has no
+# predicate of its own, the customer pool holds the Edgewood customers, and the
+# appended rows' sr_cdemo_sk was drawn uniformly — no appended row joined a
+# pooled customer and every q84 tick merged an empty delta (node 144,
+# 2026-10-23). A dimension X joined to a fact column whose key equals a column
+# of another pooled dimension Y takes as its pool the projection of that Y
+# column over Y's pooled rows (the pooled customers' c_current_cdemo_sk).
+
+def dim_links(sql):
+    """[(X, x_alias, Y, y_column)] for every `X.key = Y.column` equality
+    (Y's column not Y's own key), anywhere in the statement. Like
+    dim_join_columns, but the other side is a dimension column, not a fact one."""
+    dim_of_key = {k: d for d, k in KEYCOL.items()}
+    out = []
+    for qa, ca, qb, cb in EQ_PAIR.findall(strip_literals(strip_comments(sql))):
+        for qx, cx, cy in ((qa, ca, cb), (qb, cb, ca)):
+            x = dim_of_key.get(cx.lower())
+            y = dim_of(cy)
+            if not x or not y or y[0] == x or cy.lower() == y[1]:
+                continue
+            al = qx.lower()
+            e = (x, "" if al == x else al, y[0], cy.lower())
+            if e not in out:
+                out.append(e)
+    return out
+
+
+def linked_pools(con, ns, sql, dims, limit):
+    """{X: keys} derived through dim_links for every fact-joined dimension
+    instance that has no pool of its own (a direct predicate's pool is never
+    replaced). Iterated so a chain of links resolves. Dates are bound per fact
+    column elsewhere, so date_dim is never derived here."""
+    out = {}
+    links = [l for l in dim_links(sql) if l[0] != "date_dim"]
+    changed = True
+    while changed:
+        changed = False
+        for x, xal, y, ycol in links:
+            if x in dims or x in out or xal not in dim_join_columns(sql, x):
+                continue
+            ypool = dims.get(y) or out.get(y)
+            if not ypool:
+                continue
+            q = "SELECT DISTINCT %s FROM src.%s.%s WHERE %s IN (%s) AND %s IS NOT NULL LIMIT %d" % (
+                ycol, ns, y, KEYCOL[y], ",".join(str(int(k)) for k in ypool), ycol, limit)
+            try:
+                ks = sorted({int(k) for (k,) in con.execute(q).fetchall() if k is not None})
+            except Exception as e:
+                print("  skip %s via %s.%s: %s" % (x, y, ycol, str(e).splitlines()[0][:160]), file=sys.stderr)
+                continue
+            if ks:
+                out[x] = ks
+                changed = True
+                print("  %s (via %s.%s over %d pooled %s): %d key(s)"
+                      % (x, y, ycol, len(ypool), y, len(ks)), file=sys.stderr)
+    return out
+
+
 def duck_connect(a):
     import duckdb
     con = duckdb.connect()
@@ -529,6 +590,9 @@ def main():
                     qentry["dims"].setdefault("customer", set()).update(cks)
             except Exception as e:
                 print("  customer narrowing failed: %s" % str(e).splitlines()[0][:200], file=sys.stderr)
+        for dim, ks in linked_pools(con, a.namespace, sql, qentry["dims"], a.limit).items():
+            dim_keys.setdefault(dim, set()).update(ks)
+            qentry["dims"].setdefault(dim, set()).update(ks)
         qentry["date_by_col"] = {c: sorted(v) for c, v in qentry["date_by_col"].items() if v}
         qentry["dims"] = {d: sorted(v) for d, v in qentry["dims"].items() if v}
         qentry["date_sk"] = sorted({k for v in qentry["date_by_col"].values() for k in v})

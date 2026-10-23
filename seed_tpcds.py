@@ -874,6 +874,15 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
         free.discard(pick)
         if r:
             solved[j] = r
+    # every other owned returns row takes a free sale its owner also owns, so
+    # the dimension keys copied below are drawn from the owner's pools (q84's
+    # sr_cdemo_sk must be a pooled customer's cdemo, 2026-10-23).
+    for j in range(m):
+        if idx[j] is None and rowners[j]:
+            pick = next((i for i in by_owner.get(rowners[j]["name"], []) if i in free), None)
+            if pick is not None:
+                idx[j] = pick
+                free.discard(pick)
     rest = rnd.sample(sorted(free), sum(1 for x in idx if x is None))
     for j in range(m):
         if idx[j] is None:
@@ -896,6 +905,25 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
         if d and d[0] not in ("date_dim", "time_dim") and d[0] in by_dim_sales:
             src = by_dim_sales[d[0]]
             out[rcol] = [sales_cols[src][i] for i in idx]
+    # An owned row whose owner had no free sale left took another owner's: a
+    # key it copied outside its owner's pool is drawn from the pool (the row's
+    # own join is what its owner filters). A sale of the same owner keeps the
+    # copy, so the pair stays consistent where the correlations moved a key.
+    pooled = {}
+    for j, o in enumerate(rowners):
+        if not o or not o["dims"] or (sowners[idx[j]] or {}).get("name") == o["name"]:
+            continue
+        for rcol in names:
+            d = dim_for(rcol)
+            p = d and d[0] not in ("date_dim", "time_dim") and o["dims"].get(d[0])
+            if not p:
+                continue
+            ps = pooled.get((o["name"], d[0]))
+            if ps is None:
+                ps = pooled[(o["name"], d[0])] = set(p)
+            if out[rcol][j] not in ps:
+                h = dim_hi.get(d[0]) or FALLBACK_DIM_HI.get(d[0]) or 1000
+                out[rcol][j] = draw_dim(d[0], 1, [o], 1, h, rnd)[0]
 
     # returned date: strictly after the sale
     sold_col = next((c for c in sales_cols if c.endswith("_sold_date_sk")), None)
