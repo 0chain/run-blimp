@@ -1619,6 +1619,15 @@ class TestDimensionToDimensionLinkPools(PoolSeedingCase):
             % ",".join(map(str, cust))).fetchall())
         self.assertEqual(q84["dims"].get("customer_demographics"), want,
                          "the fact's cdemo pool is the pooled customers' c_current_cdemo_sk")
+        # the customer pool honours the income band reached through
+        # household_demographics (ib_income_band_sk = hd_income_band_sk)
+        bad = con.execute(
+            "SELECT count(*) FROM src.ns.customer c JOIN src.ns.household_demographics h "
+            "ON c.c_current_hdemo_sk = h.hd_demo_sk JOIN src.ns.income_band ib "
+            "ON ib.ib_income_band_sk = h.hd_income_band_sk WHERE c.c_customer_sk IN (%s) "
+            "AND NOT (ib.ib_lower_bound >= 38128 AND ib.ib_upper_bound <= 38128 + 50000)"
+            % ",".join(map(str, cust))).fetchone()[0]
+        self.assertEqual(bad, 0, "pooled customers outside q84's income band")
 
         # Seeding: another query owns store_sales rows with its own cdemo pool,
         # so a returns row on a non-q84 parent would copy a foreign key.

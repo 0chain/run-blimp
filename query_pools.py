@@ -603,6 +603,20 @@ def main():
                 for ps in link_groups.values():
                     for p_ in ps:
                         cust_where.append("(" + p_ + ")")
+        # A CUSTOMER-LINKED DIMENSION FILTERED THROUGH ANOTHER POOLED ONE.
+        # q84's household_demographics carries no predicate of its own: its
+        # filter is income_band's (ib_income_band_sk = hd_income_band_sk), so
+        # the customer pool ignored it and ~80% of the q84-owned rows joined a
+        # customer outside the band (node 144, 2026-10-23). Join the linked
+        # dimension and keep its rows whose column lies in the pooled keys.
+        for x, _xa, y, ycol in dim_links(sql):
+            if y not in CUSTOMER_LINKS or y not in links or not qentry["dims"].get(x):
+                continue
+            alias = "l_" + y
+            j = "JOIN src.%s.%s %s ON c.%s = %s.%s" % (a.namespace, y, alias, CUSTOMER_LINKS[y], alias, keymap[y])
+            if j not in cust_joins:
+                cust_joins.append(j)
+            cust_where.append("(%s.%s IN (%s))" % (alias, ycol, ", ".join(str(k) for k in sorted(qentry["dims"][x]))))
         if cust_joins or cust_where:
             q = "SELECT c.c_customer_sk FROM src.%s.customer c %s%s LIMIT %d" % (
                 a.namespace, " ".join(cust_joins), (" WHERE " + " AND ".join(cust_where)) if cust_where else "", a.limit)
