@@ -157,8 +157,32 @@ def where_conjuncts(sql):
                 parts[k] = p + " AND " + parts[k + 1]
                 del parts[k + 1]
             k += 1
-        conj.extend(parts)
+        conj.extend(_flatten_and_groups(parts))
     return conj
+
+
+def _flatten_and_groups(parts):
+    """A parenthesised AND group is its conjuncts: the `_filter` variants wrap
+    the original WHERE as `(A AND B …) AND d_moy <= 6`, and read as ONE
+    conjunct it named no date window and no dimension pool — v_q27_filter's
+    rows were drawn over all 20,000 dates and its ticks merged nothing (node
+    144, 2026-10-23). An OR group stays whole (expand_or_groups reads it)."""
+    out = []
+    for p in parts:
+        inner = peel(p)
+        if inner != p.strip() and len(top_level_split(inner, "or")) == 1:
+            sub = top_level_split(inner, "and")
+            if len(sub) > 1:
+                k = 0
+                while k < len(sub):  # BETWEEN's own AND was split: rejoin
+                    if re.search(r"(?i)\bbetween\b", sub[k]) and not re.search(r"(?i)\bbetween\b.*\band\b", sub[k]) and k + 1 < len(sub):
+                        sub[k] = sub[k] + " AND " + sub[k + 1]
+                        del sub[k + 1]
+                    k += 1
+                out.extend(_flatten_and_groups(sub))
+                continue
+        out.append(p)
+    return out
 
 
 def strip_literals(expr):

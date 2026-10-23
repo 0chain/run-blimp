@@ -822,6 +822,20 @@ class TestPoolDerivationBindsTheRightDateInstance(unittest.TestCase):
         self.assertEqual(QP.dim_predicates(Q67_SQL)["date_dim"],
                          {"": ["d_month_seq BETWEEN 1200 AND 1200+11"]})
 
+    def test_a_parenthesised_and_group_is_its_conjuncts(self):
+        """v_q27_filter wraps the original WHERE in parentheses and adds
+        `AND d_moy <= 6`: read as one conjunct it named no date window
+        (node 144, 2026-10-23)."""
+        sql = ("select 1 from store_sales, date_dim, store where (ss_sold_date_sk = d_date_sk "
+               "AND d_year = 2002 AND s_state IN ('TN') AND d_date BETWEEN 1 AND 5) AND d_moy <= 6")
+        conj = QP.where_conjuncts(sql)
+        self.assertIn("d_year = 2002", conj)
+        self.assertIn("d_moy <= 6", conj)
+        self.assertIn("d_date BETWEEN 1 AND 5", conj)
+        self.assertEqual(QP.dim_predicates(sql)["date_dim"][""], ["d_year = 2002", "d_date BETWEEN 1 AND 5", "d_moy <= 6"])
+        # an OR group is not flattened
+        self.assertIn("(a = 1 OR b = 2)", QP.where_conjuncts("select 1 from t where (a = 1 OR b = 2) AND c = 3"))
+
     def test_a_dimension_key_on_both_sides_is_not_a_fact_join(self):
         self.assertEqual(QP.dim_join_columns("select 1 from t where d_date_sk = d_date_sk",
                                              "date_dim"), {})
