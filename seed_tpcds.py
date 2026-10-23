@@ -439,7 +439,8 @@ def date_after(d, lo_gap, hi_gap, date_max, rnd):
     return rnd.randint(lo, hi)
 
 
-def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random):
+def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=random,
+                  report_preds=True):
     """Generate EVERY column of `fact` — no null-filled column, ever again.
 
     `columns` is the fact's physical column list as (name, kind), taken from the
@@ -594,7 +595,7 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
     assert not missing, f"{fact}: generator left {missing} unset"
     if not _ENFORCING[0]:
         _enforce_fact_preds(fact, columns, out, owners, date_lo=date_lo, date_hi=date_hi,
-                            dim_hi=dim_hi, key_base=key_base, rnd=rnd)
+                            dim_hi=dim_hi, key_base=key_base, rnd=rnd, report=report_preds)
     return out
 
 
@@ -629,20 +630,49 @@ def _row_ok(out, i, preds):
     return True
 
 
-def _enforce_fact_preds(fact, columns, out, owners, *, date_lo, date_hi, dim_hi, key_base, rnd):
+def _measure_cols(columns):
+    """The columns one money-model draw sets together: every decimal plus the
+    quantity. Copying all of them from one draw keeps the composites exact."""
+    kinds = dict(columns)
+    qty_col = next((c for c, _ in columns if c.endswith("_quantity")), None)
+    return [c for c, _ in columns if kinds.get(c) == "d"] + ([qty_col] if qty_col else [])
+
+
+def _measure_draws(fact, columns, *, date_lo, date_hi, dim_hi, key_base, rnd):
+    """Endless rows {measure column: value} from gen_fact_cols' own money model,
+    512 at a time. Shared by _enforce_fact_preds (a sale's bands) and
+    gen_referential_returns (a parent sale that must carry its return's band).
+    The pool's own date reports describe rows never written, so they are dropped."""
+    mcols = _measure_cols(columns)
+    while True:
+        mark = len(DATE_REPORTS)
+        _ENFORCING[0] = True
+        try:
+            pool = gen_fact_cols(fact, columns, 512, date_lo=date_lo, date_hi=date_hi,
+                                 dim_hi=dim_hi, key_base=key_base, rnd=rnd)
+        finally:
+            _ENFORCING[0] = False
+            del DATE_REPORTS[mark:]
+        for k in range(512):
+            yield {c: pool[c][k] for c in mcols}
+
+
+def _owned_preds(o, out):
+    return {c: k for c, k in ((o or {}).get("fact") or {}).items() if c in out}
+
+
+def _enforce_fact_preds(fact, columns, out, owners, *, date_lo, date_hi, dim_hi, key_base, rnd,
+                        report=True):
     kinds = dict(columns)
     names = [c[0] for c in columns]
-    qty_col = next((c for c in names if c.endswith("_quantity")), None)
-    measure_cols = [c for c in names if kinds.get(c) == "d"] + ([qty_col] if qty_col else [])
+    measure_cols = _measure_cols(columns)
     n = len(out[names[0]]) if names else 0
-    done, total, failed = {}, {}, {}
-    pool, pi = None, 0
+    draws = None
     for i in range(n):
         o = owners[i] if i < len(owners) else None
-        preds = {c: k for c, k in ((o or {}).get("fact") or {}).items() if c in out}
+        preds = _owned_preds(o, out)
         if not preds:
             continue
-        total[o["name"]] = total.get(o["name"], 0) + 1
         # keys and NULLs: assigned
         for col, c in preds.items():
             if col in measure_cols:
@@ -654,27 +684,42 @@ def _enforce_fact_preds(fact, columns, out, owners, *, date_lo, date_hi, dim_hi,
         mpreds = {c: k for c, k in preds.items() if c in measure_cols}
         tries = 0
         while mpreds and not _row_ok(out, i, mpreds) and tries < 64:
-            if pool is None or pi >= len(pool[names[0]]):
-                _ENFORCING[0] = True
-                try:
-                    pool = gen_fact_cols(fact, columns, 512, date_lo=date_lo, date_hi=date_hi,
-                                         dim_hi=dim_hi, key_base=key_base, rnd=rnd)
-                finally:
-                    _ENFORCING[0] = False
-                pi = 0
-            for c in measure_cols:
-                out[c][i] = pool[c][pi]
-            pi += 1
+            if draws is None:
+                draws = _measure_draws(fact, columns, date_lo=date_lo, date_hi=date_hi,
+                                       dim_hi=dim_hi, key_base=key_base, rnd=rnd)
+            for c, v in next(draws).items():
+                out[c][i] = v
             tries += 1
+    if report:
+        _report_fact_preds(fact, out, owners)
+
+
+def _report_fact_preds(fact, out, owners):
+    """The "fact predicates" line, computed on the rows AS WRITTEN — never on an
+    intermediate the caller overwrites afterwards (gen_referential_returns
+    replaced keys and money after this line had already claimed success, q49
+    2026-10-23). Unmet rows are counted per column."""
+    done, total, failed = {}, {}, {}
+    for i, o in enumerate(owners):
+        preds = _owned_preds(o, out)
+        if not preds:
+            continue
+        q = o["name"]
+        total[q] = total.get(q, 0) + 1
         if _row_ok(out, i, preds):
-            done[o["name"]] = done.get(o["name"], 0) + 1
-        else:
-            failed[o["name"]] = failed.get(o["name"], 0) + 1
+            done[q] = done.get(q, 0) + 1
+            continue
+        f = failed.setdefault(q, {})
+        for col, c in preds.items():
+            if not _row_ok(out, i, {col: c}):
+                f[col] = f.get(col, 0) + 1
     for q in total:
+        bad = total[q] - done.get(q, 0)
         print("   fact predicates %s.%s: %d/%d owned row(s) satisfy %s%s"
               % (fact, q, done.get(q, 0), total[q],
                  next((x.get("fact") for x in KEY_POOLS["queries"] if x["name"] == q), {}),
-                 "" if not failed.get(q) else " — %d could not be met by the money model" % failed[q]))
+                 "" if not bad else " — %d could not be met (unmet per column: %s)"
+                 % (bad, ", ".join("%s=%d" % kv for kv in sorted(failed[q].items())))))
 
 
 def _returns_money(amt, tax, fee, ship, cash, rnd):
@@ -697,27 +742,142 @@ def _returns_money(amt, tax, fee, ship, cash, rnd):
 
 
 def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
-                            date_lo, date_hi, dim_hi, rnd=random):
+                            date_lo, date_hi, dim_hi, rnd=random, sales_columns=None):
     """Returns rows that actually reference the sales rows just appended.
 
     Every returns fact joins its parent on (item_sk, ticket/order number). Rows
     generated INDEPENDENTLY of the sales never match, so the delta merge scans
     both facts and produces nothing. Dimension keys, dates and money are all
-    derived from the parent sale so the pair is internally consistent."""
+    derived from the parent sale so the pair is internally consistent.
+
+    A returns row a query owns with predicates on the returns fact's measures
+    (q49's sr_return_amt > 10000) takes a parent sale the SAME query owns (its
+    date window and sale bands already hold) and a return quantity up to the
+    sale's, so the band holds on the final row. When no such parent can carry
+    the band, that parent sale's measures are drawn again from the money model
+    until it still meets its own predicates and can — so `sales_cols` must be
+    written AFTER this call. `sales_columns` is the sales fact's (name, kind)
+    list (the live schema; FACT_COLUMNS when omitted)."""
     rfact, keypairs = RETURNS_OF[sales_fact]
     names = [c[0] for c in returns_columns]
     n = len(next(iter(sales_cols.values())))
     m = max(0, min(m, n))
-    idx = rnd.sample(range(n), m)
 
     # Start from a standalone generation so no column can be missed, then
     # overwrite everything that must agree with the parent sale. The standalone
     # generation's date report describes dates that are about to be replaced by
-    # the parent's, so drop it and restate below.
+    # the parent's, so drop it and restate below; its predicate report likewise
+    # describes values about to be replaced, so it is stated on the final rows.
     _mark = len(DATE_REPORTS)
     out = gen_fact_cols(rfact, returns_columns, m, date_lo=date_lo, date_hi=date_hi,
-                        dim_hi=dim_hi, key_base=1, rnd=rnd)
+                        dim_hi=dim_hi, key_base=1, rnd=rnd, report_preds=False)
     del DATE_REPORTS[_mark:]
+    rowners, _ = row_owners(names, m)
+
+    # money: refund a subset of what was actually paid on that sale
+    sqty = next((c for c in sales_cols if c.endswith("_quantity")), None)
+    sprice = next((c for c in sales_cols
+                   if c.endswith("_sales_price") and "_ext_" not in c), None)
+    rkinds = dict(returns_columns)
+
+    def refund(rq, unit):
+        """One returns row's money for `rq` units at the sale's unit price."""
+        amt = [_q(rq * unit)]
+        d = _returns_money(amt, [_q(float(amt[0]) * 0.07)], [_q(rnd.uniform(0, 20))],
+                           [_q(rnd.uniform(0, 10))], [_q(float(amt[0]) * rnd.uniform(0, 0.6))],
+                           rnd)
+        d["return_quantity"] = [rq]
+        r = {}
+        for name in names:
+            bare = name.split("_", 1)[1]
+            if bare in d:
+                r[name] = _q(d[bare][0]) if rkinds.get(name) == "d" else int(d[bare][0])
+        return r
+
+    def fits(i, mp):
+        """A refund of sale i meeting the measure predicates `mp`, or None.
+        rq never exceeds the sale's quantity. The refund grows with rq, so a
+        lower bound the largest return misses (or an upper bound the smallest
+        exceeds) ends the search for this sale at once."""
+        qty = int(sales_cols[sqty][i] or 0)
+        if qty < 1:
+            return None
+        unit = float(sales_cols[sprice][i])
+        for k, rq in enumerate([qty, 1] + rnd.sample(range(2, qty), min(16, max(0, qty - 2)))):
+            r = refund(rq, unit)
+            if _row_ok({c: [v] for c, v in r.items()}, 0, mp):
+                return r
+            side = "lo" if k == 0 else "hi" if k == 1 else None
+            if side and any(c in r and k_.get(side) is not None and
+                            (float(r[c]) < float(k_["lo"]) if side == "lo" else float(r[c]) > float(k_["hi"]))
+                            for c, k_ in mp.items()):
+                return None
+        return None
+
+    # parents: a row whose owner constrains the returns measures is placed first,
+    # on a free sale its owner also owns that can carry the band; the rest are
+    # drawn uniformly from the sales left.
+    sowners, _ = row_owners(list(sales_cols), n)
+    by_owner = {}
+    for i, o in enumerate(sowners):
+        if o:
+            by_owner.setdefault(o["name"], []).append(i)
+    for lst in by_owner.values():
+        rnd.shuffle(lst)
+    rmeasure = [c for c in _measure_cols(returns_columns) if c in out]
+    idx, solved, free = [None] * m, {}, set(range(n))
+    draws = None
+    smeasure = None
+    hopeless = set()   # owners whose band no redraw reached: one budget per owner, not per row
+    for j in range(m):
+        mp = {c: k for c, k in _owned_preds(rowners[j], out).items() if c in rmeasure}
+        if not mp or not (sqty and sprice):
+            continue
+        cand = [i for i in by_owner.get(rowners[j]["name"], []) if i in free][:8] \
+            or rnd.sample(sorted(free), min(8, len(free)))
+        if not cand:
+            continue
+        pick = None
+        for i in cand:
+            r = fits(i, mp)
+            if r:
+                pick = i
+                break
+        if pick is None:
+            # no parent can carry it: draw that sale's measures again until the
+            # sale still meets ITS predicates and the return fits.
+            pick = cand[0]
+        if r is None and rowners[j]["name"] not in hopeless:
+            if draws is None:
+                scols = sales_columns or FACT_COLUMNS.get(sales_fact) or []
+                smeasure = _measure_cols(scols)
+                draws = _measure_draws(sales_fact, scols, date_lo=date_lo, date_hi=date_hi,
+                                       dim_hi=dim_hi, key_base=1, rnd=rnd)
+            spm = {c: k for c, k in _owned_preds(sowners[pick], sales_cols).items()
+                   if c in smeasure}
+            for _t in range(4096):
+                row = next(draws)
+                if not _row_ok({c: [v] for c, v in row.items()}, 0, spm):
+                    continue
+                saved = {c: sales_cols[c][pick] for c in row if c in sales_cols}
+                for c, v in row.items():
+                    if c in sales_cols:
+                        sales_cols[c][pick] = v
+                r = fits(pick, mp)
+                if r:
+                    break
+                for c, v in saved.items():
+                    sales_cols[c][pick] = v
+            else:
+                hopeless.add(rowners[j]["name"])
+        idx[j] = pick
+        free.discard(pick)
+        if r:
+            solved[j] = r
+    rest = rnd.sample(sorted(free), sum(1 for x in idx if x is None))
+    for j in range(m):
+        if idx[j] is None:
+            idx[j] = rest.pop()
 
     for scol, rcol in keypairs:
         if rcol in out and scol in sales_cols:
@@ -750,25 +910,13 @@ def gen_referential_returns(sales_fact, sales_cols, returns_columns, m, *,
                         "that filters the RETURN date needs its window to extend past "
                         "the sale window" % (rfact, rcol, min(out[rcol]), max(out[rcol])))
 
-    # money: refund a subset of what was actually paid on that sale
-    sqty = next((c for c in sales_cols if c.endswith("_quantity")), None)
-    sprice = next((c for c in sales_cols
-                   if c.endswith("_sales_price") and "_ext_" not in c), None)
     if sqty and sprice and m:
-        rq = [max(1, min(sales_cols[sqty][i], rnd.randint(1, 10))) for i in idx]
-        unit = [float(sales_cols[sprice][i]) for i in idx]
-        amt = [_q(q * u) for q, u in zip(rq, unit)]
-        derived = _returns_money(amt, [_q(float(a) * 0.07) for a in amt],
-                                 [_q(rnd.uniform(0, 20)) for _ in range(m)],
-                                 [_q(rnd.uniform(0, 10)) for _ in range(m)],
-                                 [_q(float(a) * rnd.uniform(0, 0.6)) for a in amt],
-                                 rnd)
-        derived["return_quantity"] = rq
-        for name, kind in returns_columns:
-            bare = name.split("_", 1)[1]
-            if bare in derived:
-                v = derived[bare]
-                out[name] = [_q(x) for x in v] if kind == "d" else [int(x) for x in v]
+        for j, i in enumerate(idx):
+            r = solved.get(j) or refund(max(1, min(sales_cols[sqty][i], rnd.randint(1, 10))),
+                                        float(sales_cols[sprice][i]))
+            for name, v in r.items():
+                out[name][j] = v
+    _report_fact_preds(rfact, out, rowners)
     return out
 
 
@@ -1493,6 +1641,19 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
         sc = _slice_col(columns)
         if sc:
             cols[sc] = list(store_pool)
+    # Returns are generated BEFORE the sales are written: a parent sale whose
+    # measures cannot carry an owned return's band is drawn again in place.
+    rcols = rcolumns = rt = None
+    if returns_rows and fact in RETURNS_OF:
+        rfact = RETURNS_OF[fact][0]
+        rt = _load_or_create(cat, namespace, rfact)
+        rcolumns = _columns_of(rt, rfact)
+        need = [d for d in dims_needed([c[0] for c in rcolumns]) if d not in dim_hi_cache]
+        if need:
+            dim_hi_cache.update(load_dim_hi(cat, namespace, need, verbose=verbose))
+        rcols = gen_referential_returns(fact, cols, rcolumns, returns_rows,
+                                        date_lo=date_lo, date_hi=date_hi,
+                                        dim_hi=dim_hi_cache, sales_columns=columns)
     data = pa.table({c: cols[c] for c, _ in columns}, schema=_pa_schema(columns))
     _write_and_add(fs, t, data, n, f"{namespace}.{fact}", strict=strict)
 
@@ -1507,17 +1668,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                   f">= {kb+n-1} — the appended file carries no bounds, so the next "
                   "append WILL reissue these keys")
 
-    if not returns_rows or fact not in RETURNS_OF:
+    if rcols is None:
         return 0
-    rfact = RETURNS_OF[fact][0]
-    rt = _load_or_create(cat, namespace, rfact)
-    rcolumns = _columns_of(rt, rfact)
-    need = [d for d in dims_needed([c[0] for c in rcolumns]) if d not in dim_hi_cache]
-    if need:
-        dim_hi_cache.update(load_dim_hi(cat, namespace, need, verbose=verbose))
-    rcols = gen_referential_returns(fact, cols, rcolumns, returns_rows,
-                                    date_lo=date_lo, date_hi=date_hi,
-                                    dim_hi=dim_hi_cache)
     if verbose:
         flush_date_reports()
     rw = len(next(iter(rcols.values())))

@@ -1455,3 +1455,34 @@ class TestFactPredicatesOnOwnedRows(unittest.TestCase):
                 self.assertIsNone(cols["ss_addr_sk"][i])
                 key += 1
         self.assertEqual((band, key), (100, 100))
+
+
+    def test_owned_returns_rows_satisfy_after_the_parent_overwrite(self):
+        """q49 shape (node 144, 2026-10-23): the returns row's predicates must hold
+        on the FINAL row, after keys/dates/money are copied from the parent sale —
+        and the parent sale must still satisfy its own predicates."""
+        S.KEY_POOLS["queries"] = [
+            {"name": "qret", "date_by_col": {}, "date_sk": [], "dims": {},
+             "fact": {"sr_return_amt": {"lo": 10000.0}, "ss_net_profit": {"lo": 1.0},
+                      "ss_net_paid": {"lo": 0.0}, "ss_quantity": {"lo": 0.0}}},
+            {"name": "qother", "date_by_col": {}, "date_sk": [], "dims": {}, "fact": {}}]
+        rnd = random.Random(11)
+        sales = S.gen_fact_cols("store_sales", S.FACT_COLUMNS["store_sales"], 400, date_lo=2451000,
+                                date_hi=2452000, dim_hi={}, key_base=1, rnd=rnd)
+        rets = S.gen_referential_returns("store_sales", sales, S.FACT_COLUMNS["store_returns"], 40,
+                                         date_lo=2451000, date_hi=2452000, dim_hi={}, rnd=rnd)
+        by_key = {(sales["ss_ticket_number"][i], sales["ss_item_sk"][i]): i for i in range(400)}
+        self.assertEqual(len({(t, it) for t, it in zip(rets["sr_ticket_number"], rets["sr_item_sk"])}), 40)
+        for j in range(40):  # qret is the only owner with fact predicates on store_returns
+            i = by_key[(rets["sr_ticket_number"][j], rets["sr_item_sk"][j])]
+            self.assertGreaterEqual(float(rets["sr_return_amt"][j]), 10000.0)
+            self.assertLessEqual(rets["sr_return_quantity"][j], sales["ss_quantity"][i])
+            self.assertAlmostEqual(float(rets["sr_return_amt"][j]),
+                                   rets["sr_return_quantity"][j] * float(sales["ss_sales_price"][i]), places=1)
+            self.assertAlmostEqual(float(rets["sr_return_amt_inc_tax"][j]),
+                                   float(rets["sr_return_amt"][j]) + float(rets["sr_return_tax"][j]), places=2)
+            self.assertGreaterEqual(float(sales["ss_net_profit"][i]), 1.0)
+            self.assertAlmostEqual(float(sales["ss_net_paid"][i]),
+                                   float(sales["ss_ext_sales_price"][i]) - float(sales["ss_coupon_amt"][i]), places=2)
+            self.assertAlmostEqual(float(sales["ss_ext_sales_price"][i]),
+                                   sales["ss_quantity"][i] * float(sales["ss_sales_price"][i]), places=1)
