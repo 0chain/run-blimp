@@ -584,7 +584,7 @@ class TestGeoCorrelation(unittest.TestCase):
     def test_triples_stay_together(self):
         cols = gen_any("store_sales", n=400)
         n = S.apply_geo_correlation(cols, "store_sales", self.GEO,
-                                    rnd=random.Random(1))
+                                    rnd=random.Random(1), fraction=1.0)
         self.assertEqual(n, 400)
         allowed = set(zip(*self.GEO))
         for c, a, s in zip(cols["ss_customer_sk"], cols["ss_addr_sk"],
@@ -592,6 +592,18 @@ class TestGeoCorrelation(unittest.TestCase):
             self.assertIn((c, a, s), allowed,
                           "customer, address and store must come from ONE row of "
                           "the zip-consistent join, not be mixed across rows")
+
+    def test_default_leaves_independent_rows(self):
+        """q19 needs ca_zip <> s_zip: with every row zip-correlated its delta
+        was always empty (node 144, 2026-10-23)."""
+        cols = gen_any("store_sales", n=400)
+        n = S.apply_geo_correlation(cols, "store_sales", self.GEO, rnd=random.Random(3))
+        allowed = set(zip(*self.GEO))
+        rows = list(zip(cols["ss_customer_sk"], cols["ss_addr_sk"], cols["ss_store_sk"]))
+        corr = sum(1 for r in rows if r in allowed)
+        self.assertEqual(n, 200)
+        self.assertGreaterEqual(corr, 200)
+        self.assertLess(corr, 400, "some rows must keep an independent customer/store draw")
 
     def test_only_store_sales_is_correlated(self):
         for fact in ("catalog_sales", "web_sales", "store_returns"):

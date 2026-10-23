@@ -1541,20 +1541,33 @@ def _load_or_create(cat, namespace, fact):
         return cat.create_table((namespace, fact), schema=_pa_schema(FACT_COLUMNS[fact]))
 
 
-def apply_geo_correlation(cols, fact, geo, rnd=random):
-    """Overwrite (customer_sk, addr_sk, store_sk) with a zip-consistent triple.
+# A SHARE OF THE ROWS, NOT ALL OF THEM. q24 needs s_zip = ca_zip, and q19 needs
+# the opposite (substr(ca_zip,1,5) <> substr(s_zip,1,5)): correlating every row
+# gave q19 5000/5000 appended rows with the customer in the store's zip, its
+# delta was always empty and every tick was a no-op (node 144, 2026-10-23).
+# CDC_GEO_FRACTION (default 0.5, like CDC_CROSS_FACT) of the rows take a
+# zip-consistent triple; the rest keep their independent draw.
+GEO_FRACTION = float(os.environ.get("CDC_GEO_FRACTION", "0.5") or 0)
+
+
+def apply_geo_correlation(cols, fact, geo, rnd=random, fraction=None):
+    """Overwrite (customer_sk, addr_sk, store_sk) with a zip-consistent triple
+    on a share of the rows (GEO_FRACTION).
 
     Only store_sales has a store to correlate against. Applied AFTER generation
     so every other column keeps its independent draw."""
     if not geo or fact != "store_sales":
         return 0
+    frac = GEO_FRACTION if fraction is None else fraction
     cust, addr, store = geo
     n = len(cols["ss_customer_sk"])
-    pick = [rnd.randrange(len(cust)) for _ in range(n)]
-    cols["ss_customer_sk"] = [cust[i] for i in pick]
-    cols["ss_addr_sk"] = [addr[i] for i in pick]
-    cols["ss_store_sk"] = [store[i] for i in pick]
-    return n
+    rows = rnd.sample(range(n), max(0, min(n, int(round(n * frac)))))
+    for r in rows:
+        i = rnd.randrange(len(cust))
+        cols["ss_customer_sk"][r] = cust[i]
+        cols["ss_addr_sk"][r] = addr[i]
+        cols["ss_store_sk"][r] = store[i]
+    return len(rows)
 
 
 # CROSS-FACT correlation. q29 joins store_sales ⋈ store_returns ⋈ catalog_sales
@@ -1633,8 +1646,8 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                          dim_hi=dim_hi_cache, key_base=kb)
     if verbose:
         flush_date_reports()
-    if apply_geo_correlation(cols, fact, geo) and verbose:
-        print(f"   {fact}: customer/address/store drawn as zip-consistent triples")
+    if (gm := apply_geo_correlation(cols, fact, geo)) and verbose:
+        print(f"   {fact}: {gm} of {n} rows take customer/address/store as zip-consistent triples")
     if (xm := apply_cross_fact(cols, fact)) and verbose:
         print(f"   {fact}: {xm} rows re-issue (customer, item) pairs returned earlier this tick (cross-fact)")
     if store_pool is not None:
