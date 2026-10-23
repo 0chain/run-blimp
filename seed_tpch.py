@@ -54,8 +54,10 @@ def key_max(cat, ns, table, col):
     if mx is None:
         mx = sd.scan_dim_hi(cat, ns, table, col)
     if mx is None:
+        why = sd.SCAN_DIM_HI_ERR.get((ns, table, col))
         raise SystemExit(f"FATAL: {ns}.{table}.{col}: no manifest bound and no scannable max — "
-                         "a fresh key cannot be issued above the existing ones")
+                         "a fresh key cannot be issued above the existing ones"
+                         + (f". The scan: {why}" if why else ""))
     return int(mx)
 
 

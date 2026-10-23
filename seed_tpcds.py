@@ -938,21 +938,39 @@ def _scan_dim_hi(cat, namespace, table, col, snapshot_id=None):
                 v = max(vals) if vals else None
             return v if best is None else (best if v is None else max(best, v))
 
+        key = (namespace, table, col)
         best = None
+        rows = 0
+        reader_err = ""
         reader = getattr(scan, "to_arrow_batch_reader", None)
         if reader is not None:
             try:
                 for batch in reader():
+                    rows += batch.num_rows
                     if batch.num_rows:
                         best = _fold(batch.column(0), best)
-                return int(best) if best is not None else None
-            except Exception:
+                if best is not None:
+                    return int(best)
+                # EVERY None says why: the FATAL that reads this was printed
+                # with no detail when the scan simply found nothing (empty
+                # table, or every key NULL) — Olyad's date_dim, 2026-10-23.
+                SCAN_DIM_HI_ERR[key] = (f"the scan read {rows} row(s) of {table}.{col} at snapshot "
+                                        f"{snapshot_id or 'current'} and found no non-NULL value")
+                return None
+            except Exception as e:
+                reader_err = f"batch reader failed ({type(e).__name__}: {e})"[:200]
                 best = None  # fall through to the whole-column read
         arrow = scan.to_arrow()
         if arrow.num_rows == 0:
+            SCAN_DIM_HI_ERR[key] = ((reader_err + "; then ") if reader_err else "") + \
+                f"the whole-column read of {table}.{col} at snapshot {snapshot_id or 'current'} returned 0 rows"
             return None
         best = _fold(arrow.column(col), best)
-        return int(best) if best is not None else None
+        if best is None:
+            SCAN_DIM_HI_ERR[key] = ((reader_err + "; then ") if reader_err else "") + \
+                f"{arrow.num_rows} row(s) of {table}.{col} read, every value NULL"
+            return None
+        return int(best)
     except Exception as e:
         # Kept for the caller's FATAL: "no scannable max" alone hid whether the
         # table is empty or its data files are unreachable from this host.
