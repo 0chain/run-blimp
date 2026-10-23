@@ -1418,3 +1418,40 @@ class TestFactKeysStayInsideTheLoadedDimension(unittest.TestCase):
             metadata = Meta()
         self.assertEqual(S.first_snapshot(T()).snapshot_id, 1)
         self.assertEqual(S.base_rows(T()), 42)
+
+
+class TestFactPredicatesOnOwnedRows(unittest.TestCase):
+    """A row a query owns satisfies that query's conditions on the fact's own
+    columns — a measure band, a foreign-key literal, IS NULL — so the tick's
+    delta terms produce rows (q13/q44/q48 merged nothing, 2026-10-23)."""
+
+    def setUp(self):
+        self.saved = S.KEY_POOLS
+        S.KEY_POOLS = {"date_sk": [], "dims": {}, "date_by_col": {}, "queries": [
+            {"name": "qband", "date_by_col": {}, "date_sk": [], "dims": {},
+             "fact": {"ss_sales_price": {"lo": 100.0, "hi": 150.0},
+                      "ss_net_profit": {"lo": 0.0, "hi": 2000.0}}},
+            {"name": "qkey", "date_by_col": {}, "date_sk": [], "dims": {},
+             "fact": {"ss_store_sk": {"eq": [4.0]}, "ss_addr_sk": {"null": True}}}]}
+
+    def tearDown(self):
+        S.KEY_POOLS = self.saved
+
+    def test_owned_rows_satisfy_the_fact_predicates(self):
+        rnd = random.Random(7)
+        cols = S.gen_fact_cols("store_sales", S.FACT_COLUMNS["store_sales"], 200, date_lo=2451000,
+                               date_hi=2452000, dim_hi={}, key_base=1, rnd=rnd)
+        band = key = 0
+        for i in range(200):
+            if i % 2 == 0:  # round-robin: even rows are qband's
+                self.assertTrue(100 <= float(cols["ss_sales_price"][i]) <= 150, cols["ss_sales_price"][i])
+                self.assertTrue(0 <= float(cols["ss_net_profit"][i]) <= 2000, cols["ss_net_profit"][i])
+                # composites stay exact
+                self.assertAlmostEqual(float(cols["ss_net_paid"][i]),
+                                       float(cols["ss_ext_sales_price"][i]) - float(cols["ss_coupon_amt"][i]), places=2)
+                band += 1
+            else:
+                self.assertEqual(cols["ss_store_sk"][i], 4)
+                self.assertIsNone(cols["ss_addr_sk"][i])
+                key += 1
+        self.assertEqual((band, key), (100, 100))

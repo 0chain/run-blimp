@@ -242,8 +242,9 @@ def load_key_pools(path):
         e = {"name": q.get("name") or "?",
              "date_by_col": {k: list(v) for k, v in (q.get("date_by_col") or {}).items() if v},
              "date_sk": list(q.get("date_sk") or []),
-             "dims": {k: list(v) for k, v in (q.get("dims") or {}).items() if v}}
-        if e["date_by_col"] or e["dims"]:
+             "dims": {k: list(v) for k, v in (q.get("dims") or {}).items() if v},
+             "fact": dict(q.get("fact") or {})}
+        if e["date_by_col"] or e["dims"] or e["fact"]:
             qs.append(e)
     KEY_POOLS = {
         "date_sk": list(d.get("date_sk") or []),
@@ -278,7 +279,8 @@ def pool_queries_for(colnames):
     cols = set(colnames)
     dims = {d[0] for d in (dim_for(c) for c in colnames) if d}
     return [q for q in KEY_POOLS["queries"]
-            if any(c in cols for c in q["date_by_col"]) or any(d in dims for d in q["dims"])]
+            if any(c in cols for c in q["date_by_col"]) or any(d in dims for d in q["dims"])
+            or any(c in cols for c in q.get("fact", {}))]
 
 
 def row_owners(colnames, n):
@@ -590,7 +592,89 @@ def gen_fact_cols(fact, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd=r
 
     missing = [c for c in names if c not in out]
     assert not missing, f"{fact}: generator left {missing} unset"
+    if not _ENFORCING[0]:
+        _enforce_fact_preds(fact, columns, out, owners, date_lo=date_lo, date_hi=date_hi,
+                            dim_hi=dim_hi, key_base=key_base, rnd=rnd)
     return out
+
+
+# FACT PREDICATES ON OWNED ROWS (query_pools.py "fact"): a row owned by a query
+# must satisfy that query's conditions on the fact's own columns too — a
+# foreign-key literal or IS NULL is assigned; a measure band (q13/q48's
+# ss_sales_price BETWEEN 100 AND 150) is met by drawing the row's measures again
+# from the SAME money model until it holds, so composite columns stay exact sums.
+# Without it the tick's delta terms produced 0 rows and no merge ran (q13, q19,
+# q44, q48, q49 and variants; regression 2026-10-23).
+_ENFORCING = [False]
+
+
+def _row_ok(out, i, preds):
+    for col, c in preds.items():
+        if col not in out:
+            continue
+        v = out[col][i]
+        if "null" in c:
+            if (v is None) != bool(c["null"]):
+                return False
+            continue
+        if v is None:
+            return False
+        v = float(v)
+        if "eq" in c and not any(abs(v - float(e)) < 1e-9 for e in c["eq"]):
+            return False
+        if c.get("lo") is not None and v < float(c["lo"]):
+            return False
+        if c.get("hi") is not None and v > float(c["hi"]):
+            return False
+    return True
+
+
+def _enforce_fact_preds(fact, columns, out, owners, *, date_lo, date_hi, dim_hi, key_base, rnd):
+    kinds = dict(columns)
+    names = [c[0] for c in columns]
+    qty_col = next((c for c in names if c.endswith("_quantity")), None)
+    measure_cols = [c for c in names if kinds.get(c) == "d"] + ([qty_col] if qty_col else [])
+    n = len(out[names[0]]) if names else 0
+    done, total, failed = {}, {}, {}
+    pool, pi = None, 0
+    for i in range(n):
+        o = owners[i] if i < len(owners) else None
+        preds = {c: k for c, k in ((o or {}).get("fact") or {}).items() if c in out}
+        if not preds:
+            continue
+        total[o["name"]] = total.get(o["name"], 0) + 1
+        # keys and NULLs: assigned
+        for col, c in preds.items():
+            if col in measure_cols:
+                continue
+            if "null" in c:
+                out[col][i] = None if c["null"] else (out[col][i] if out[col][i] is not None else 1)
+            elif "eq" in c and c["eq"]:
+                out[col][i] = int(c["eq"][0]) if kinds.get(col) == "i" else c["eq"][0]
+        mpreds = {c: k for c, k in preds.items() if c in measure_cols}
+        tries = 0
+        while mpreds and not _row_ok(out, i, mpreds) and tries < 64:
+            if pool is None or pi >= len(pool[names[0]]):
+                _ENFORCING[0] = True
+                try:
+                    pool = gen_fact_cols(fact, columns, 512, date_lo=date_lo, date_hi=date_hi,
+                                         dim_hi=dim_hi, key_base=key_base, rnd=rnd)
+                finally:
+                    _ENFORCING[0] = False
+                pi = 0
+            for c in measure_cols:
+                out[c][i] = pool[c][pi]
+            pi += 1
+            tries += 1
+        if _row_ok(out, i, preds):
+            done[o["name"]] = done.get(o["name"], 0) + 1
+        else:
+            failed[o["name"]] = failed.get(o["name"], 0) + 1
+    for q in total:
+        print("   fact predicates %s.%s: %d/%d owned row(s) satisfy %s%s"
+              % (fact, q, done.get(q, 0), total[q],
+                 next((x.get("fact") for x in KEY_POOLS["queries"] if x["name"] == q), {}),
+                 "" if not failed.get(q) else " — %d could not be met by the money model" % failed[q]))
 
 
 def _returns_money(amt, tax, fee, ship, cash, rnd):

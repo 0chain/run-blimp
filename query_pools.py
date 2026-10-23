@@ -204,7 +204,7 @@ def dim_predicates(sql):
     """{dim: {alias: [predicate text without qualifiers]}} for conjuncts that
     reference exactly one dimension (any alias), no other table, no subquery."""
     out = {}
-    for c in where_conjuncts(sql):
+    for c in expand_or_groups(where_conjuncts(sql)):
         low = c.lower()
         if "select" in low or "exists" in low:
             continue
@@ -242,6 +242,121 @@ def dim_predicates(sql):
         # drop qualifiers so the predicate binds on the bare dim table
         bare = re.sub(r"(?i)\b([a-z_][a-z0-9_]*)\.(?=[a-z_])", "", c)
         out.setdefault(dim, {}).setdefault(alias, []).append(bare.strip())
+    return out
+
+
+# FACT-COLUMN PREDICATES. A conjunct over the fact's own columns (a measure
+# band `ss_sales_price BETWEEN 100 AND 150`, a foreign-key literal
+# `ss_store_sk = 4`, `ss_addr_sk IS NULL`) was skipped above, so the appended
+# rows never satisfied it and the tick's delta terms produced 0 rows: q13, q19,
+# q44, q48, q49 and their variants never exercised a merge (regression on
+# dfd56293, 2026-10-23). Parsed into per-column constraints the seeder enforces
+# on the rows the query owns.
+FACT_COL = re.compile(r"(?i)^(ss|sr|cs|cr|ws|wr|inv)_[a-z0-9_]+$")
+NUM = r"[-+]?\d+(?:\.\d+)?(?:\s*[-+*/]\s*[-+]?\d+(?:\.\d+)?)*"
+
+
+def _num(expr):
+    expr = expr.strip()
+    if not re.fullmatch(r"[-+*/().\d\s]+", expr):
+        return None
+    try:
+        return float(eval(expr, {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+
+def _bare_cols(c):
+    return [n.lower() for q, n in IDENT.findall(strip_literals(c))
+            if n.lower() not in KEYWORDS and n != "L" and not re.match(r"^\d", n)
+            and not (q and q.lower() in KEYWORDS)]
+
+
+def fact_constraint(c):
+    """(col, constraint) for a conjunct over ONE fact column, else None.
+    constraint: {"eq": [v…]} | {"lo": x, "hi": y} | {"null": bool}."""
+    cols = _bare_cols(c)
+    if len(set(cols)) != 1 or not FACT_COL.match(cols[0]):
+        return None
+    col = cols[0]
+    b = peel(re.sub(r"(?i)\b[a-z_][a-z0-9_]*\.(?=[a-z_])", "", c))
+    m = re.fullmatch(r"(?is)%s\s+between\s+(%s)\s+and\s+(%s)" % (col, NUM, NUM), b)
+    if m:
+        lo, hi = _num(m.group(1)), _num(m.group(2))
+        return (col, {"lo": lo, "hi": hi}) if lo is not None and hi is not None else None
+    m = re.fullmatch(r"(?is)%s\s*(<=|>=|<|>|=)\s*(%s)" % (col, NUM), b)
+    if m:
+        v = _num(m.group(2))
+        if v is None:
+            return None
+        op = m.group(1)
+        return (col, {"eq": [v]} if op == "=" else {"lo": v} if op in (">", ">=") else {"hi": v})
+    m = re.fullmatch(r"(?is)%s\s+in\s*\(([^()]*)\)" % col, b)
+    if m:
+        vs = [_num(x) for x in m.group(1).split(",")]
+        return (col, {"eq": vs}) if vs and all(v is not None for v in vs) else None
+    m = re.fullmatch(r"(?is)%s\s+is\s+(not\s+)?null" % col, b)
+    if m:
+        return (col, {"null": not m.group(1)})
+    return None
+
+
+def peel(t):
+    """Remove outer parentheses only while they are ONE matching pair."""
+    t = t.strip()
+    while t.startswith("(") and t.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(t):
+            depth += ch == "("
+            depth -= ch == ")"
+            if depth == 0 and i < len(t) - 1:
+                return t  # the first '(' closes before the end: not a wrapper
+        t = t[1:-1].strip()
+    return t
+
+
+def expand_or_groups(conjs):
+    """A top-level OR whose disjuncts mix dimension and fact columns (q13/q48's
+    demographic-and-price bands) is replaced by its FIRST disjunct's conjuncts:
+    a row satisfying one disjunct satisfies the OR."""
+    out = []
+    for c in conjs:
+        ors = top_level_split(peel(c), "or")
+        if len(ors) > 1 and any(FACT_COL.match(n) for n in _bare_cols(c)):
+            parts = top_level_split(peel(ors[0]), "and")
+            # BETWEEN's own AND was split: rejoin, as where_conjuncts does.
+            joined = []
+            for p_ in parts:
+                if joined and re.search(r"(?i)\bbetween\b", joined[-1]) and not re.search(r"(?i)\bbetween\b.*\band\b", joined[-1]):
+                    joined[-1] = joined[-1] + " AND " + p_
+                else:
+                    joined.append(p_)
+            out.extend(peel(p_) for p_ in joined)
+        else:
+            out.append(c)
+    return out
+
+
+def fact_predicates(sql):
+    """{fact column: merged constraint} over the query's conjuncts (OR-groups
+    expanded to their first disjunct)."""
+    out = {}
+    for c in expand_or_groups(where_conjuncts(sql)):
+        if "select" in c.lower():
+            continue
+        fc = fact_constraint(c)
+        if not fc:
+            continue
+        col, k = fc
+        e = out.setdefault(col, {})
+        if "eq" in k:
+            e["eq"] = k["eq"]
+        if "null" in k:
+            e["null"] = k["null"]
+        if k.get("lo") is not None:
+            e["lo"] = max(e.get("lo", k["lo"]), k["lo"])
+        if k.get("hi") is not None:
+            e["hi"] = min(e.get("hi", k["hi"]), k["hi"])
     return out
 
 
@@ -358,7 +473,9 @@ def main():
     for f in a.sql_file:
         sql = open(f).read()
         qname = re.sub(r"\.sql$", "", f.rsplit("/", 1)[-1]) or f
-        qentry = {"name": qname, "date_sk": [], "date_by_col": {}, "dims": {}}
+        qentry = {"name": qname, "date_sk": [], "date_by_col": {}, "dims": {}, "fact": fact_predicates(sql)}
+        if qentry["fact"]:
+            print("  fact predicates: %s" % qentry["fact"], file=sys.stderr)
         preds = dim_predicates(sql)
         links = customer_link_aliases(sql)  # dim -> alias joined through customer
         print("%s: predicated dims %s; customer-linked %s" % (f, {d: sum(len(v) for v in g.values()) for d, g in preds.items()}, links), file=sys.stderr)
@@ -415,7 +532,7 @@ def main():
         qentry["date_by_col"] = {c: sorted(v) for c, v in qentry["date_by_col"].items() if v}
         qentry["dims"] = {d: sorted(v) for d, v in qentry["dims"].items() if v}
         qentry["date_sk"] = sorted({k for v in qentry["date_by_col"].values() for k in v})
-        if qentry["date_by_col"] or qentry["dims"]:
+        if qentry["date_by_col"] or qentry["dims"] or qentry["fact"]:
             pools["queries"].append(qentry)
         else:
             print("  %s: NO usable pool — its tick rows are drawn uniformly" % qname, file=sys.stderr)
