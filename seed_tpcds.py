@@ -1619,6 +1619,28 @@ def record_cross_pairs(rcols):
     return len(pairs)
 
 
+def correlate_owned_sales(cols, fact, columns, n, *, geo, store_pool, date_lo, date_hi,
+                          dim_hi, key_base, verbose=True, rnd=random):
+    """The cross-row correlations (zip triples, cross-fact pairs, the store
+    slice), then the owners' fact predicates once more on the rows as written.
+
+    THE OWNERS' PREDICATES HAVE THE LAST WORD. The correlations rewrite keys
+    after gen_fact_cols enforced them: the zip triple overwrote q76's owned
+    `ss_store_sk IS NULL` rows on every tick (5000/5000 "satisfy" was logged
+    before the overwrite) and its store leg never merged (node 144, 2026-10-23)."""
+    if (gm := apply_geo_correlation(cols, fact, geo, rnd=rnd)) and verbose:
+        print(f"   {fact}: {gm} of {n} rows take customer/address/store as zip-consistent triples")
+    if (xm := apply_cross_fact(cols, fact, rnd=rnd)) and verbose:
+        print(f"   {fact}: {xm} rows re-issue (customer, item) pairs returned earlier this tick (cross-fact)")
+    if store_pool is not None:
+        sc = _slice_col(columns)
+        if sc:
+            cols[sc] = list(store_pool)
+    _enforce_fact_preds(fact, columns, cols, row_owners([c for c, _ in columns], n)[0],
+                        date_lo=date_lo, date_hi=date_hi, dim_hi=dim_hi,
+                        key_base=key_base, rnd=rnd, report=verbose)
+
+
 def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
                 store_pool=None, returns_rows=0, strict=True, verbose=True,
                 geo=None):
@@ -1643,17 +1665,12 @@ def append_fact(cat, fs, namespace, fact, n, *, date_lo, date_hi, dim_hi_cache,
             print(f"   {fact}.{keycol}: current max={mx} -> issuing {kb}..{kb+n-1}")
 
     cols = gen_fact_cols(fact, columns, n, date_lo=date_lo, date_hi=date_hi,
-                         dim_hi=dim_hi_cache, key_base=kb)
+                         dim_hi=dim_hi_cache, key_base=kb, report_preds=False)
     if verbose:
         flush_date_reports()
-    if (gm := apply_geo_correlation(cols, fact, geo)) and verbose:
-        print(f"   {fact}: {gm} of {n} rows take customer/address/store as zip-consistent triples")
-    if (xm := apply_cross_fact(cols, fact)) and verbose:
-        print(f"   {fact}: {xm} rows re-issue (customer, item) pairs returned earlier this tick (cross-fact)")
-    if store_pool is not None:
-        sc = _slice_col(columns)
-        if sc:
-            cols[sc] = list(store_pool)
+    correlate_owned_sales(cols, fact, columns, n, geo=geo, store_pool=store_pool,
+                          date_lo=date_lo, date_hi=date_hi, dim_hi=dim_hi_cache,
+                          key_base=kb, verbose=verbose)
     # Returns are generated BEFORE the sales are written: a parent sale whose
     # measures cannot carry an owned return's band is drawn again in place.
     rcols = rcolumns = rt = None
