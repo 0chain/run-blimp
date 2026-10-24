@@ -142,8 +142,20 @@ def main():
                 t = cat.create_table(ident, schema=arrow_schema)
             except TableAlreadyExistsError:
                 t = cat.load_table(ident)
+                # IDEMPOTENT PER TABLE: a table that already has a snapshot holds
+                # its data — adding the files again would double every row. One
+                # without a snapshot is a registration that failed after
+                # create_table (Olyad's tpcds_clean: 24 tables at their 00000
+                # metadata, current-snapshot-id -1, 2026-10-24): finish it.
+                if t.current_snapshot() is not None:
+                    n = t.current_snapshot().summary.get("total-records", "?")
+                    print(f"  {tbl:26s} OK   already registered  rows={n}")
+                    ok += 1
+                    continue
             # register the existing parquet files (no rewrite)
             t.add_files(file_paths=files)
+            if t.current_snapshot() is None:
+                raise RuntimeError("add_files committed no snapshot — the catalog table is still empty")
             n = t.current_snapshot().summary.get("total-records", "?") if t.current_snapshot() else "?"
             print(f"  {tbl:26s} OK   {len(files):5d} files  rows={n}")
             ok += 1

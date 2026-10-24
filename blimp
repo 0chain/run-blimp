@@ -1238,17 +1238,17 @@ cmd_setup(){
     # catalog does not. Build both the probe path and the registrar flag from it.
     local pfx="${ICEBERG_PREFIX:-}" pfx_path="" pfx_flag=""
     [ -n "$pfx" ] && { pfx_path="/$pfx"; pfx_flag="--prefix $pfx"; }
-    # IDEMPOTENT: registration is add_files against the catalog, so re-running it
-    # on an already-populated namespace is wasted work that ends in a warning.
-    local have; have=$(curl -s -m 8 "$cat_url/v1$pfx_path/namespaces/$NAMESPACE/tables" 2>/dev/null \
-                       | grep -o '"name"' | wc -l | tr -d ' ')
-    if [ "${have:-0}" -ge 24 ]; then
-      bold "  ✓ $NAMESPACE already has $have tables registered — skipping registration"
-    else
+    # IDEMPOTENT PER TABLE (register_tpcds_tables.py): a table that already has a
+    # snapshot is skipped, one without is finished. The old check counted TABLES,
+    # so 24 tables left empty by a failed add_files were "already registered" on
+    # every re-run, and `| tail -3` returned tail's status, so the failure was never
+    # reported (Olyad's tpcds_clean, CATALOG_CHOICE=1, 2026-10-24).
     bold "registering the 24 TPC-DS SF${BLIMP_SF:-1} tables into $cat_url"
-    register_source_tables "" | tail -3 \
-      || bold "  (auto-register had issues — re-run 'blimp --register')"
-    fi
+    local reg_out reg_rc
+    reg_out=$(register_source_tables ""); reg_rc=$?
+    printf '%s\n' "$reg_out" | grep -E ' FAIL ' || true
+    printf '%s\n' "$reg_out" | tail -1
+    [ "$reg_rc" = 0 ] || die "registration failed (above) — the tables would serve with no data; fix it and re-run 'blimp --register'"
   fi
 
   save_env
