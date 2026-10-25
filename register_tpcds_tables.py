@@ -42,6 +42,9 @@ TPCDS_TABLES = [
     "web_sales", "web_site",
 ]
 
+BASELINE_TAG_AGE_MS = 100 * 365 * 24 * 3600 * 1000  # rollback.py's TAG_AGE_MS
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", required=True, help="Iceberg REST catalog URL")
@@ -54,6 +57,14 @@ def main():
     # Nessie serves Iceberg REST under a BRANCH prefix (default "main"); the
     # tabulario/iceberg-rest catalog serves the root and takes no prefix. Passing
     # one where it is not expected 404s every call, so this stays opt-in.
+    # THE BASELINE IS SET HERE, ONCE, AT THE BASE LOAD. The node rollback
+    # inferred it ("the latest of every table's oldest surviving ancestor")
+    # once the true base snapshots had expired, so 144/37's "SF10" rolled back
+    # to store 1,543-1,622 rows (102), store_sales 44.0M (28.8M) — every run
+    # started bigger than the last and MVs grew run over run (v_q59_agg's
+    # chart 13,624 -> 464,462 rows; 2026-10-25).
+    ap.add_argument("--tag-baseline", action="store_true",
+                    help="tag each table's base snapshot 'bench_baseline' (the rollback target) when it has none")
     ap.add_argument("--prefix", default="", help="Iceberg REST prefix (Nessie branch, e.g. main); blank = none")
     # Explicit keys for an S3 that is not reachable by this box's IAM role — the
     # fleet cache layer is key-authenticated, and pyiceberg/s3fs will otherwise
@@ -152,7 +163,16 @@ def main():
             if t.current_snapshot() is None:
                 raise RuntimeError("add_files committed no snapshot — the catalog table is still empty")
             n = t.current_snapshot().summary.get("total-records", "?") if t.current_snapshot() else "?"
-            print(f"  {tbl:26s} OK   {len(files):5d} files  rows={n}")
+            tagged = ""
+            if args.tag_baseline and "bench_baseline" not in t.metadata.refs:
+                # only the snapshot add_files just committed — never a later
+                # state of an already-registered table. A max ref age of its
+                # own (rollback.py's 100 years): without one, iceberg-go's
+                # expiry drops a tag older than its cutoff with the snapshots.
+                t.manage_snapshots().create_tag(snapshot_id=t.current_snapshot().snapshot_id, tag_name="bench_baseline",
+                                                max_ref_age_ms=BASELINE_TAG_AGE_MS).commit()
+                tagged = "  tagged bench_baseline"
+            print(f"  {tbl:26s} OK   {len(files):5d} files  rows={n}{tagged}")
             ok += 1
         except Exception as e:
             print(f"  {tbl:26s} FAIL {str(e)[:120]}")
