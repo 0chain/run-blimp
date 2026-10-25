@@ -221,6 +221,21 @@ def tie_verdict(sql, served, base):
     return True, "only the last tied group (%d rows, key %s) differs" % (len(gb), last)
 
 
+def written_since(fs, path, not_before, slack=2.0):
+    """True when the object at path was written at or after not_before (epoch
+    seconds, with a little clock slack); with no bound, any object counts."""
+    if not not_before:
+        return True
+    try:
+        lm = fs.info(path).get("LastModified")
+    except Exception:
+        return False
+    if lm is None:
+        return False
+    ts = lm.timestamp() if hasattr(lm, "timestamp") else float(lm)
+    return ts >= not_before - slack
+
+
 def url_path(url):
     """The bucket key a result_url's viewer link names (path=...)."""
     return (parse_qs(urlparse(url).query).get("path") or [""])[0]
@@ -231,6 +246,8 @@ def main():
     ap.add_argument("--sql", required=True)
     ap.add_argument("--served", default=""); ap.add_argument("--base", default="")
     ap.add_argument("--served-url", default=""); ap.add_argument("--base-url", default="")
+    ap.add_argument("--not-before", type=float, default=0,
+                    help="epoch seconds the served request was sent: an object older than this is a previous run's")
     a = ap.parse_args()
     fs, served, base = None, a.served, a.base
     if not (served and base):
@@ -245,12 +262,22 @@ def main():
         if not (bucket and sp and bp) or sp == bp:
             print("result parquets not addressable (served=%r base=%r)" % (sp, bp)); sys.exit(1)
         served, base = "%s/%s" % (bucket, sp), "%s/%s" % (bucket, bp)
-        # The gateway uploads the base answer just after it responds.
+        # The gateway uploads both answers just after it responds, in the
+        # background; the keys are reused run to run, so an object that EXISTS
+        # may be the previous run's when this run's upload failed or is late (a
+        # blobber at its write threshold: node 37, 2026-10-25, v_q59_rollup
+        # judged against an older served result and logged MISMATCH).
+        fresh = False
         for _ in range(12):
             fs.invalidate_cache()
             if fs.exists(base) and fs.exists(served):
-                break
+                fresh = all(written_since(fs, p, a.not_before) for p in (served, base))
+                if fresh:
+                    break
             time.sleep(5)
+        if a.not_before and not fresh:
+            print("stale result parquet: an object predates this run (its upload failed or is late) — not compared")
+            sys.exit(2)
     try:
         ok, why = float_verdict(read_raw(served, fs), read_raw(base, fs))
         if not ok:

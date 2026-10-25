@@ -72,8 +72,12 @@ verify_served() { # <name> <label suffix> <printed tag>: the served result vs th
     # tied group differs (verify_ties.py states the rule).
     if [ "$v" = MISMATCH ] && [ -n "$MV_S3_KEY" ] && [ -n "${I_RESURL[$n]:-}" ] && [ -n "${V_RESURL[$n]}" ]; then
       tv=$(MV_BUCKET="$MV_BUCKET" MV_S3_ENDPOINT="$MV_S3_ENDPOINT" MV_S3_KEY="$MV_S3_KEY" MV_S3_SECRET="$MV_S3_SECRET" \
-        "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" 2>&1) \
+        "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" --not-before "${I_T0[$n]:-0}" 2>&1) \
         && { case "${tv##*$'\n'}" in float:*) v="MATCH(float)";; *) v="MATCH(ties)";; esac; V_RESULT[$n]="$v"; }
+      # a result object older than the request is a previous run's (its upload
+      # failed or is late — a blobber at its write threshold): nothing was
+      # compared, so this is not a verdict
+      case "${tv##*$'\n'}" in stale*) v="UNCHECKED"; V_RESULT[$n]="$v";; esac
       echo "   $n: ties: ${tv##*$'\n'}"
     fi
     echo "   $n: verify$3: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
@@ -327,6 +331,7 @@ except Exception: print(-1)' 2>/dev/null)
 
   echo ">> phase 1: serve/author all (evict=${EVICT:-0}; correctness is the author's row-hash, which always runs)"
   for n in $FNAMES; do
+    I_T0[$n]=$(date +%s)
     R=$(run "${SQL[$n]}" "$n:author" 1)
     A_MS[$n]=$(echo "$R" | J author_ms); M_MS[$n]=$(echo "$R" | J materialize_ms)
     V_MS[$n]=$(echo "$R" | J verify_ms)
@@ -501,6 +506,7 @@ except Exception: print(-1)' 2>/dev/null)
   echo ">> phase 3: re-run all (incremental)"
   for n in $FNAMES; do
     _p3=$(date +%s.%N)
+    I_T0[$n]=$(date +%s)
     R=$(run "${SQL[$n]}" "$n:incr"); I_QMS[$n]=$(echo "$R" | J query_ms)
     _p3r=$(date +%s.%N)
     # Lazy CDC model: snapshot_changed only MARKS the MV stale; the delta-merge

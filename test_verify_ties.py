@@ -15,5 +15,27 @@ class ResolveOrderBy(unittest.TestCase):
         self.assertIsNone(v.resolve(["s DESC", "c"], ["x", "s"], sql))
 
 
+class _FakeFS:
+    def __init__(self, lm):
+        self.lm = lm
+
+    def info(self, path):
+        return {"LastModified": self.lm}
+
+
+class WrittenSince(unittest.TestCase):
+    def test_written_since_rejects_a_previous_runs_object(self):
+        import datetime
+        t = datetime.datetime(2026, 10, 25, 10, 45, 0, tzinfo=datetime.timezone.utc)
+        sent = t.timestamp()
+        # written after the request: fresh
+        assert v.written_since(_FakeFS(t + datetime.timedelta(seconds=20)), "b/k", sent)
+        # the previous run's object (minutes older): stale (node 37, v_q59_rollup)
+        assert not v.written_since(_FakeFS(t - datetime.timedelta(minutes=5)), "b/k", sent)
+        # no bound given: any object counts (old callers)
+        assert v.written_since(_FakeFS(t - datetime.timedelta(days=1)), "b/k", 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
