@@ -1576,6 +1576,22 @@ def demanded_nulls(columns, n):
     return out
 
 
+# METADATA RETENTION. Every add_files commit writes a new metadata.json, and with
+# Iceberg's defaults the files that fall off the metadata log are never deleted:
+# a long bench keeps a full copy of each table's metadata per tick (node 37,
+# 2026-10-25: ~8,700 versions per fact table, ~33 GB of a 46 GB warehouse). Set
+# once per table; the committer then deletes what falls off the log.
+RETAIN_PROPS = {"write.metadata.delete-after-commit.enabled": "true",
+                "write.metadata.previous-versions-max": os.environ.get("CDC_METADATA_VERSIONS", "20")}
+
+
+def _retain_metadata(t):
+    if all(t.properties.get(k) == v for k, v in RETAIN_PROPS.items()):
+        return
+    with t.transaction() as tx:
+        tx.set_properties(RETAIN_PROPS)
+
+
 def _write_and_add(fs, t, data, n, label, strict=True, allow_nulls=None):
     """Conform, write the delta parquet ourselves, and add_files it.
     allow_nulls: {column: count} of NULLs an owning query's IS NULL demands."""
@@ -1642,6 +1658,7 @@ def _write_and_add(fs, t, data, n, label, strict=True, allow_nulls=None):
         pq.write_table(data, f, store_decimal_as_integer=True,
                        write_statistics=stat_cols)
     _step("write_parquet", _t0); _t0 = _t.time()
+    _retain_metadata(t)
     # The key is seed-<uuid4>.parquet, written just above: it cannot already be
     # in the table. pyiceberg's duplicate check reads EVERY manifest of the
     # table to prove that, once per table per tick — O(ticks) and growing.
