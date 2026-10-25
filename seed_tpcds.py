@@ -1019,8 +1019,13 @@ def client_s3_props(s3_endpoint="", region="", key="", secret=""):
     variables blimp and bench_cdc.sh hand every tool). Path-style only for
     non-AWS endpoints (MinIO needs it; forcing it on real AWS would regress newer
     buckets — S3_ENDPOINT is commonly the AWS regional URL)."""
-    key = key or os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret = secret or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    token = ""
+    if not key:
+        # Keys from the environment may be temporary (SSO, an assumed role:
+        # ASIA… keys) and are useless without their session token.
+        key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+        secret = secret or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        token = os.environ.get("AWS_SESSION_TOKEN", "")
     p = {}
     if region:
         p["s3.region"] = region
@@ -1031,6 +1036,8 @@ def client_s3_props(s3_endpoint="", region="", key="", secret=""):
     if key:
         p["s3.access-key-id"] = key
         p["s3.secret-access-key"] = secret
+        if token:
+            p["s3.session-token"] = token
     return p
 
 
@@ -1056,7 +1063,12 @@ def load_rest_catalog(name, uri, warehouse="", *, s3_endpoint="", region="", key
     def _pinned(props):
         out = {**props, **pin}
         if own_keys:
-            out.pop("s3.session-token", None)  # a vended token belongs to the vended keys
+            # a vended token belongs to the vended keys; the client's own token
+            # (if any) is pinned again below
+            out.pop("s3.session-token", None)
+            out.pop("client.session-token", None)
+            if "s3.session-token" in pin:
+                out["s3.session-token"] = pin["s3.session-token"]
         return out
 
     class _ClientS3Catalog(RestCatalog):

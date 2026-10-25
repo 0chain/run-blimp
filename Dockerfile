@@ -35,7 +35,7 @@ RUN set -eux; \
     rm -rf /tmp/aws /tmp/awscli.zip /tmp/duckdb.zip /var/lib/apt/lists/*
 
 # --- python deps: Iceberg + Arrow + S3 + boto3 (register / seed / CDC)
-RUN pip install --no-cache-dir "pyiceberg[s3fs]" pyarrow boto3 duckdb
+RUN pip install --no-cache-dir "pyiceberg[s3fs]==0.11.0" pyarrow boto3 duckdb
 
 # --- the kit
 WORKDIR /kit

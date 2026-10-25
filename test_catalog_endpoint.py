@@ -107,6 +107,26 @@ class TestClientEndpointWins(unittest.TestCase):
                 else:
                     os.environ[k] = v
 
+    def test_env_temporary_keys_keep_their_session_token(self):
+        # SSO / assumed-role keys (ASIA…) need AWS_SESSION_TOKEN; dropping it
+        # (with the vended token) made S3 reject every request (review of f4139ba).
+        import os
+        names = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
+        old = {k: os.environ.get(k) for k in names}
+        os.environ.update(AWS_ACCESS_KEY_ID="ASIATEMP", AWS_SECRET_ACCESS_KEY="S", AWS_SESSION_TOKEN="TOK")
+        try:
+            cat = S.load_rest_catalog("kit", self.uri, s3_endpoint=CLIENT)
+            for props in (cat.properties, cat.load_table("ns.date_dim").io.properties,
+                          cat._load_file_io({"s3.session-token": "VENDED", "client.session-token": "VENDED"}).properties):
+                self.assertEqual(props.get("s3.session-token"), "TOK")
+                self.assertNotEqual(props.get("client.session-token"), "VENDED")
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_no_client_endpoint_keeps_the_catalogs(self):
         # Nothing to pin (AWS via IAM, no env keys): the catalog's value stands.
         import os
