@@ -138,5 +138,112 @@ class TestClientEndpointWins(unittest.TestCase):
             os.environ.update({k: v for k, v in old.items() if v is not None})
 
 
+# --- query_pools: the key-pool builder's DuckDB ATTACH --------------------
+# DuckDB's iceberg extension defaults to vended credentials and builds the
+# table's S3 secret from the loadTable config — endpoint included — so every
+# dim lookup went to minioserver:9000 ("pools: skip item ... Could not resolve
+# hostname", then "q3: NO usable pool", uniform tick draws).
+SNAP_META = dict(METADATA, **{
+    "current-snapshot-id": 1, "refs": {"main": {"snapshot-id": 1, "type": "branch"}},
+    "snapshots": [{"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 0, "schema-id": 0,
+                   "manifest-list": "s3://tpcds-mv/tpcds_clean/date_dim/metadata/snap-1.avro",
+                   "summary": {"operation": "append"}}]})
+
+
+class FakeRestAndS3(BaseHTTPRequestHandler):
+    """Catalog AND the client's S3 endpoint on one port; records every GET."""
+    seen = []
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, body):
+        FakeRest._json(self, body)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        FakeRestAndS3.seen.append(self.path)
+        p = self.path
+        if p.startswith("/v1/config"):
+            return self._json({"defaults": {}, "overrides": {"s3.endpoint": ADVERTISED, "prefix": "main"}})
+        if p.startswith("/v1/") and "/tables/" in p:
+            return self._json({
+                "metadata-location": "s3://tpcds-mv/tpcds_clean/date_dim/metadata/00000.metadata.json",
+                "metadata": SNAP_META, "config": {
+                    "s3.endpoint": ADVERTISED, "s3.access-key-id": "SERVERKEY",
+                    "s3.secret-access-key": "SERVERSECRET", "s3.session-token": "SERVERTOKEN"}})
+        if p.startswith("/v1/") and "/namespaces" in p:
+            return self._json({"namespace": ["ns"], "properties": {}})
+        self.send_response(404)
+        self.end_headers()
+
+
+def _pool_args(**kw):
+    import types
+    a = dict(s3_endpoint=CLIENT, s3_key="CLIENTKEY", s3_secret="CLIENTSECRET",
+             s3_region="us-east-1", catalog="http://127.0.0.1:8181", warehouse="tpcds-mv")
+    a.update(kw)
+    return types.SimpleNamespace(**a)
+
+
+class TestPoolBuilderUsesClientEndpoint(unittest.TestCase):
+    def test_attach_sql_pins_the_client_secret_and_no_vended_credentials(self):
+        import query_pools as QP
+        sec, _, att = QP.duck_source_sql(_pool_args())
+        self.assertIn("ENDPOINT '127.0.0.1:9000'", sec)
+        self.assertIn("KEY_ID 'CLIENTKEY'", sec)
+        self.assertIn("URL_STYLE 'path'", sec)
+        self.assertIn("ACCESS_DELEGATION_MODE 'none'", att)
+
+    def test_env_temporary_keys_keep_their_session_token(self):
+        import os
+        import query_pools as QP
+        names = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
+        old = {k: os.environ.get(k) for k in names}
+        os.environ.update(AWS_ACCESS_KEY_ID="ASIATEMP", AWS_SECRET_ACCESS_KEY="S", AWS_SESSION_TOKEN="TOK")
+        try:
+            sec, _, att = QP.duck_source_sql(_pool_args(s3_endpoint="", s3_key="", s3_secret=""))
+            self.assertIn("SESSION_TOKEN 'TOK'", sec)
+            self.assertIn("ACCESS_DELEGATION_MODE 'none'", att)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_nothing_given_keeps_the_catalogs_vended_credentials(self):
+        import os
+        import query_pools as QP
+        old = {k: os.environ.pop(k, None) for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")}
+        try:
+            sec, _, att = QP.duck_source_sql(_pool_args(s3_endpoint="", s3_key="", s3_secret=""))
+            self.assertIn("credential_chain", sec)
+            self.assertNotIn("ACCESS_DELEGATION_MODE", att)
+        finally:
+            os.environ.update({k: v for k, v in old.items() if v is not None})
+
+    def test_real_duckdb_attach_reads_through_the_client_endpoint(self):
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            self.skipTest("duckdb not installed")
+        import query_pools as QP
+        srv = HTTPServer(("127.0.0.1", 0), FakeRestAndS3)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        uri = "http://127.0.0.1:%d" % srv.server_address[1]
+        FakeRestAndS3.seen = []
+        try:
+            con = QP.duck_connect(_pool_args(s3_endpoint=uri, catalog=uri))
+            with self.assertRaises(Exception) as e:   # the fake S3 404s the manifest list
+                con.execute("SELECT count(*) FROM src.ns.date_dim").fetchall()
+        finally:
+            srv.shutdown()
+        self.assertNotIn("minioserver", str(e.exception))
+        self.assertIn("/tpcds-mv/tpcds_clean/date_dim/metadata/snap-1.avro", FakeRestAndS3.seen)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -486,24 +486,52 @@ def linked_pools(con, ns, sql, dims, limit):
     return out
 
 
+def duck_source_sql(a):
+    """The statements that attach the customer catalog as `src`.
+
+    The S3 secret comes from seed_tpcds.client_s3_props — the same client
+    endpoint/region/keys (and AWS_SESSION_TOKEN for env keys) every pyiceberg
+    path pins. With a client endpoint or keys the ATTACH takes
+    ACCESS_DELEGATION_MODE 'none': in its default (vended credentials) DuckDB
+    builds the table's S3 secret from the loadTable config, endpoint included,
+    so a co-located node (CATALOG_CHOICE=1) read every dim's metadata from the
+    advertised container address http://minioserver:9000 ("Could not resolve
+    hostname", every pool skipped, uniform tick draws). Nothing given -> the
+    credential chain and the catalog's vended credentials stand."""
+    from seed_tpcds import client_s3_props
+    p = client_s3_props(a.s3_endpoint, a.s3_region, a.s3_key, a.s3_secret)
+    if a.s3_endpoint and "s3.access-key-id" not in p:
+        p.update({"s3.access-key-id": "minioadmin", "s3.secret-access-key": "minioadmin"})  # local MinIO
+    lit = lambda v: "'%s'" % str(v).replace("'", "''")
+    own = "s3.endpoint" in p or "s3.access-key-id" in p
+    if own:
+        # AWS S3 without keys reads anonymously and every dim lookup fails,
+        # which leaves the tick with no pools.
+        opts = ["TYPE S3", "REGION " + lit(a.s3_region)]
+        if "s3.access-key-id" in p:
+            opts += ["KEY_ID " + lit(p["s3.access-key-id"]), "SECRET " + lit(p["s3.secret-access-key"])]
+        if "s3.session-token" in p:
+            opts.append("SESSION_TOKEN " + lit(p["s3.session-token"]))
+        if "s3.endpoint" in p:
+            ep = p["s3.endpoint"]
+            opts += ["ENDPOINT " + lit(re.sub(r"^https?://", "", ep)),
+                     "USE_SSL " + ("true" if ep.startswith("https") else "false")]
+        if p.get("s3.path-style-access") == "true":
+            opts.append("URL_STYLE 'path'")
+    else:
+        opts = ["TYPE S3", "PROVIDER credential_chain", "REGION " + lit(a.s3_region)]
+    return ["CREATE OR REPLACE SECRET src (%s)" % ", ".join(opts),
+            "CREATE OR REPLACE SECRET ic (TYPE ICEBERG, ENDPOINT %s, TOKEN '')" % lit(a.catalog),
+            "ATTACH %s AS src (TYPE ICEBERG, SECRET ic%s)"
+            % (lit(a.warehouse), ", ACCESS_DELEGATION_MODE 'none'" if own else "")]
+
+
 def duck_connect(a):
     import duckdb
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs; INSTALL iceberg; LOAD iceberg;")
-    if a.s3_endpoint:
-        ep = re.sub(r"^https?://", "", a.s3_endpoint)
-        ssl = "true" if a.s3_endpoint.startswith("https") else "false"
-        con.execute("CREATE OR REPLACE SECRET src (TYPE S3, KEY_ID '%s', SECRET '%s', ENDPOINT '%s', URL_STYLE 'path', USE_SSL %s)"
-                    % (a.s3_key or "minioadmin", a.s3_secret or "minioadmin", ep, ssl))
-    elif a.s3_key:
-        # AWS S3: without a secret DuckDB reads anonymously and every dim lookup
-        # fails, which leaves the tick with no pools.
-        con.execute("CREATE OR REPLACE SECRET src (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s')"
-                    % (a.s3_key, a.s3_secret, a.s3_region))
-    else:
-        con.execute("CREATE OR REPLACE SECRET src (TYPE S3, PROVIDER credential_chain, REGION '%s')" % a.s3_region)
-    con.execute("CREATE OR REPLACE SECRET ic (TYPE ICEBERG, ENDPOINT '%s', TOKEN '')" % a.catalog)
-    con.execute("ATTACH '%s' AS src (TYPE ICEBERG, SECRET ic)" % a.warehouse)
+    for q in duck_source_sql(a):
+        con.execute(q)
     return con
 
 
@@ -545,8 +573,8 @@ def main():
     # Same credentials the seeder writes with (AWS_* env, set by bench_cdc.sh);
     # minioadmin only as the local-MinIO fallback, the AWS credential chain
     # when no key is set.
-    ap.add_argument("--s3-key", default=os.environ.get("AWS_ACCESS_KEY_ID", ""))
-    ap.add_argument("--s3-secret", default=os.environ.get("AWS_SECRET_ACCESS_KEY", ""))
+    ap.add_argument("--s3-key", default="")     # "" -> client_s3_props reads the env (+ session token)
+    ap.add_argument("--s3-secret", default="")
     ap.add_argument("--s3-region", default=os.environ.get("AWS_REGION") or "us-east-1")
     ap.add_argument("--limit", type=int, default=20000)
     ap.add_argument("--out", required=True)
