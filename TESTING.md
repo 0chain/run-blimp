@@ -7,6 +7,7 @@ before shipping a change to the kit:
 ./test_kit.sh                      # decision logic behind the measurements
 ./test_setup_options.sh            # the --setup A/B/C choices and their guards
 python3 test_seed_tpcds.py         # the CDC delta generator
+~/.blimp_venv/bin/python3 test_catalog_endpoint.py  # client S3 endpoint beats the catalog-advertised one
 ```
 
 Every case in them corresponds to a bug that shipped a *wrong number* rather

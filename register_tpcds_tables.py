@@ -21,8 +21,8 @@ import argparse, sys
 import boto3
 import pyarrow.parquet as pq
 import s3fs
-from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, TableAlreadyExistsError
+from seed_tpcds import load_rest_catalog  # the one client-side catalog loader
 
 
 def bucket_region(bucket):
@@ -91,14 +91,9 @@ def main():
     # another region returns HTTP 301. Customer only sets --s3-endpoint for MinIO.
     s3_endpoint = args.s3_endpoint or f"https://s3.{args.region}.amazonaws.com"
     print(f"  s3 endpoint: {s3_endpoint}  region: {args.region}")
-    props = {"uri": args.catalog, "warehouse": args.warehouse,
-             "s3.region": args.region, "s3.endpoint": s3_endpoint}
-    if args.prefix:
-        props["prefix"] = args.prefix
-    if args.s3_key:
-        props["s3.access-key-id"] = args.s3_key
-        props["s3.secret-access-key"] = args.s3_secret
-    cat = RestCatalog("zus", **props)
+    cat = load_rest_catalog("zus", args.catalog, args.warehouse, s3_endpoint=s3_endpoint,
+                            region=args.region, key=args.s3_key, secret=args.s3_secret,
+                            prefix=args.prefix)
 
     try:
         cat.create_namespace(args.namespace)

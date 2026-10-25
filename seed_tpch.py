@@ -176,14 +176,9 @@ def main():
     sd.DRY_RUN = a.dry_run
     if not a.s3_endpoint:
         a.s3_endpoint = os.environ.get("S3_ENDPOINT") or os.environ.get("AWS_ENDPOINT_URL") or ""
-    from pyiceberg.catalog.rest import RestCatalog
     import s3fs
-    props = {"s3.region": a.s3_region}
-    if a.s3_endpoint:
-        props["s3.endpoint"] = a.s3_endpoint
-        if "amazonaws.com" not in a.s3_endpoint:
-            props["s3.path-style-access"] = "true"
-    cat = RestCatalog("kit", uri=a.catalog, warehouse=a.warehouse, **props)
+    cat = sd.load_rest_catalog("kit", a.catalog, a.warehouse, s3_endpoint=a.s3_endpoint,
+                               region=a.s3_region)
     fs_kwargs = {"region_name": a.s3_region}
     if a.s3_endpoint:
         fs_kwargs["endpoint_url"] = a.s3_endpoint

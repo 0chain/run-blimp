@@ -1013,6 +1013,66 @@ def parse_ratios(s):
 STEP_T = {}   # step -> seconds, summed over the tick (printed in the tick timing line)
 
 
+def client_s3_props(s3_endpoint="", region="", key="", secret=""):
+    """The S3 FileIO properties THIS host's tools use — the client's own endpoint,
+    region and keys (keys default to AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, the
+    variables blimp and bench_cdc.sh hand every tool). Path-style only for
+    non-AWS endpoints (MinIO needs it; forcing it on real AWS would regress newer
+    buckets — S3_ENDPOINT is commonly the AWS regional URL)."""
+    key = key or os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret = secret or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    p = {}
+    if region:
+        p["s3.region"] = region
+    if s3_endpoint:
+        p["s3.endpoint"] = s3_endpoint
+        if "amazonaws.com" not in s3_endpoint:
+            p["s3.path-style-access"] = "true"
+    if key:
+        p["s3.access-key-id"] = key
+        p["s3.secret-access-key"] = secret
+    return p
+
+
+def load_rest_catalog(name, uri, warehouse="", *, s3_endpoint="", region="", key="",
+                      secret="", prefix=""):
+    """The ONE client-side Iceberg REST catalog loader (register, seeder ticks and
+    their rollback, TPC-H seeder): every FileIO it hands out uses the client's S3
+    endpoint/region/keys, never the ones the catalog advertises.
+
+    The catalog advertises the address IT reaches the warehouse at — on a
+    co-located node (CATALOG_CHOICE=1) the container name http://minioserver:9000,
+    which does not resolve on the host, so add_files and every metadata write
+    failed ("Could not connect to the endpoint URL: http://minioserver:9000/…",
+    0/24 registered). pyiceberg (0.11) lets the SERVER win at two places: the
+    /v1/config `overrides` replace client properties (RestCatalog._fetch_config),
+    and each table's FileIO is built from {catalog props, table metadata
+    properties, loadTable config} with the last two on top (_response_to_table).
+    The client's values are applied after both."""
+    from pyiceberg.catalog.rest import RestCatalog
+    pin = client_s3_props(s3_endpoint, region, key, secret)
+    own_keys = "s3.access-key-id" in pin
+
+    def _pinned(props):
+        out = {**props, **pin}
+        if own_keys:
+            out.pop("s3.session-token", None)  # a vended token belongs to the vended keys
+        return out
+
+    class _ClientS3Catalog(RestCatalog):
+        def _load_file_io(self, properties=None, location=None):
+            return super()._load_file_io(_pinned(properties or {}), location)
+
+    props = {"uri": uri, **pin}
+    if warehouse:
+        props["warehouse"] = warehouse
+    if prefix:
+        props["prefix"] = prefix
+    cat = _ClientS3Catalog(name, **props)
+    cat.properties = _pinned(cat.properties)  # over the server's config overrides
+    return cat
+
+
 def _step(name, t0):
     import time as _t
     STEP_T[name] = STEP_T.get(name, 0.0) + (_t.time() - t0)
@@ -2170,21 +2230,11 @@ def main():
         # env fallback so callers that export AWS_ENDPOINT_URL (bench launchers)
         # get MinIO routing without a CLI change
         a.s3_endpoint=os.environ.get("S3_ENDPOINT") or os.environ.get("AWS_ENDPOINT_URL") or ""
-    from pyiceberg.catalog.rest import RestCatalog
     import s3fs
-    props={"s3.region":a.s3_region}
-    if a.s3_endpoint:
-        # Custom endpoint: point BOTH pyiceberg's file IO and the writer at it
-        # (without this, PyArrow S3 IO resolves bucket names against real AWS ->
-        # ACCESS_DENIED on a local-only bucket).
-        # Same convention as register_tpcds_tables.py: s3.endpoint always; path-
-        # style ONLY for non-AWS endpoints (MinIO needs it; forcing it on real
-        # AWS would regress newer buckets — S3_ENDPOINT is commonly the AWS
-        # regional URL, per standup_data.sh).
-        props["s3.endpoint"]=a.s3_endpoint
-        if "amazonaws.com" not in a.s3_endpoint:
-            props["s3.path-style-access"]="true"
-    cat=RestCatalog("kit",uri=a.catalog,warehouse=a.warehouse,**props)
+    # Custom endpoint: point BOTH pyiceberg's file IO and the writer at it
+    # (without this, PyArrow S3 IO resolves bucket names against real AWS ->
+    # ACCESS_DENIED on a local-only bucket) — and over the catalog-advertised one.
+    cat=load_rest_catalog("kit",a.catalog,a.warehouse,s3_endpoint=a.s3_endpoint,region=a.s3_region)
     try: cat.create_namespace((a.namespace,))
     except Exception: pass
 
