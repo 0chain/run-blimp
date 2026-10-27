@@ -195,9 +195,26 @@ def float_verdict(served, base):
     return False, "float: values differ beyond 1e-9"
 
 
+def unordered_limit(sql):
+    """n of an outermost `LIMIT n` with no outermost ORDER BY, or None."""
+    s = strip_sql(sql).strip().rstrip(";").strip()
+    mask = top_level(s)
+    if any(mask[m.start()] for m in re.finditer(r"\border\s+by\b", s, re.I)):
+        return None
+    m = re.search(r"\blimit\s+(\d+)\s*$", s, re.I)
+    if not m or not all(mask[m.start():]):
+        return None
+    return int(m.group(1))
+
+
 def tie_verdict(sql, served, base):
     """(ok, reason). served/base are (column_names, rows) in result order."""
     ob = order_by_limit(sql)
+    # A LIMIT with no ORDER BY ties every row: the whole result is the last
+    # tied group, so any n rows are an answer (ClickBench q18 `GROUP BY
+    # UserID, SearchPhrase LIMIT 10`, node 144, 2026-10-27).
+    if not ob and unordered_limit(sql) is not None:
+        ob = ([], unordered_limit(sql))
     if not ob:
         return False, "no ORDER BY ... LIMIT on the outermost statement"
     items, n = ob
