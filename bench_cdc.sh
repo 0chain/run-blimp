@@ -71,14 +71,33 @@ verify_served() { # <name> <label suffix> <printed tag>: the served result vs th
     # two persisted result parquets; MATCH(ties) only when nothing but that last
     # tied group differs (verify_ties.py states the rule).
     if [ "$v" = MISMATCH ] && [ -n "$MV_S3_KEY" ] && [ -n "${I_RESURL[$n]:-}" ] && [ -n "${V_RESURL[$n]}" ]; then
+      local mf; mf=$(mktemp)
       tv=$(MV_BUCKET="$MV_BUCKET" MV_S3_ENDPOINT="$MV_S3_ENDPOINT" MV_S3_KEY="$MV_S3_KEY" MV_S3_SECRET="$MV_S3_SECRET" \
-        "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" --not-before "${I_T0[$n]:-0}" 2>&1) \
+        "$PY3" "$HERE/verify_ties.py" --sql "${SQL[$n]}" --served-url "${I_RESURL[$n]}" --base-url "${V_RESURL[$n]}" --not-before "${I_T0[$n]:-0}" --membership-out "$mf" 2>&1) \
         && { case "${tv##*$'\n'}" in float:*) v="MATCH(float)";; *) v="MATCH(ties)";; esac; V_RESULT[$n]="$v"; }
+      # A TIE IS ACCEPTED ON THE ORDER BY KEYS: each served row must also be a
+      # row of the whole answer (the query without its LIMIT/OFFSET) — the
+      # statement verify_ties wrote returns one row per served row it finds.
+      if [ "$v" = "MATCH(ties)" ] && [ -s "$mf" ]; then
+        local want msql mr mrows
+        want=$(head -1 "$mf"); msql=$(tail -n +2 "$mf")
+        mr=$(curl -s -m "${VERIFY_CAP_S:-3600}" "$QAPI/admin/query/run" -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(python3 -c 'import json,sys;print(json.dumps({"original_sql":sys.argv[1],"source":sys.argv[2],"label":sys.argv[3],"no_mv":True}))' "$msql" "$SOURCE" "$n:verify-member")")
+        mrows=$(echo "$mr" | J rows)
+        if [ "$(echo "$mr" | J status)" != ok ] || [ "$mrows" != "$want" ]; then
+          v="MISMATCH"; V_RESULT[$n]="$v"
+          tv="${tv}"$'\n'"membership: ${mrows:-?} of $want served row(s) are rows of the whole answer (status=$(echo "$mr" | J status))"
+        else
+          tv="${tv}"$'\n'"membership: all $want served row(s) are rows of the whole answer"
+        fi
+      fi
+      rm -f "$mf"
       # a result object older than the request is a previous run's (its upload
       # failed or is late — a blobber at its write threshold): nothing was
       # compared, so this is not a verdict
       case "${tv##*$'\n'}" in stale*) v="UNCHECKED"; V_RESULT[$n]="$v";; esac
-      echo "   $n: ties: ${tv##*$'\n'}"
+      echo "   $n: ties: $(printf '%s' "$tv" | tail -2 | tr '\n' ' ')"
     fi
     echo "   $n: verify$3: $v tick(status=${I_STATUS[$n]:-?} rows=${I_ROWS[$n]:-?} md5=${tmd5:-none}) original(status=${bst:-?} rows=${brows:-?} md5=${bmd5:-none})"
 }

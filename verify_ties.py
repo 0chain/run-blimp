@@ -195,6 +195,90 @@ def float_verdict(served, base):
     return False, "float: values differ beyond 1e-9"
 
 
+def strip_tail(sql):
+    """The outermost statement without its trailing [ORDER BY …] LIMIT n
+    [OFFSET k] — the whole relation the page was cut from."""
+    orig = sql.strip().rstrip(";").rstrip()
+    s = blank_sql(orig)  # same length: positions found in s cut orig
+    mask = top_level(s)
+    m = re.search(r"\blimit\s+\d+(?:\s+offset\s+\d+)?\s*;?\s*$", s, re.I)
+    if not m or not all(mask[m.start():]):
+        return None
+    cut = m.start()
+    obs = [x for x in re.finditer(r"\border\s+by\b", s, re.I) if mask[x.start()] and x.start() < cut]
+    if obs:
+        cut = obs[-1].start()
+    return orig[:cut].strip()
+
+
+def blank_sql(sql):
+    """strip_sql's scan, LENGTH-PRESERVING: comment and literal characters
+    become spaces (a literal keeps its quotes), so an offset found in the
+    result cuts the original text."""
+    out, i = list(sql), 0
+    while i < len(sql):
+        if sql.startswith("--", i):
+            j = sql.find("\n", i); j = len(sql) if j < 0 else j
+            out[i:j] = " " * (j - i); i = j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2); j = len(sql) if j < 0 else j + 2
+            out[i:j] = " " * (j - i); i = j
+        elif sql[i] == "'":
+            j = i + 1
+            while j < len(sql) and not (sql[j] == "'" and not sql.startswith("''", j)):
+                j += 2 if sql.startswith("''", j) else 1
+            out[i + 1:j] = " " * (j - i - 1); i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def sql_literal(v):
+    import datetime, decimal
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, (int, decimal.Decimal)):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, datetime.datetime):
+        return "TIMESTAMP '%s'" % v.isoformat(sep=" ")
+    if isinstance(v, datetime.date):
+        return "DATE '%s'" % v.isoformat()
+    if isinstance(v, bytes):
+        v = v.decode("utf-8", "replace")
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def membership_sql(sql, served_raw):
+    """A statement whose row count is the number of DISTINCT served rows the
+    whole relation holds at least as often as they were served (the query without its LIMIT/OFFSET): the tie rules accept
+    boundary rows on their ORDER BY keys alone, so each served row must also
+    be proven a row of the answer (reviewer, 2026-10-27). Floats compare to a
+    relative 1e-9. None when the query has no LIMIT tail."""
+    whole = strip_tail(sql)
+    cols, rows = served_raw
+    if whole is None or not rows:
+        return None
+    k = len(cols)
+    qc = ", ".join("c%d" % i for i in range(k))
+    # A row served twice must be a row the answer holds twice (reviewer,
+    # 2026-10-27: a double-applied Δ row passed a per-row existence check):
+    # one VALUES row per distinct served row with its multiplicity.
+    need = Counter(rows)
+    distinct = list(need)
+    vals = ", ".join("(%d, %d, %s)" % (j, need[r], ", ".join(sql_literal(v) for v in r)) for j, r in enumerate(distinct))
+    on = []
+    for i in range(k):
+        if any(isinstance(r[i], float) for r in rows):
+            on.append("(q.c%d IS NULL AND v.c%d IS NULL OR abs(q.c%d - v.c%d) <= 1e-9 * greatest(1, abs(v.c%d)))" % (i, i, i, i, i))
+        else:
+            on.append("q.c%d IS NOT DISTINCT FROM v.c%d" % (i, i))
+    return "SELECT v.rid FROM (%s) q(%s) JOIN (VALUES %s) v(rid, need, %s) ON %s GROUP BY v.rid, v.need HAVING count(*) >= v.need" % (whole, qc, vals, qc, " AND ".join(on))
+
+
 def has_offset(sql):
     """The outermost statement ends in LIMIT n OFFSET k."""
     s = strip_sql(sql).strip().rstrip(";").strip()
@@ -287,6 +371,8 @@ def main():
     ap.add_argument("--sql", required=True)
     ap.add_argument("--served", default=""); ap.add_argument("--base", default="")
     ap.add_argument("--served-url", default=""); ap.add_argument("--base-url", default="")
+    ap.add_argument("--membership-out", default="",
+                    help="on a tie verdict, write '<served rows>\\n<statement>' here: the bench runs the statement over base and needs that many rows back")
     ap.add_argument("--not-before", type=float, default=0,
                     help="epoch seconds the served request was sent: an object older than this is a previous run's")
     a = ap.parse_args()
@@ -323,6 +409,12 @@ def main():
         ok, why = float_verdict(read_raw(served, fs), read_raw(base, fs))
         if not ok:
             ok, why = tie_verdict(a.sql, read_rows(served, fs), read_rows(base, fs))
+            if ok and a.membership_out:
+                raw = read_raw(served, fs)
+                m = membership_sql(a.sql, raw)
+                if m:
+                    with open(a.membership_out, "w") as f:
+                        f.write("%d\n%s\n" % (len(set(raw[1])), m))
     except Exception as e:
         ok, why = False, "unreadable result parquet: %s" % e
     print(why)
