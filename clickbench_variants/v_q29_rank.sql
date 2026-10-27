@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY l DESC) AS rnk FROM (SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000) g) ranked WHERE rnk <= 10 ORDER BY rnk;

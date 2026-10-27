@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY c DESC) AS rnk FROM (SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID) g) ranked WHERE rnk <= 10 ORDER BY rnk;

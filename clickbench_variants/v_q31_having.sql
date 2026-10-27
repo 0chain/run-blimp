@@ -1,0 +1,1 @@
+SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP HAVING COUNT(*) > 10 ORDER BY c DESC LIMIT 10;

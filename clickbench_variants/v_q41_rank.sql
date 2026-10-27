@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY PageViews DESC) AS rnk FROM (SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate) g) ranked WHERE rnk <= 10 ORDER BY rnk;

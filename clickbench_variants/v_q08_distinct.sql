@@ -1,0 +1,1 @@
+SELECT AdvEngineID, COUNT(*), COUNT(DISTINCT UserID) AS users FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC;

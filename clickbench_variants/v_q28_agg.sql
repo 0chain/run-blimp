@@ -1,0 +1,1 @@
+SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c, SUM(ResolutionWidth) AS sum_rw FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;

@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY c DESC) AS rnk FROM (SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3) g) ranked WHERE rnk <= 10 ORDER BY rnk;

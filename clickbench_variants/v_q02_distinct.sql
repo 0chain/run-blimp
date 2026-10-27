@@ -1,0 +1,1 @@
+SELECT COUNT(*), COUNT(DISTINCT UserID) AS users FROM hits WHERE AdvEngineID <> 0;

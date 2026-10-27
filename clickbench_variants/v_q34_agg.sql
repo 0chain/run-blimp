@@ -1,0 +1,1 @@
+SELECT URL, COUNT(*) AS c, SUM(ResolutionWidth) AS sum_rw FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10;

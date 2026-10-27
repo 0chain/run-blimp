@@ -1,0 +1,1 @@
+SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase HAVING COUNT(*) > 10 ORDER BY COUNT(*) DESC LIMIT 10;

@@ -1,0 +1,1 @@
+SELECT UserID, COUNT(*), SUM(ResolutionWidth) AS sum_rw FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10;

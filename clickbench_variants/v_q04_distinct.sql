@@ -1,0 +1,1 @@
+SELECT AVG(UserID), COUNT(DISTINCT UserID) AS users FROM hits;

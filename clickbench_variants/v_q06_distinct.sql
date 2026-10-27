@@ -1,0 +1,1 @@
+SELECT COUNT(DISTINCT SearchPhrase), COUNT(DISTINCT UserID) AS users FROM hits;

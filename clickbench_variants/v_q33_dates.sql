@@ -1,0 +1,1 @@
+SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE EventDate >= DATE '2013-07-10' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;

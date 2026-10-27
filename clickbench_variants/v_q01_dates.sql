@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE EventDate >= DATE '2013-07-10';

@@ -1,0 +1,1 @@
+SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID HAVING COUNT(*) > 10 ORDER BY c DESC LIMIT 10;

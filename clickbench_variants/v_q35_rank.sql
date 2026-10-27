@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY c DESC) AS rnk FROM (SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL) g) ranked WHERE rnk <= 10 ORDER BY rnk;

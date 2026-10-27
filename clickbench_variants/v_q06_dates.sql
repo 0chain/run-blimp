@@ -1,0 +1,1 @@
+SELECT COUNT(DISTINCT SearchPhrase) FROM hits WHERE EventDate >= DATE '2013-07-10';

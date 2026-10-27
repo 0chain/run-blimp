@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY u DESC) AS rnk FROM (SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID) g) ranked WHERE rnk <= 10 ORDER BY rnk;
