@@ -1,0 +1,11 @@
+-- Nexmark q15 (bidding statistics report): per day, bids / bidders / auctions by price band
+SELECT CAST(dateTime AS DATE) AS day, count(*) AS total_bids,
+  count(*) FILTER (WHERE price < 10000) AS rank1_bids, count(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids,
+  count(*) FILTER (WHERE price >= 1000000) AS rank3_bids,
+  count(DISTINCT bidder) AS total_bidders, count(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders,
+  count(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders,
+  count(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders,
+  count(DISTINCT auction) AS total_auctions, count(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions,
+  count(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions,
+  count(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions
+FROM bid GROUP BY day ORDER BY day;

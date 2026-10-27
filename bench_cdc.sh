@@ -451,12 +451,24 @@ except Exception: print(-1)' 2>/dev/null)
     SEEDER=seed_tpcds.py; SEED_EXTRA=
     if [ "$("$PY3" "$HERE/query_tables.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" ${ICEBERG_PREFIX:+--prefix "$ICEBERG_PREFIX"} \
           --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" --namespace-has lineitem 2>/dev/null)" = yes ]; then SEEDER=seed_tpch.py; fi
-    # A ClickBench namespace (the catalog holds hits) appends held-out hits rows.
+    # A namespace loaded with held-out files (ClickBench, Nexmark: no TPC-DS
+    # fact in it) appends held-out rows from HOLDOUT_ROOT (or the older
+    # CLICKBENCH_HOLDOUT) to the namespace's tables that have <table>_holdout/
+    # there. The namespace still decides: a TPC-DS namespace keeps seed_tpcds.py
+    # whatever the env says, and a namespace no seeder fits is FATAL — the
+    # TPC-DS seeder would write store_sales into it and every tick would merge
+    # 0 rows (the f3c0e5f class).
+    HOLDOUT="${HOLDOUT_ROOT:-${CLICKBENCH_HOLDOUT:-}}"
     if [ "$SEEDER" = seed_tpcds.py ] && [ "$("$PY3" "$HERE/query_tables.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" ${ICEBERG_PREFIX:+--prefix "$ICEBERG_PREFIX"} \
-          --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" --namespace-has hits 2>/dev/null)" = yes ]; then
-      SEEDER=seed_clickbench.py
-      SEED_EXTRA="${CLICKBENCH_HOLDOUT:+--holdout $CLICKBENCH_HOLDOUT}"
-      echo "   seeder: seed_clickbench.py (ClickBench namespace; held-out rows from ${CLICKBENCH_HOLDOUT:-<unset>})"
+          --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" --namespace-has store_sales 2>/dev/null)" != yes ]; then
+      if [ -z "$HOLDOUT" ]; then
+        echo "FATAL: namespace $NAMESPACE holds neither store_sales nor lineitem and no HOLDOUT_ROOT names its held-out files — no seeder fits"; exit 1
+      fi
+      SEEDER=seed_holdout.py
+      SEED_EXTRA="--holdout $HOLDOUT"
+      echo "   seeder: seed_holdout.py (held-out rows from $HOLDOUT)"
+    elif [ "$SEEDER" = seed_tpcds.py ] && [ -n "$HOLDOUT" ]; then
+      echo "   seeder: seed_tpcds.py (TPC-DS namespace; HOLDOUT_ROOT=$HOLDOUT ignored)"
     fi
     if [ "$SEEDER" = seed_tpch.py ]; then
       # The TPC-DS extras list names TPC-DS tables; the TPC-H seeder takes the

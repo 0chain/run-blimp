@@ -1,21 +1,61 @@
 #!/usr/bin/env python3
-"""One CDC tick for a ClickBench namespace: append hits rows held out of the base.
+"""One CDC tick for a namespace loaded with held-out files (ClickBench, Nexmark).
 
-The base table `hits` is registered from the first files of the ClickBench
-dataset (tools/clickbench_load.py); the rest are kept under hits_holdout/ in the
-same bucket, already converted to the table's types. A tick appends --rows rows
-taken from a random held-out file at a random offset: real ClickBench rows, so
-every query's filters (CounterID = 62, the July 2013 dates, non-empty
-SearchPhrase, …) see appended rows in the same proportions as the base.
+A loader (tools/clickbench_load.sh, tools/nexmark_load.sh) registers each
+table from most of its files and keeps the rest under <root>/<table>_holdout/
+in the same bucket, already in the table's types. A tick appends --rows rows in
+all, split across the namespace's tables that have a holdout in proportion to
+their held-out row counts (Nexmark's person:auction:bid stays ~1:3:46). Each
+table's slice is CONTIGUOUS: it starts where the table's appends so far end
+(its current rows minus its bench_baseline tag's rows, both from the catalog),
+over the held-out files in name order, written in event order by the loader.
+So every table advances through the same stretch of later events: appended
+bids name the auctions and persons appended with them, and no row is appended
+twice. A rollback to bench_baseline starts the stream over.
 
 Catalog/write plumbing is seed_tpcds.py's (load_rest_catalog, _write_and_add).
-bench_cdc.sh calls this instead of seed_tpcds.py when the namespace holds a
-hits table; TPC-DS-only options it passes are accepted and ignored.
+bench_cdc.sh calls this for a namespace that holds neither store_sales nor
+lineitem (HOLDOUT_ROOT, or the older CLICKBENCH_HOLDOUT, names the held-out
+files); TPC-DS-only options it passes are accepted and ignored.
 """
-import argparse, os, random, sys, time
+import argparse, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import seed_tpcds as sd  # noqa: E402
+
+
+def _rows_of(t, ref=None):
+    snap = t.snapshot_by_name(ref) if ref else t.current_snapshot()
+    if snap is None or snap.summary is None:
+        return None
+    v = snap.summary.get("total-records")
+    return int(v) if v is not None else None
+
+
+def _contiguous(fs, pq, files, start, rows):
+    """rows rows of the held-out files (name order) from row start on."""
+    import pyarrow as pa
+    out, pos = [], 0
+    for f in files:
+        pf = pq.ParquetFile(fs.open(f, "rb"))
+        n = pf.metadata.num_rows
+        if pos + n <= start:
+            pos += n
+            continue
+        lo = max(0, start - pos)
+        take = min(n - lo, rows - sum(x.num_rows for x in out))
+        gstart, groups = 0, []
+        for g in range(pf.metadata.num_row_groups):
+            gn = pf.metadata.row_group(g).num_rows
+            if gstart + gn > lo and gstart < lo + take:
+                groups.append(g)
+            gstart += gn
+        first = sum(pf.metadata.row_group(g).num_rows for g in range(groups[0]))
+        out.append(pf.read_row_groups(groups).slice(lo - first, take))
+        pos += n
+        if sum(x.num_rows for x in out) >= rows:
+            break
+    return pa.concat_tables(out) if out else None
 
 
 def main():
@@ -23,8 +63,8 @@ def main():
     ap.add_argument("--catalog", required=True); ap.add_argument("--warehouse", required=True)
     ap.add_argument("--namespace", required=True)
     ap.add_argument("--tick", action="store_true")
-    ap.add_argument("--rows", type=int, default=5000, help="hits rows appended per tick")
-    ap.add_argument("--holdout", default="", help="s3://bucket/prefix of the held-out files (default: <table source bucket>/hits_holdout)")
+    ap.add_argument("--rows", type=int, default=5000, help="rows appended per tick, across all held-out tables")
+    ap.add_argument("--holdout", default="", help="s3://bucket[/prefix] holding <table>_holdout/ dirs (or a single <table>_holdout dir)")
     ap.add_argument("--s3-region", default="us-east-1"); ap.add_argument("--s3-endpoint", default="")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
@@ -40,32 +80,56 @@ def main():
     if a.s3_endpoint:
         fs_kwargs["endpoint_url"] = a.s3_endpoint
     fs = s3fs.S3FileSystem(client_kwargs=fs_kwargs)
-    t = cat.load_table((a.namespace, "hits"))
-    holdout = a.holdout or os.environ.get("CLICKBENCH_HOLDOUT", "")
-    if not holdout:
-        raise SystemExit("FATAL: no --holdout / CLICKBENCH_HOLDOUT: where the held-out hits files are")
-    files = sorted(fs.glob(holdout.rstrip("/").replace("s3://", "") + "/*.parquet"))
-    if not files:
-        raise SystemExit(f"FATAL: no held-out parquet under {holdout}")
-    rnd = random.Random(a.seed)
-    f = rnd.choice(files)
-    pf = pq.ParquetFile(fs.open(f, "rb"))
-    n = pf.metadata.num_rows
-    off = rnd.randrange(0, max(1, n - a.rows))
-    # read only the row groups that hold [off, off+rows)
-    rows, start, groups = [], 0, []
-    for g in range(pf.metadata.num_row_groups):
-        gn = pf.metadata.row_group(g).num_rows
-        if start + gn > off and start < off + a.rows:
-            groups.append(g)
-        start += gn
-    data = pf.read_row_groups(groups)
-    first = sum(pf.metadata.row_group(g).num_rows for g in range(groups[0]))
-    data = data.slice(off - first, a.rows)
-    print(f"== ClickBench CDC tick: +{data.num_rows} hits rows from {f.rsplit('/', 1)[-1]} @ {off} ==")
+    root = (a.holdout or os.environ.get("HOLDOUT_ROOT", "") or os.environ.get("CLICKBENCH_HOLDOUT", "")).rstrip("/")
+    if not root:
+        raise SystemExit("FATAL: no --holdout / HOLDOUT_ROOT: where the held-out files are")
+    root = root.replace("s3://", "")
+    if root.endswith("_holdout"):  # the older single-table form: s3://clickbench/hits_holdout
+        root = root.rsplit("/", 1)[0]
+    held = {}
+    for d in fs.ls(root):
+        name = d.rstrip("/").rsplit("/", 1)[-1]
+        if not name.endswith("_holdout"):
+            continue
+        files = sorted(fs.glob(d.rstrip("/") + "/*.parquet"))
+        if files:
+            n = sum(pq.ParquetFile(fs.open(f, "rb")).metadata.num_rows for f in files[:3]) * len(files) / min(3, len(files))
+            held[name[:-len("_holdout")]] = (files, n)
+    if not held:
+        raise SystemExit(f"FATAL: no <table>_holdout/ parquet under s3://{root}")
+    # only the namespace's own tables: a bucket may hold another dataset's
+    # holdouts beside this one's
+    tables = {}
+    for tbl in sorted(held):
+        try:
+            tables[tbl] = cat.load_table((a.namespace, tbl))
+        except Exception:
+            print(f"   {tbl}_holdout/: no {a.namespace}.{tbl} — not this namespace's table, skipped")
+    if not tables:
+        raise SystemExit(f"FATAL: none of the held-out tables ({', '.join(sorted(held))}) is in namespace {a.namespace}")
+    total = sum(held[t][1] for t in tables)
+    print(f"== holdout CDC tick: +{a.rows} rows across {', '.join(sorted(tables))} ==")
     t0 = time.time()
-    sd._write_and_add(fs, t, data, data.num_rows, f"{a.namespace}.hits", strict=False)
+    appended = 0
+    for tbl, t in sorted(tables.items()):
+        files, n = held[tbl]
+        rows = max(1, round(a.rows * n / total))
+        now, base = _rows_of(t), _rows_of(t, "bench_baseline")
+        if now is None or base is None:
+            raise SystemExit(f"FATAL: {a.namespace}.{tbl}: no row count for the current snapshot or the bench_baseline tag — the cursor needs both")
+        start = now - base
+        data = _contiguous(fs, pq, files, start, rows)
+        if data is None or data.num_rows == 0:
+            print(f"   {a.namespace}.{tbl}: held-out rows exhausted at {start} — nothing appended")
+            continue
+        print(f"   {a.namespace}.{tbl}: +{data.num_rows} held-out rows @ {start}")
+        sd._write_and_add(fs, t, data, data.num_rows, f"{a.namespace}.{tbl}", strict=False)
+        appended += data.num_rows
     print(f"   == tick timing: total {time.time() - t0:.1f}s")
+    if appended == 0:
+        # every held-out stream is used up: a tick that appends nothing must
+        # fail, not merge 0 rows and report a fast MATCH
+        raise SystemExit("FATAL: held-out rows exhausted for every table — nothing appended (roll back to bench_baseline to restart the stream)")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+-- Nexmark q22 (get URL directories): the first three path parts of each bid URL
+SELECT auction, bidder, price, channel, split_part(url, '/', 4) AS dir1, split_part(url, '/', 5) AS dir2, split_part(url, '/', 6) AS dir3, dateTime
+FROM bid ORDER BY auction DESC, bidder, price, dateTime LIMIT 100;

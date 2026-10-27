@@ -6,7 +6,7 @@
 # VARCHAR (the files store BINARY), EventDate as DATE (stored as days since
 # 1970), the one unsigned column widened (Iceberg has no unsigned types) — and
 # written to s3://<bucket>/hits/ (the first [base files], default 90: the table)
-# or s3://<bucket>/hits_holdout/ (the rest: what seed_clickbench.py appends one
+# or s3://<bucket>/hits_holdout/ (the rest: what seed_holdout.py appends one
 # slice per tick). The table is then registered from hits/ with
 # register_tpcds_tables.py (add_files, no copy) and tagged bench_baseline.
 set -e
