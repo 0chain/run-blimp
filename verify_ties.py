@@ -74,7 +74,7 @@ def order_by_limit(sql):
     if not hits:
         return None
     tail = s[hits[-1].end():]
-    m = re.search(r"\blimit\s+(\d+)\s*$", tail, re.I)
+    m = re.search(r"\blimit\s+(\d+)(?:\s+offset\s+\d+)?\s*$", tail, re.I)
     if not m or not all(mask[hits[-1].end() + m.start():]):
         return None
     body, tmask = tail[:m.start()], mask[hits[-1].end():hits[-1].end() + m.start()]
@@ -195,6 +195,13 @@ def float_verdict(served, base):
     return False, "float: values differ beyond 1e-9"
 
 
+def has_offset(sql):
+    """The outermost statement ends in LIMIT n OFFSET k."""
+    s = strip_sql(sql).strip().rstrip(";").strip()
+    m = re.search(r"\blimit\s+\d+\s+offset\s+\d+\s*$", s, re.I)
+    return bool(m) and all(top_level(s)[m.start():])
+
+
 def unordered_limit(sql):
     """n of an outermost `LIMIT n` with no outermost ORDER BY, or None."""
     s = strip_sql(sql).strip().rstrip(";").strip()
@@ -227,6 +234,23 @@ def tie_verdict(sql, served, base):
     if not (len(a) == len(b) == n):
         return False, "rows served=%d base=%d limit=%d (no cut at the limit)" % (len(a), len(b), n)
     key = lambda r: tuple(r[k] for k in idx)
+    if has_offset(sql):
+        # A page cut out of the middle can split a tied group at BOTH ends
+        # (ClickBench q39-q42: ranks 990-1020 all PageViews = 2): the first
+        # and the last tied groups may hold different members; the rows
+        # strictly between them must be the same.
+        first, last = key(b[0]), key(b[-1])
+        if key(a[0]) != first or key(a[-1]) != last:
+            return False, "the page's first/last ORDER BY keys differ: served=%s..%s base=%s..%s" % (key(a[0]), key(a[-1]), first, last)
+        if first == last:
+            return True, "the whole page is one tied group (key %s) — any %d of its rows are an answer" % (first, n)
+        inner = lambda rows: Counter(r for r in rows if key(r) not in (first, last))
+        if inner(a) != inner(b):
+            return False, "rows between the page's boundary tied groups differ"
+        for k in (first, last):
+            if sum(1 for r in a if key(r) == k) != sum(1 for r in b if key(r) == k):
+                return False, "a boundary tied group is not the same size in both pages"
+        return True, "only the page's boundary tied groups (keys %s, %s) differ" % (first, last)
     last = key(b[-1])
     if key(a[-1]) != last:
         return False, "the last ORDER BY key differs: served=%s base=%s" % (key(a[-1]), last)
