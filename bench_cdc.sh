@@ -429,9 +429,16 @@ except Exception: print(-1)' 2>/dev/null)
     # the TPC-H namespace and never touched the query's tables — every such
     # tick merged 0 rows and still printed a sub-0.1 s MATCH (node 65,
     # 2026-10-21).
-    SEEDER=seed_tpcds.py
+    SEEDER=seed_tpcds.py; SEED_EXTRA=
     if [ "$("$PY3" "$HERE/query_tables.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" ${ICEBERG_PREFIX:+--prefix "$ICEBERG_PREFIX"} \
           --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" --namespace-has lineitem 2>/dev/null)" = yes ]; then SEEDER=seed_tpch.py; fi
+    # A ClickBench namespace (the catalog holds hits) appends held-out hits rows.
+    if [ "$SEEDER" = seed_tpcds.py ] && [ "$("$PY3" "$HERE/query_tables.py" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" ${ICEBERG_PREFIX:+--prefix "$ICEBERG_PREFIX"} \
+          --warehouse "$WAREHOUSE" --namespace "$NAMESPACE" --namespace-has hits 2>/dev/null)" = yes ]; then
+      SEEDER=seed_clickbench.py
+      SEED_EXTRA="${CLICKBENCH_HOLDOUT:+--holdout $CLICKBENCH_HOLDOUT}"
+      echo "   seeder: seed_clickbench.py (ClickBench namespace; held-out rows from ${CLICKBENCH_HOLDOUT:-<unset>})"
+    fi
     if [ "$SEEDER" = seed_tpch.py ]; then
       # The TPC-DS extras list names TPC-DS tables; the TPC-H seeder takes the
       # tables this run's queries read (part/partsupp are appended from it).
@@ -458,7 +465,7 @@ except Exception: print(-1)' 2>/dev/null)
     fi
     seed_out=$(AWS_ACCESS_KEY_ID="$SEED_CREDS_AK" AWS_SECRET_ACCESS_KEY="$SEED_CREDS_SK" \
       "$PY3" "$HERE/$SEEDER" --catalog "${ICEBERG_URL_LOCAL:-$ICEBERG_URL}" --warehouse "$WAREHOUSE" \
-      --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG \
+      --namespace "$NAMESPACE" --tick --rows "$CDC_ROWS" --s3-region "$REGION" $POOLS_ARG ${SEED_EXTRA:-} \
       ${EXTRA_TABLES:+--extra-tables "$EXTRA_TABLES"} \
       ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} ${CDC_DIM_GROWTH:+--dim-growth "$CDC_DIM_GROWTH"} \
       ${CDC_DIM_RATE:+--dim-rate "$CDC_DIM_RATE"} \
