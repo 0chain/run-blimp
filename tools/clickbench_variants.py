@@ -87,9 +87,37 @@ def render(p):
     return s + ";"
 
 
+# per-table variant columns: a measure to add, a conjunct, a date window and a
+# distinct-count column (--profile picks the set; the first FROM table picks
+# the row). Only these name columns — the rules below are dataset-free.
+PROFILES = {
+    "clickbench": {
+        "hits": dict(measure="SUM(ResolutionWidth) AS sum_rw", case="SUM(CASE WHEN IsRefresh = 0 THEN 1 ELSE 0 END) AS not_refresh",
+                     flag="IsRefresh = 0", flag_re=r"\bIsRefresh\s*=\s*0\b", date="EventDate >= DATE '2013-07-10'",
+                     date_re=r"\bEventDate\s*(>=|>|=|between)", distinct="UserID", distinct_as="users"),
+    },
+    "nexmark": {
+        "bid": dict(measure="SUM(price) AS sum_price", case="SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS big_bids",
+                    flag="price >= 10000", flag_re=r"\bprice\s*>=\s*10000\b", date="dateTime >= TIMESTAMP '2015-07-16 00:00:00'",
+                    date_re=r"\bdateTime\s*(>=|>|=|between)", distinct="bidder"),
+        "auction": dict(measure="SUM(initialBid) AS sum_initial", case="SUM(CASE WHEN reserve > initialBid THEN 1 ELSE 0 END) AS reserved",
+                        flag="category = 10", flag_re=r"\bcategory\s*=\s*10\b", date="dateTime >= TIMESTAMP '2015-07-16 00:00:00'",
+                        date_re=r"\bdateTime\s*(>=|>|=|between)", distinct="seller"),
+        "person": dict(measure="COUNT(emailAddress) AS emails", case="SUM(CASE WHEN state = 'OR' THEN 1 ELSE 0 END) AS in_or",
+                       flag="state <> 'WY'", flag_re=r"\bstate\s*<>\s*'WY'", date="dateTime >= TIMESTAMP '2015-07-16 00:00:00'",
+                       date_re=r"\bdateTime\s*(>=|>|=|between)", distinct="city"),
+    },
+}
+PROFILE = PROFILES["clickbench"]
+
+
 def variants(sql):
     p = parse(sql)
-    if "select" not in p or not p.get("from", "").lower().startswith("hits"):
+    if "select" not in p:
+        return {}
+    first = re.split(r"[\s,]+", p.get("from", "").strip())[0].lower()
+    cfg = PROFILE.get(first)
+    if cfg is None or re.search(r"(?i)\bjoin\b|\(\s*select", p.get("from", "")):
         return {}
     grouped = bool(p.get("group by"))
     grain = split_commas(p["group by"]) if grouped else []
@@ -102,18 +130,18 @@ def variants(sql):
 
     has_agg = bool(re.search(r"(?i)\b(count|sum|avg|min|max)\s*\(", p["select"]))
     if has_agg:
-        v("agg", select=p["select"] + ", SUM(ResolutionWidth) AS sum_rw")
-        v("caseagg", select=p["select"] + ", SUM(CASE WHEN IsRefresh = 0 THEN 1 ELSE 0 END) AS not_refresh")
-        if not re.search(r"(?i)count\s*\(\s*distinct\s+userid", p["select"]):
-            v("distinct", select=p["select"] + ", COUNT(DISTINCT UserID) AS users")
+        v("agg", select=p["select"] + ", " + cfg["measure"])
+        v("caseagg", select=p["select"] + ", " + cfg["case"])
+        if not re.search(r"(?i)count\s*\(\s*distinct\s+" + cfg["distinct"], p["select"]):
+            v("distinct", select=p["select"] + ", COUNT(DISTINCT " + cfg["distinct"] + ") AS " + cfg.get("distinct_as", "n_distinct"))
     where = p.get("where", "")
     # the original WHERE is parenthesized (an OR in it must not bind to the
     # added conjunct), and a conjunct it already implies is not a variant
     w = f"({where}) AND " if where else ""
-    if not re.search(r"(?i)\bIsRefresh\s*=\s*0\b", where):
-        v("filter", where=w + "IsRefresh = 0")
-    if not re.search(r"(?i)\bEventDate\s*(>=|>|=|between)", where):
-        v("dates", where=w + "EventDate >= DATE '2013-07-10'")
+    if not re.search("(?i)" + cfg["flag_re"], where):
+        v("filter", where=w + cfg["flag"])
+    if not re.search("(?i)" + cfg["date_re"], where):
+        v("dates", where=w + cfg["date"])
     if grouped and has_agg:
         hv = p.get("having", "")
         v("having", having=(hv + " AND " if hv else "") + "COUNT(*) > 10")
@@ -142,11 +170,14 @@ def variants(sql):
     return out
 
 
-def validate(sql, files, max_rows, duckdb):
-    view = ("CREATE VIEW hits AS SELECT * REPLACE (DATE '1970-01-01' + CAST(EventDate AS INTEGER) AS EventDate) "
-            f"FROM read_parquet({files!r}, binary_as_string=true);")
+def validate(sql, files, max_rows, duckdb, db=""):
+    if db:  # a DuckDB database holding the profile's tables (Nexmark's generated sample)
+        view = ""
+    else:
+        view = ("CREATE VIEW hits AS SELECT * REPLACE (DATE '1970-01-01' + CAST(EventDate AS INTEGER) AS EventDate) "
+                f"FROM read_parquet({files!r}, binary_as_string=true);")
     q = sql.rstrip(";")
-    r = subprocess.run([duckdb, "-csv", "-noheader", "-c", view + f"SELECT count(*) FROM ({q}) t;"],
+    r = subprocess.run([duckdb] + ([db] if db else []) + ["-csv", "-noheader", "-c", view + f"SELECT count(*) FROM ({q}) t;"],
                        capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         return False, r.stderr.strip().splitlines()[-1][:160] if r.stderr.strip() else "error"
@@ -164,15 +195,20 @@ def main():
     ap.add_argument("--max-rows", type=int, default=200000)
     ap.add_argument("--recheck", default="", help="parquet glob a variant that returned 0 rows on --validate is re-run over (the full base) before it is dropped")
     ap.add_argument("--duckdb", default="duckdb")
+    ap.add_argument("--profile", default="clickbench", choices=sorted(PROFILES))
+    ap.add_argument("--db", default="", help="a DuckDB database with the profile's tables to validate against (instead of --validate files)")
     a = ap.parse_args()
+    global PROFILE
+    PROFILE = PROFILES[a.profile]
     os.makedirs(a.out, exist_ok=True)
     files = sorted(glob.glob(a.validate)) if a.validate else []
+    check = bool(files) or bool(a.db)
     kept = skipped = 0
     for f in sorted(glob.glob(os.path.join(a.queries, "q*.sql"))):
         name = os.path.basename(f)[:-4]
         for kind, sql in sorted(variants(open(f).read()).items()):
-            if files:
-                ok, why = validate(sql, files, a.max_rows, a.duckdb)
+            if check:
+                ok, why = validate(sql, files, a.max_rows, a.duckdb, a.db)
                 if not ok and why == "0 rows" and a.recheck:
                     ok, why = validate(sql, sorted(glob.glob(a.recheck)), a.max_rows, a.duckdb)
                 if not ok:

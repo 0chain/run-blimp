@@ -1,0 +1,1 @@
+SELECT auction, CAST(dateTime AS DATE) AS day, count(*) AS total_bids, count(*) FILTER (WHERE price < 10000) AS rank1_bids, min(price) AS min_price, max(price) AS max_price, avg(price) AS avg_price, sum(price) AS sum_price, SUM(CASE WHEN price >= 1000000 THEN 1 ELSE 0 END) AS big_bids FROM bid GROUP BY auction, day ORDER BY total_bids DESC, auction, day LIMIT 100;

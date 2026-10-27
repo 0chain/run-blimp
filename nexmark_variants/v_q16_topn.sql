@@ -1,0 +1,1 @@
+SELECT channel, CAST(dateTime AS DATE) AS day, count(*) AS total_bids, count(*) FILTER (WHERE price < 10000) AS rank1_bids, count(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, count(*) FILTER (WHERE price >= 1000000) AS rank3_bids, count(DISTINCT bidder) AS total_bidders FROM bid GROUP BY channel, day ORDER BY total_bids DESC, channel, day LIMIT 1000;

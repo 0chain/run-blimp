@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT g.*, RANK() OVER (ORDER BY total_bids DESC) AS rnk FROM (SELECT auction, CAST(dateTime AS DATE) AS day, count(*) AS total_bids, count(*) FILTER (WHERE price < 10000) AS rank1_bids, min(price) AS min_price, max(price) AS max_price, avg(price) AS avg_price, sum(price) AS sum_price FROM bid GROUP BY auction, day) g) ranked WHERE rnk <= 10 ORDER BY rnk;
