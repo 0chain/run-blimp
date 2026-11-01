@@ -500,7 +500,7 @@ except Exception: print(-1)' 2>/dev/null)
       ${EXTRA_TABLES:+--extra-tables "$EXTRA_TABLES"} \
       ${CDC_RATIOS:+--ratios "$CDC_RATIOS"} ${CDC_DIM_GROWTH:+--dim-growth "$CDC_DIM_GROWTH"} \
       ${CDC_DIM_RATE:+--dim-rate "$CDC_DIM_RATE"} \
-      --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" \
+      --returns-ratio "${CDC_RETURNS_RATIO:-0.1}" ${CDC_MUTATION:+--mutation "$CDC_MUTATION"} \
       ${CDC_YEARS:+--years "$CDC_YEARS"} ${CDC_STREAM_DAYS:+--stream-days "$CDC_STREAM_DAYS"} \
       ${S3_ENDPOINT:+--s3-endpoint "$S3_ENDPOINT"} 2>&1); seed_rc=$?
     if [ "$seed_rc" -ne 0 ]; then

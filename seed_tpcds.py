@@ -2174,6 +2174,73 @@ def append_table(cat, fs, namespace, table, n, *, date_lo, date_hi, dim_hi_cache
     dim_hi_cache.pop(table, None)
 
 
+def mutate_fact(cat, a, fact, nkeys):
+    """One tick mutation of `fact` (--mutation): the rows of its newest `nkeys`
+    keys (FACT_KEY_COL above max - nkeys, from manifest bounds) are deleted
+    copy-on-write, replaced with changed values (upsert: one overwrite commit),
+    or deleted merge-on-read through DuckDB's Iceberg writer. Only the newest
+    files hold those keys, so the rewrite stays small at any scale."""
+    col=FACT_KEY_COL.get(fact)
+    if not col:
+        print(f"   {fact}: no key column — {a.mutation} skipped"); return
+    lo,hi=_catalog_bounds(cat,a.namespace,fact,col)
+    if hi is None:
+        print(f"   {fact}: no {col} bounds — {a.mutation} skipped"); return
+    cut=int(hi)-int(nkeys)
+    from pyiceberg.expressions import GreaterThan
+    t=cat.load_table((a.namespace,fact))
+    pred=GreaterThan(col,cut)
+    if a.mutation=="delete":
+        t.delete(pred)
+    elif a.mutation=="upsert":
+        import pyarrow as pa, pyarrow.compute as pc
+        rows=t.scan(row_filter=pred).to_arrow()
+        qty=next((c for c in rows.column_names if c.endswith("_quantity")),None)
+        if qty is not None and rows.num_rows:
+            i=rows.column_names.index(qty)
+            rows=rows.set_column(i,qty,pc.add(rows.column(qty),pa.scalar(1,rows.schema.field(qty).type)))
+        t.overwrite(rows,overwrite_filter=pred)
+    elif a.mutation=="mor_delete":
+        _duckdb_iceberg_delete(a,fact,f"{col} > {cut}")
+    t=cat.load_table((a.namespace,fact))
+    cs=t.current_snapshot()
+    print(f"   {fact}: {a.mutation} {col} > {cut} -> snapshot {cs.snapshot_id if cs else None}")
+
+
+def _duckdb_iceberg_delete(a, fact, where):
+    """DELETE through DuckDB's Iceberg writer (position-delete files), with the
+    same catalog, warehouse and S3 credentials as this seeder. The duckdb CLI
+    on PATH, or the duckdb Python package."""
+    p=client_s3_props(a.s3_endpoint,a.s3_region)
+    ep=a.s3_endpoint or ""
+    host=ep.split("://",1)[-1] if ep else ""
+    ssl="false" if ep.startswith("http://") else "true"
+    sec=[f"TYPE S3", f"KEY_ID '{p.get('s3.access-key-id','')}'", f"SECRET '{p.get('s3.secret-access-key','')}'",
+         f"REGION '{a.s3_region or 'us-east-1'}'"]
+    if host:
+        sec+= [f"ENDPOINT '{host}'", "URL_STYLE 'path'", f"USE_SSL {ssl}"]
+    if p.get("s3.session-token"):
+        sec.append(f"SESSION_TOKEN '{p['s3.session-token']}'")
+    stmts=["INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;",
+           "CREATE SECRET s ("+", ".join(sec)+");",
+           f"ATTACH '{a.warehouse}' AS c (TYPE ICEBERG, ENDPOINT '{a.catalog.rstrip('/')}', AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', READ_ONLY false);",
+           f'DELETE FROM c."{a.namespace}"."{fact}" WHERE {where};']
+    try:
+        import duckdb
+        con=duckdb.connect()
+        for st in stmts: con.execute(st)
+        return
+    except ImportError:
+        pass
+    import subprocess
+    r=subprocess.run(["duckdb"],input="\n".join(stmts),capture_output=True,text=True)
+    if r.returncode!=0:
+        msg=(r.stderr.strip().splitlines() or ["?"])[-1][:300]
+        for v in (p.get("s3.secret-access-key",""),p.get("s3.access-key-id","")):
+            if v: msg=msg.replace(v,"***")
+        raise RuntimeError("merge-on-read delete failed: "+msg)
+
+
 def _slice_col(columns):
     """The column --upsert-store-sk slices on: the fact's own 'channel' key."""
     return next((c for c, _ in columns
@@ -2193,6 +2260,14 @@ def main():
              "data files, so the snapshot has REMOVED files and the MV must be "
              "fully rematerialized.")
     ap.add_argument("--upsert-store-sk",type=int,default=7,help="slice replaced in upsert mode")
+    ap.add_argument("--mutation",choices=["append","delete","upsert","mor_delete"],
+        default=os.environ.get("CDC_MUTATION","append") or "append",
+        help="with --tick: what else the tick does to each sales fact after its append. "
+             "append = nothing (default). delete = copy-on-write DELETE of the newest "
+             "keys (rewrites only the newest files). upsert = those keys' rows replaced "
+             "with changed values in one overwrite commit. mor_delete = the same keys "
+             "deleted by DuckDB's Iceberg writer, which writes position-delete files "
+             "(merge-on-read). Phase 4 (--verify) then checks the answer as for appends.")
     ap.add_argument("--stream-days",type=int,default=int(os.environ.get("CDC_STREAM_DAYS","0") or 0),
         help="REALISTIC-STREAM mode: appended fact rows are dated in the last N days of the "
              "dataset's own 'now' (the sales facts' max sold date from catalog bounds), the "
@@ -2294,7 +2369,7 @@ def main():
     # ---------------- one realistic tick across all six facts ---------------
     if a.tick:
         if a.mode!="append":
-            raise SystemExit("--tick is append-only (upsert rewrites files; use --table)")
+            raise SystemExit("--tick takes --mutation, not --mode (use --mode upsert with --table)")
         plan=plan_tick(a.rows,parse_ratios(a.ratios),a.returns_ratio)
         extras=[x for x in a.extra_tables.replace(","," ").split() if x]
         def extra_rows_for(x):
@@ -2361,6 +2436,13 @@ def main():
             with ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
                 for r in list(ex.map(_fact,plan)):
                     _tt.append(r)
+            # THE TICK'S MUTATION (--mutation): after the appends, inside the
+            # all-or-nothing tick, so a failure rolls it back with them.
+            if a.mutation!="append":
+                for sf,sn,rf,rn in plan:
+                    _t=_time.time()
+                    mutate_fact(cat,a,sf,max(1,sn//20))
+                    _tt.append((sf+":"+a.mutation,_time.time()-_t))
             # WHERE THE TICK'S TIME GOES, per table.
             print("== tick timing: total %.1fs | %s"%(_time.time()-_tt0,
                   ", ".join("%s %.1fs"%(k,v) for k,v in sorted(_tt,key=lambda kv:-kv[1]))))
