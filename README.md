@@ -72,6 +72,7 @@ adds hops and, across providers, egress cost on every read.
 2. Connect to the node once (~10-15 min; asks for the cluster ID and token, saves `~/.blimp_env`): `./blimp --setup`
 3. Run a query (q3 here): `./blimp --query --tpc 3 --tick`
    - `--tick` appends rows and measures how fast the answer updates (delta merge).
+   - `CDC_MUTATION=delete|upsert|mor_delete ./blimp --query --tpc 3 --tick --verify` makes each tick also change the newest rows it appended: a copy-on-write delete, an upsert (rows replaced with changed values in one overwrite commit), or a merge-on-read delete (DuckDB's Iceberg writer, position-delete files). `--verify` checks the answer against the base tables as for appends. The default is `append` (nothing else).
    - `--evict-family` forces a cold author first.
    - `--verify` also checks the tick's answer against the original query over base (MATCH / MISMATCH); it costs one full original-query run.
 4. Several queries: `echo "3 7 19" > list.txt && ./tpc_batch list.txt` — one line per query: `author= verify= tick1= tick2= result= wall=`.
