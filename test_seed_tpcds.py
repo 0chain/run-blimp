@@ -647,6 +647,95 @@ class StringDomainsTest(unittest.TestCase):
         self.assertEqual(out["i_category"][0], "i_category:1")
 
 
+    def test_numeric_and_date_attributes_stay_in_the_live_domain(self):
+        """c_birth_month was randint(1, 1000) on every appended customer row; the
+        gateway's NDV sample read 1095 months (SF1000 q18, node 37, 2026-11-04)."""
+        import datetime
+        from decimal import Decimal
+        cols = [("c_customer_sk", "i"), ("c_birth_month", "i"), ("c_birth_year", "i"),
+                ("c_acct_bal", "d"), ("c_first_seen", "t")]
+        doms = S._domains_restore({"c_birth_month": list(range(1, 13)),
+                                   "c_birth_year": {"lo": 1924, "hi": 1992},
+                                   "c_acct_bal": {"lo": "10.00", "hi": "20.00"},
+                                   "c_first_seen": {"lo": "2000-01-01", "hi": "2000-12-31"}},
+                                  dict(cols))
+        out = S.gen_table_cols("customer", cols, 200, date_lo=1, date_hi=2, dim_hi={}, key_base=1,
+                               rnd=random.Random(1), str_domains=doms)
+        self.assertTrue(set(out["c_birth_month"]) <= set(range(1, 13)))
+        self.assertTrue(all(1924 <= v <= 1992 for v in out["c_birth_year"]))
+        self.assertTrue(all(Decimal("10") <= v <= Decimal("20") for v in out["c_acct_bal"]))
+        self.assertTrue(all(datetime.date(2000, 1, 1) <= v <= datetime.date(2000, 12, 31) for v in out["c_first_seen"]))
+
+
+try:
+    import pyarrow as _pa  # noqa: F401
+    import pyiceberg.io.pyarrow as _pio  # noqa: F401
+    _HAVE_ARROW = True
+except Exception:
+    _HAVE_ARROW = False
+
+
+@unittest.skipUnless(_HAVE_ARROW, "pyarrow + pyiceberg (run in /opt/cdc/venv)")
+class ColumnDomainSampleTest(unittest.TestCase):
+    """load_string_domains samples BASE files: earlier ticks' seed-*.parquet are
+    planned first and would teach the sampler their noise (item.i_class_id max
+    998397440, node 37, 2026-11-04)."""
+
+    def test_domains_from_base_files_only_and_cache_round_trip(self):
+        import datetime, json, os, tempfile, types
+        from decimal import Decimal
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import pyiceberg.io.pyarrow as pio
+        d = tempfile.mkdtemp()
+        n = 1000
+        base = pa.table({"c_birth_month": [1 + i % 12 for i in range(n)],
+                         "c_birth_year": [1924 + i % 900 for i in range(n)],
+                         "c_acct_bal": pa.array([Decimal("10.00") + Decimal(i % 7) for i in range(n)], pa.decimal128(7, 2)),
+                         "c_first_seen": [datetime.date(2000, 1, 1) + datetime.timedelta(days=i % 300) for i in range(n)]})
+        seed = pa.table({"c_birth_month": [999] * 50, "c_birth_year": [99999] * 50,
+                         "c_acct_bal": pa.array([Decimal("99999.00")] * 50, pa.decimal128(7, 2)),
+                         "c_first_seen": [datetime.date(2030, 1, 1)] * 50})
+        pq.write_table(seed, os.path.join(d, "seed-aa.parquet"))
+        pq.write_table(base, os.path.join(d, "base-0.parquet"))
+        task = lambda f: types.SimpleNamespace(file=types.SimpleNamespace(file_path=os.path.join(d, f)))
+
+        class Scan:
+            row_filter = None
+            def plan_files(self):
+                return [task("seed-aa.parquet"), task("base-0.parquet")]  # seeds planned first
+            def projection(self):
+                return None
+
+        class FakeArrowScan:
+            def __init__(self, md, io, schema, row_filter, limit=None):
+                self.limit = limit
+            def to_table(self, tasks):
+                t = pa.concat_tables([pq.read_table(k.file.file_path) for k in tasks])
+                return t.slice(0, self.limit) if self.limit else t
+
+        fake = types.SimpleNamespace(scan=lambda **kw: Scan(), metadata=None, io=None, name=lambda: ("x", "cust_test"))
+        cols = [("c_birth_month", "i"), ("c_birth_year", "i"), ("c_acct_bal", "d"), ("c_first_seen", "t")]
+        prev = pio.ArrowScan
+        pio.ArrowScan = FakeArrowScan
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = d
+        try:
+            out = S.load_string_domains(fake, cols, sample_rows=5000, verbose=False)
+            self.assertEqual(sorted(out["c_birth_month"]), list(range(1, 13)))       # categorical int: a list
+            self.assertEqual(out["c_birth_year"], {"lo": 1924, "hi": 1924 + 899})    # non-categorical: a range
+            self.assertNotIn(99999, [out["c_birth_year"]["hi"]])
+            self.assertEqual(max(out["c_acct_bal"]), Decimal("16.00"))
+            self.assertLess(max(out["c_first_seen"]) if isinstance(out["c_first_seen"], list) else out["c_first_seen"]["hi"],
+                            datetime.date(2030, 1, 1))
+            cached = S.load_string_domains(fake, cols, sample_rows=5000, verbose=False)  # from the JSON cache
+            self.assertEqual(cached, out)
+            self.assertIsInstance(max(cached["c_acct_bal"]), Decimal)
+        finally:
+            pio.ArrowScan = prev
+            if home is not None:
+                os.environ["HOME"] = home
+
 class TestDimBoundsAreScaleFree(unittest.TestCase):
     """The seeder must derive dimension key bounds from the DATA, never from a
     constant measured at one scale factor.

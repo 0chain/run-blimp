@@ -1198,6 +1198,63 @@ def _bounds_after_append(t, data, n):
         pass
 
 
+def _sample_base_rows(t, cols, limit):
+    """Up to `limit` rows of cols from the table's BASE files. Earlier ticks'
+    seed-*.parquet files (_write_and_add's naming) are planned first, and
+    sampling them would learn the noise they carry as the domain (item's
+    i_class_id max 998397440 from old seed rows, node 37, 2026-11-04). Seed
+    files are read only when the table has nothing else."""
+    from pyiceberg.io.pyarrow import ArrowScan
+    scan = t.scan(selected_fields=tuple(cols))
+    tasks = list(scan.plan_files())
+    base = [k for k in tasks if not os.path.basename(k.file.file_path).startswith("seed-")]
+    return ArrowScan(t.metadata, t.io, scan.projection(), scan.row_filter,
+                     limit=limit).to_table(base or tasks)
+
+
+def _range_typed(kind, vals):
+    """A range is drawn by kind (_draw_in_domain): only values of that type
+    get one (_columns_of maps timestamp/double/boolean to "i" too)."""
+    import datetime
+    from decimal import Decimal
+    ok = {"i": int, "l": int, "d": (Decimal, float, int), "t": datetime.date}[kind]
+    return all(isinstance(v, ok) and not isinstance(v, bool) and
+               (kind == "t" or not isinstance(v, datetime.date)) for v in vals)
+
+
+def _domains_restore(out, kinds):
+    """The JSON cache holds decimals and dates as text: back to their types."""
+    import datetime
+    from decimal import Decimal
+
+    def conv(k, v):
+        if isinstance(v, str) and k == "d":
+            return Decimal(v)
+        if isinstance(v, str) and k == "t":
+            return datetime.date.fromisoformat(v[:10])
+        return v
+    res = {}
+    for c, v in out.items():
+        k = kinds.get(c, "s")
+        res[c] = ({"lo": conv(k, v["lo"]), "hi": conv(k, v["hi"])} if isinstance(v, dict)
+                  else [conv(k, x) for x in v])
+    return res
+
+
+def _draw_in_domain(dom, kind, n, rnd):
+    """n values from a load_string_domains entry: a value list, or a range."""
+    import datetime
+    if isinstance(dom, list):
+        return [rnd.choice(dom) for _ in range(n)]
+    lo, hi = dom["lo"], dom["hi"]
+    if kind == "t":
+        span = (hi - lo).days
+        return [lo + datetime.timedelta(days=rnd.randint(0, span)) for _ in range(n)]
+    if kind == "d":
+        return [_q(rnd.uniform(float(lo), float(hi))) for _ in range(n)]
+    return [rnd.randint(int(lo), int(hi)) for _ in range(n)]
+
+
 def _catalog_bounds(cat, namespace, table, col, min_rows=0, snapshot_id=None):
     """(min, max) of `col` read from ICEBERG MANIFEST STATISTICS — no data scan.
 
@@ -1859,7 +1916,15 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
     id-like columns (near-unique in the sample) keep the unique-per-row value.
     Returns {} when the table cannot be sampled."""
     import pyarrow.compute as pc
-    scols = [c for c, k in columns if k == "s"]
+    # NUMERIC AND DATE ATTRIBUTES TOO: an int filled with randint(1, 1000) put
+    # c_birth_month at 1..1000 on every appended customer row; the gateway's
+    # NDV sample then read 1095 months and priced SF1000 q18's customer filter
+    # at 0.5% instead of 46% (one pass -> five; node 37, 2026-11-04). Every
+    # non-key column samples its live domain: categorical ones draw from the
+    # values, the rest uniformly over the live [lo, hi]. Foreign keys and the
+    # table's own key keep their generators.
+    kinds = {c: k for c, k in columns}
+    scols = [c for c, k in columns if k in ("s", "i", "l", "d", "t") and dim_for(c) is None]
     if t is None or not scols:
         return {}
     # CACHED ACROSS TICKS: a categorical domain does not move when the appends
@@ -1878,13 +1943,13 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
                 c = _j.load(f)
             if c.get("cols") == ckey:
                 if verbose and c.get("out"):
-                    print("   string domains (cached): "
+                    print("   column domains (cached): "
                           + ", ".join(f"{k}={len(v)}" for k, v in sorted(c["out"].items())))
-                return c.get("out") or {}
+                return _domains_restore(c.get("out") or {}, kinds)
         except Exception:
             pass
     try:
-        arr = t.scan(selected_fields=tuple(scols), limit=sample_rows).to_arrow()
+        arr = _sample_base_rows(t, scols, sample_rows)
     except Exception as e:
         if verbose:
             print(f"   WARN: string-domain sample unavailable ({e}); appended strings stay unique per row")
@@ -1903,8 +1968,10 @@ def load_string_domains(t, columns, *, sample_rows=50000, max_ratio=0.2, verbose
             continue
         if len(vals) <= max(1, int(n * max_ratio)):
             out[c] = vals
+        elif kinds[c] != "s" and _range_typed(kinds[c], vals):
+            out[c] = {"lo": min(vals), "hi": max(vals)}
     if verbose and out:
-        print("   string domains from the live table (categorical): "
+        print("   column domains from the live table: "
               + ", ".join(f"{c}={len(v)}" for c, v in sorted(out.items())))
     if cpath:
         try:
@@ -1924,7 +1991,7 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
 
       own surrogate key (c_customer_sk on customer) -> key_base+i, never reused
       foreign _sk                                  -> uniform over the catalog range
-      string, categorical (see load_string_domains) -> drawn from the live domain
+      any attribute with a live domain (load_string_domains) -> drawn from it
       string, id-like                               -> '<col>:<key>' (unique per row)
       date / decimal / int / long                  -> in-range noise"""
     import datetime
@@ -1948,9 +2015,8 @@ def gen_table_cols(table, columns, n, *, date_lo, date_hi, dim_hi, key_base, rnd
             out[name] = [rnd.randint(0, hi("time_dim")) for _ in range(n)]
         elif d is not None:
             h = hi(d[0]); out[name] = draw_dim(d[0], n, owners, 1, h, rnd)
-        elif kind == "s" and str_domains and str_domains.get(name):
-            dom = str_domains[name]
-            out[name] = [rnd.choice(dom) for _ in range(n)]
+        elif str_domains and str_domains.get(name):
+            out[name] = _draw_in_domain(str_domains[name], kind, n, rnd)
         elif kind == "s":
             out[name] = [f"{name}:{key_base + i}" for i in range(n)]
         elif kind == "t":
