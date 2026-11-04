@@ -16,6 +16,8 @@ set -uo pipefail
 SF="${BLIMP_SF:-1}"
 # shellcheck source=scratch_dir.sh
 . "$(dirname "${BASH_SOURCE[0]}")/scratch_dir.sh"
+# shellcheck source=s3_check.sh
+. "$(dirname "${BASH_SOURCE[0]}")/s3_check.sh"
 # duckdb's working database plus the parquet output both land locally before the
 # upload. Budget ~2x the scale factor in GB (the .duckdb file and the parquet
 # tree), with a 2 GB floor so SF1 does not demand a whole gigabyte for nothing.
@@ -44,27 +46,32 @@ if ! command -v duckdb >/dev/null; then
 fi
 
 # --- 1. generate SF<N> once (idempotent) into <table>/data.parquet -------------
-# Idempotence is keyed on the FILES, not just the .done marker: a box generated
-# by an older TABLES list carries a stale marker and would silently keep its
-# missing tables forever. Any absent parquet re-runs the generation (COPY TO
-# overwrites, so this is safe and deletes nothing).
-NEED_GEN=0
-[ -f "$OUT/.done" ] || NEED_GEN=1
-for t in $TABLES; do [ -s "$OUT/$t/data.parquet" ] || { NEED_GEN=1; log "missing $t/data.parquet — regenerating SF${SF}"; break; }; done
-if [ "$NEED_GEN" = 1 ]; then
-  log "generating TPC-DS SF${SF} (~$([ "$SF" = 1 ] && echo '1 GB' || echo "${SF}x SF1") — all 24 tables) — one time"
-  mkdir -p "$OUT"; COPIES=""
-  for t in $TABLES; do mkdir -p "$OUT/$t"; COPIES="$COPIES COPY $t TO '$OUT/$t/data.parquet' (FORMAT PARQUET);"; done
-  # temp on-disk db so a small box (4 GiB) doesn't OOM building SF1 in memory
-  rm -f "$SF_SCRATCH/_sf${SF}.duckdb"
-  scratch_report "$SF_SCRATCH"
-  duckdb "$SF_SCRATCH/_sf${SF}.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=${SF}); $COPIES" >&2 \
-    || die "SF${SF} generation failed (duckdb tpcds dsdgen)"
-  rm -f "$SF_SCRATCH/_sf${SF}.duckdb"   # the parquet tree is the artefact; reclaim the working DB
-  # Upgrade hygiene: earlier versions staged the working DB on the boot disk.
-  rm -f "/tmp/_sf${SF}.duckdb"; touch "$OUT/.done"
-  log "generated $(du -sh "$OUT" 2>/dev/null | awk '{print $1}') across 24 tables in $OUT"
-fi
+# A FUNCTION, called only once the target bucket has been proven writable: the
+# customer generated 3.9 GiB for four minutes before learning that their role
+# had no s3:CreateBucket (report 2026-11-03, item 8).
+generate_data(){
+  # Idempotence is keyed on the FILES, not just the .done marker: a box generated
+  # by an older TABLES list carries a stale marker and would silently keep its
+  # missing tables forever. Any absent parquet re-runs the generation (COPY TO
+  # overwrites, so this is safe and deletes nothing).
+  NEED_GEN=0
+  [ -f "$OUT/.done" ] || NEED_GEN=1
+  for t in $TABLES; do [ -s "$OUT/$t/data.parquet" ] || { NEED_GEN=1; log "missing $t/data.parquet — regenerating SF${SF}"; break; }; done
+  if [ "$NEED_GEN" = 1 ]; then
+    log "generating TPC-DS SF${SF} (~$([ "$SF" = 1 ] && echo '1 GB' || echo "${SF}x SF1") — all 24 tables) — one time"
+    mkdir -p "$OUT"; COPIES=""
+    for t in $TABLES; do mkdir -p "$OUT/$t"; COPIES="$COPIES COPY $t TO '$OUT/$t/data.parquet' (FORMAT PARQUET);"; done
+    # temp on-disk db so a small box (4 GiB) doesn't OOM building SF1 in memory
+    rm -f "$SF_SCRATCH/_sf${SF}.duckdb"
+    scratch_report "$SF_SCRATCH"
+    duckdb "$SF_SCRATCH/_sf${SF}.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=${SF}); $COPIES" >&2 \
+      || die "SF${SF} generation failed (duckdb tpcds dsdgen)"
+    rm -f "$SF_SCRATCH/_sf${SF}.duckdb"   # the parquet tree is the artefact; reclaim the working DB
+    # Upgrade hygiene: earlier versions staged the working DB on the boot disk.
+    rm -f "/tmp/_sf${SF}.duckdb"; touch "$OUT/.done"
+    log "generated $(du -sh "$OUT" 2>/dev/null | awk '{print $1}') across 24 tables in $OUT"
+  fi
+}
 
 # --- 2. AWS (region-local S3 bucket) vs no writable S3 (MinIO on this box) ------
 # MinIO IS the customer's S3 when there is no writable bucket: either the host is
@@ -100,10 +107,12 @@ minio_source(){
   for i in $(seq 1 25); do curl -s -m2 -o /dev/null "$lep/minio/health/live" && break; sleep 2; done
   curl -s -m3 -o /dev/null "$lep/minio/health/live" || die "MinIO did not come up on $bind:9000"
   BKT="blimp-sf${SF}"
-  AWS_ACCESS_KEY_ID="$MK" AWS_SECRET_ACCESS_KEY="$MS" AWS_DEFAULT_REGION=us-east-1 \
-    aws --endpoint-url "$lep" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
-  AWS_ACCESS_KEY_ID="$MK" AWS_SECRET_ACCESS_KEY="$MS" AWS_DEFAULT_REGION=us-east-1 \
-    aws --endpoint-url "$lep" s3 sync "$OUT" "s3://$BKT/" --exclude ".done" >&2 \
+  export AWS_ACCESS_KEY_ID="$MK" AWS_SECRET_ACCESS_KEY="$MS" AWS_DEFAULT_REGION=us-east-1
+  aws --endpoint-url "$lep" s3 mb "s3://$BKT" >/dev/null 2>&1 || true
+  local werr; werr=$(s3_write_check "$BKT" --endpoint-url "$lep") \
+    || die "MinIO bucket s3://$BKT on $lep is not writable: $werr"
+  generate_data
+  aws --endpoint-url "$lep" s3 sync "$OUT" "s3://$BKT/" --exclude ".done" >&2 \
     || die "MinIO load failed"
   emit ORIGIN_BUCKET "$BKT"
   emit WAREHOUSE "s3://$BKT/wh"
@@ -132,6 +141,11 @@ fleet_source(){
   export AWS_DEFAULT_REGION="${REGION:-us-east-1}"
   # shellcheck disable=SC2086
   aws --endpoint-url "$ep" $vfy s3 mb "s3://$bkt" >/dev/null 2>&1 || true
+  local werr
+  # shellcheck disable=SC2086
+  werr=$(s3_write_check "$bkt" --endpoint-url "$ep" $vfy) \
+    || die "s3://$bkt on $ep is not writable with the ${BLIMP_DATA_TARGET:-fleet} keys — nothing generated: $werr"
+  generate_data
   # shellcheck disable=SC2086
   aws --endpoint-url "$ep" $vfy s3 sync "$OUT" "s3://$bkt/" --exclude ".done" >&2 \
     || die "fleet upload failed (endpoint $ep, bucket $bkt)"
@@ -163,24 +177,43 @@ if [ "$ON_AWS" = 1 ] && command -v aws >/dev/null && aws sts get-caller-identity
   TOK=$(curl -s -m2 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
   AZ=$(curl -s -m2 -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null)
   [ -n "$AZ" ] && REGION="${AZ%[a-z]}"
-  BKT="blimp-sf${SF}-${REGION}-${CLUSTER_ID}"
-  log "AWS: creating s3://$BKT in $REGION (this box's region) + uploading SF${SF}"
+  # BLIMP_DATA_BUCKET (blimp --setup --data-bucket B): an EXISTING bucket, for
+  # least-privilege roles without s3:CreateBucket. Otherwise setup creates
+  # blimp-sf<N>-<region>-<cluster id> in this account (README: "What --setup
+  # creates in your AWS account").
+  BKT="${BLIMP_DATA_BUCKET:-blimp-sf${SF}-${REGION}-${CLUSTER_ID}}"
+  CB_ERR=""
+  if [ -n "${BLIMP_DATA_BUCKET:-}" ]; then
+    log "AWS: using the existing bucket s3://$BKT (--data-bucket) for SF${SF}"
+  else
+    log "AWS: creating s3://$BKT in $REGION (this box's region) + uploading SF${SF}"
+  fi
   # Keep the create error — swallowing it left only "could not create/access",
   # which hides the actual cause (AccessDenied vs BucketAlreadyOwnedByYou vs a
   # region mismatch) and makes the fallback below look unexplained.
-  if [ "$REGION" = us-east-1 ]; then
+  if [ -n "${BLIMP_DATA_BUCKET:-}" ]; then :
+  elif [ "$REGION" = us-east-1 ]; then
     CB_ERR=$(aws s3api create-bucket --bucket "$BKT" --region "$REGION" 2>&1 >/dev/null) || true
   else
     CB_ERR=$(aws s3api create-bucket --bucket "$BKT" --region "$REGION" \
       --create-bucket-configuration "LocationConstraint=$REGION" 2>&1 >/dev/null) || true
   fi
+  # WRITE access is checked here, BEFORE generating anything (head-bucket alone
+  # passes on a read-only role).
   S3_OK=1
   if ! aws s3api head-bucket --bucket "$BKT" >/dev/null 2>&1; then
     S3_OK=0
     log "cannot create/access s3://$BKT — ${CB_ERR:-head-bucket denied}"
-  elif ! aws s3 sync "$OUT" "s3://$BKT/" --exclude ".done" --region "$REGION" >&2; then
+  elif ! WERR=$(s3_write_check "$BKT" --region "$REGION"); then
     S3_OK=0
-    log "upload to s3://$BKT failed"
+    log "s3://$BKT is not writable by this box's AWS identity — $WERR"
+  fi
+  [ "$S3_OK" = 0 ] && [ -n "${BLIMP_DATA_BUCKET:-}" ] \
+    && die "--data-bucket s3://$BKT: this box's AWS identity cannot write it — grant s3:PutObject/GetObject/ListBucket/GetBucketLocation on it (README: \"What --setup creates in your AWS account\"); nothing was generated"
+  if [ "$S3_OK" = 1 ]; then
+    generate_data
+    aws s3 sync "$OUT" "s3://$BKT/" --exclude ".done" --region "$REGION" >&2 \
+      || die "upload to s3://$BKT failed (the write check passed — see the aws error above)"
   fi
   if [ "$S3_OK" = 1 ]; then
     emit ORIGIN_BUCKET "$BKT"

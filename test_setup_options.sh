@@ -35,8 +35,8 @@ curl(){
   # Only the URL matters; every flag the callers use (-s/-sf/-m/-H) is ignored.
   # `curl -sf` returns 22 on an HTTP error, which is how choose_catalog detects
   # an unknown warehouse — so the unknown branch returns 22, not a JSON body.
-  local url="" a
-  for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
+  local url="" a wcode=0
+  for a in "$@"; do case "$a" in http*) url="$a" ;; '%{http_code}') wcode=1 ;; esac; done
   case "$url" in
     *"/admin/credentials"*)
       [ "$FLEET_OK" = 1 ] || { printf '{"fleet_enabled":false}'; return 0; }
@@ -50,6 +50,7 @@ curl(){
       return 22 ;;                      # Nessie 500 "Warehouse ... is not known"
     *"/v1/config"*)
       [ "$NESSIE_OK" = 1 ] || return 7
+      [ "$wcode" = 1 ] && { printf 200; return 0; }   # -o /dev/null -w '%{http_code}'
       printf '{"defaults":{"warehouse":"s3://tpcds-mv","prefix":"main"}}'; return 0 ;;
   esac
   return 0
@@ -58,6 +59,9 @@ curl(){
 # Load the CLI's functions only.
 # shellcheck disable=SC1090
 BLIMP_LIB_ONLY=1 . "$HERE/blimp"
+# Every case runs with no terminal; --yes is the documented way to take the
+# prompts' defaults there (without it a prompt fails at once — tested below).
+BLIMP_YES=1
 
 # Each case starts from a clean slate: these are the vars the choices read AND
 # write, and a leftover value would silently satisfy the next case's prompt.
@@ -73,7 +77,12 @@ reset(){
 # =========================================================== pick() =========
 case_ "pick() — defaults, overrides, bad input"
 reset
-eq "$(pick UNSET_A 'p' 2 a b c 2>/dev/null)" "2" "no tty -> default"
+eq "$(pick UNSET_A 'p' 2 a b c 2>/dev/null)" "2" "--yes, no tty -> default"
+# No terminal and no --yes: fail at once, name the flag, and stop the MAIN shell
+# (the prompt runs inside $(…)) — never read a dead /dev/tty and carry on.
+out=$(BLIMP_LIB_ONLY=1 setsid bash -c '. "$1"; BLIMP_YES=0; v=$(ask REGION "S3 region" us-east-1); echo "continued:$v"' _ "$HERE/blimp" </dev/null 2>&1); rc=$?
+[ "$rc" != 0 ] && ! grep -q continued <<<"$out" && ok "no tty, no --yes -> exits" || bad "no tty, no --yes kept going (rc=$rc): $out"
+grep -q -- '--yes' <<<"$out" && grep -q REGION <<<"$out" && ok "no-tty fatal names --yes and the key" || bad "no-tty fatal message: $out"
 eq "$(PRESET=3 pick PRESET 'p' 1 a b c 2>/dev/null)" "3" "env preset wins"
 eq "$(BAD=notanumber pick BAD 'p' 1 a b c 2>/dev/null)" "notanumber" "preset passes through verbatim"
 
@@ -246,7 +255,7 @@ if sed -n '/^heal_wiring(){/,/^}/p' "$HERE/blimp" | grep -q 'tok=$(node_token)';
 else bad "the container env still wins over the file"; fi
 # --setup must obtain the token on the node BEFORE anything calls the gateway.
 SETUP=$(sed -n '/^cmd_setup(){/,/^}/p' "$HERE/blimp")
-tl=$(printf '%s\n' "$SETUP" | grep -n 'CLUSTER_TOKEN=$(node_token)' | head -1 | cut -d: -f1)
+tl=$(printf '%s\n' "$SETUP" | grep -nE 'ntok=\$\(node_token\)' | head -1 | cut -d: -f1)
 cl=$(printf '%s\n' "$SETUP" | grep -n '^  choose_source_location' | head -1 | cut -d: -f1)
 if [ -n "$tl" ] && [ -n "$cl" ] && [ "$tl" -lt "$cl" ]; then ok "--setup reads the node token before fleet_creds"
 else bad "--setup does not read the node token before fleet_creds"; fi
@@ -494,6 +503,27 @@ case "$reg" in *"--warehouse s3://whbkt/wh "*"--source-bucket whbkt/sf10"*"--nam
 grep -q '/admin/source/configure.*"namespace": "sf10".*"bucket": "whbkt"' "$CALLS" \
   && ok "gateway wired to the warehouse bucket (not bucket/prefix)" || bad "gateway wiring: $(grep configure "$CALLS")"
 rm -rf "$TMPD"
+
+# ============================================ wiring file + no terminal ====
+case_ "wiring file: read by every command, the file wins, the environment fills gaps"
+WT=$(mktemp -d)
+printf 'GW=127.0.0.1\nCLUSTER_ID=111\nCLUSTER_TOKEN=filetok\nNAMESPACE=fromfile\n' > "$WT/inst_env"
+out=$(env -i PATH="$PATH" CLUSTER_ID=222 BLIMP_LIB_ONLY=1 bash -c '. "$1"; load_kv "$2"; wiring_defaults; echo "$GW|$CLUSTER_ID|$NAMESPACE|$REGION|$ICEBERG_URL|$HOME"' _ "$HERE/blimp" "$WT/inst_env" 2>"$WT/err")
+eq "${out%|*}" "127.0.0.1|111|fromfile|us-east-1|" "file read; file CLUSTER_ID wins over env; REGION defaults; missing keys bound"
+home_out=$out
+printf 'ORIGIN_BUCKET=newbkt\n' > "$WT/cfg"; printf 'ORIGIN_BUCKET=oldbkt\n' >> "$WT/inst_env"
+run_setup_bucket(){ env -i PATH="$PATH" HOME="$WT" BLIMP_LIB_ONLY=1 bash -c '. "$1"; ENVF="$2"; shift 2; wait_node_ready(){ echo "$ORIGIN_BUCKET"; exit 0; }; cmd_setup "$@"' _ "$HERE/blimp" "$WT/inst_env" "$@" 2>/dev/null | tail -1; }
+eq "$(run_setup_bucket)" "oldbkt" "--setup with no flags keeps the wiring's bucket"
+eq "$(run_setup_bucket --config "$WT/cfg")" "newbkt" "--config overrides the wiring"
+eq "$(run_setup_bucket --config "$WT/cfg" --data-bucket xb)" "xb" "--data-bucket overrides --config and the wiring"
+grep -q "note: CLUSTER_ID from .* used; the exported value is ignored" "$WT/err" && ok "a differing export is named" || bad "no note for the ignored export: $(cat "$WT/err")"
+out=$(env -i PATH="$PATH" ICEBERG_URL=http://env:8181 BLIMP_LIB_ONLY=1 bash -c '. "$1"; load_kv "$2"; wiring_defaults; echo "$ICEBERG_URL"' _ "$HERE/blimp" "$WT/inst_env" 2>/dev/null)
+eq "$out" "http://env:8181" "the environment fills a key the file does not set"
+[ -n "${home_out##*|}" ] && ok "HOME unset -> taken from passwd ($home_out)" || bad "HOME unset left blank: $home_out"
+out=$(env -i PATH="$PATH" BLIMP_LIB_ONLY=1 bash -c '. "$1"; load_kv "$2"; wiring_defaults; ENVF="$2"; require_wiring GW ICEBERG_URL WAREHOUSE' _ "$HERE/blimp" "$WT/inst_env" 2>&1); rc=$?
+[ "$rc" != 0 ] && grep -q "missing in $WT/inst_env: ICEBERG_URL WAREHOUSE" <<<"$out" && ok "require_wiring names the file and the missing keys" || bad "require_wiring: rc=$rc $out"
+out=$(env -i PATH="$PATH" BLIMP_ENV="$WT/none" setsid bash "$HERE/blimp" --query </dev/null 2>&1); rc=$?
+[ "$rc" != 0 ] && grep -q -- '--setup --yes' <<<"$out" && ! grep -q 'No such device' <<<"$out" && ok "no wiring + no tty: fails at once naming --yes" || bad "no wiring + no tty: rc=$rc $out"
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 # Exit non-zero on failure so CI and `blimp --selftest` actually gate on this.

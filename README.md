@@ -335,6 +335,60 @@ Finally it prints the same values for the Blimp node UI (Query Optimizer →
 Production, the manual path) and the `snapshot_changed` webhook for your
 pipeline.
 
+#### Unattended runs (CI, SSM, `ssh host cmd`)
+
+Every command, `--setup` included, reads the wiring file: `$BLIMP_ENV`, else
+`~/.blimp_env`, else `/root/.blimp_env` (the node's installer writes `GW`,
+`CLUSTER_ID`, `CLUSTER_TOKEN`, `GW_AK`, `GW_SK` there). An exported variable
+is used only for a key the file does not set (a differing export is noted). `HOME` may be unset.
+
+```
+./blimp --setup --yes                          # every documented default (first option of each question, SF1)
+./blimp --setup --config answers.env           # KEY=VALUE answers: CATALOG_CHOICE=1 SOURCE_CHOICE=3 BUILD_DATASET=1 BLIMP_SF=10 …
+./blimp --setup --yes --data-bucket my-bucket  # an EXISTING bucket for the data (no s3:CreateBucket)
+./blimp --doctor                               # read-only preflight; each ✗ line names its fix
+```
+
+With no usable terminal (opening `/dev/tty` fails) and no `--yes`, a question
+that has no answer in the file / `--config` / environment fails at once, naming
+the key and `--yes`. On the Blimp node, `--setup` first waits for the node's own
+install: every container up, `:9000/minio/health/live` and
+`:19122/iceberg/v1/config` answering 200, printing `N of M services up`
+(`BLIMP_READY_TIMEOUT`, default 1200 s). apt waits out a held dpkg lock; a
+missing `pyiceberg` is fatal there, not at registration. On the node the
+gateway is `GW=127.0.0.1` and its catalog `http://127.0.0.1:19122/iceberg`
+(probed first; every address tried is printed).
+
+Inbound ports on the node: 9000 (gateway S3 + admin API, the panel's health
+signal), 9443 (panel endpoint), 19123 (read-only query shim, for engines off
+the node); 19122 (Nessie) is reached on loopback on the node.
+
+#### What --setup creates in your AWS account
+
+Only with option 3 (your own S3) on an AWS box with a test dataset to build.
+Write access is checked (one small `PUT s3://<bucket>/.blimp/write-check`)
+**before** any data is generated.
+
+- **Bucket** `blimp-sf<N>-<region>-<cluster id>` in this box's region, unless
+  `--data-bucket <bucket>` names an existing one. If the box's identity cannot
+  create or write it, setup falls back to a MinIO container on this box (a
+  `--data-bucket` it cannot write is fatal instead).
+- **Objects**: `<table>/data.parquet` for the 24 TPC-DS tables, plus the
+  Iceberg metadata the catalog writes.
+- **Bucket policy** statement `Sid=BlimpSourceAccess` (merged; other statements
+  kept) granting the account and the gateway's instance role
+  `s3:GetObject s3:PutObject s3:DeleteObject s3:ListBucket s3:GetBucketLocation`.
+
+IAM the box's identity needs: `s3:CreateBucket` (not with `--data-bucket`),
+`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:ListBucket`,
+`s3:GetBucketLocation`, `s3:GetBucketPolicy`, `s3:PutBucketPolicy` on
+`arn:aws:s3:::<bucket>` and `arn:aws:s3:::<bucket>/*`; `ec2:DescribeInstances`
+and `iam:GetInstanceProfile` to find the gateway role (or set
+`GATEWAY_ROLE_ARN=arn:aws:iam::<acct>:role/<role>`); `sts:GetCallerIdentity`.
+
+A fallback Nessie (catalog option 2) keeps its store in `/opt/blimp/nessie`
+(`NESSIE_STORE` relocates it), owned by the image's own uid/gid.
+
 ### Step 3 — register your tables (optional)
 
 `--setup` already registers the test dataset it generates. Do this only for
