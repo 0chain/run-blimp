@@ -44,8 +44,9 @@ WORKDIR /kit
 # verdict that gates merge_ms), query_pools.py (query-aware CDC tick),
 # suites/ (the DEFAULT --query batch is the named suite "first-10"),
 # tfrecord2idx (dlio shells out to it during mlperf datagen), and scratch_dir.sh
-# (sourced by standup_data.sh and run_cluster.sh).
-COPY blimp register_tpcds_tables.py seed_tpcds.py seed_tpch.py standup_data.sh scratch_dir.sh \
+# (sourced by standup_data.sh and run_cluster.sh), s3_check.sh (sourced by
+# standup_data.sh and blimp --doctor).
+COPY blimp register_tpcds_tables.py seed_tpcds.py seed_tpch.py standup_data.sh scratch_dir.sh s3_check.sh \
      query_tables.py mv_delta_rows.py query_pools.py tfrecord2idx \
      test_query.sh bench_cdc.sh test_cache.sh \
      run_cluster.sh /kit/

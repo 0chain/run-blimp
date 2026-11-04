@@ -11,11 +11,11 @@
 #   blimp --storage       TEST: storage suite (warp, mlperf).
 #   blimp --query         TEST: query + CDC suite (author → append → delta-merge).
 #
-# Wiring is saved to ~/.blimp_env (override path with BLIMP_ENV). --setup writes
-# it; --storage/--query read it (and prompt for anything still missing).
-# Non-interactive: pre-set the env vars (REGION, CLUSTER_ID, CLUSTER_TOKEN, GW,
-# ICEBERG_URL, WAREHOUSE, ORIGIN_BUCKET, NAMESPACE, GW_AK, GW_SK) and they won't
-# be asked.
+# Wiring is saved to ~/.blimp_env (override path with BLIMP_ENV). Every command,
+# --setup included, reads it; the environment fills keys it does not set.
+# Non-interactive: put the answers in the wiring file, a --setup --config file or
+# the env (REGION, CLUSTER_ID, CLUSTER_TOKEN, GW, ICEBERG_URL, WAREHOUSE,
+# ORIGIN_BUCKET, NAMESPACE, GW_AK, GW_SK), or pass --yes for the defaults.
 # ==============================================================================
 set -uo pipefail
 # Resolve $0 through any symlink so `blimp` works when installed as
@@ -25,18 +25,39 @@ SELF="$0"; while [ -L "$SELF" ]; do
   link="$(readlink "$SELF")"; case "$link" in /*) SELF="$link";; *) SELF="$(dirname "$SELF")/$link";; esac
 done
 HERE="$(cd "$(dirname "$SELF")" && pwd)"
-ENVF="${BLIMP_ENV:-$HOME/.blimp_env}"
+# HOME is unset under SSM sessions, CI runners and `sh -c` from a non-login
+# shell; under `set -u` every $HOME below then killed the run ("line 856: HOME:
+# unbound variable", customer report 2026-11-03). Take it from the passwd entry.
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+[ -n "${HOME:-}" ] || HOME=/root
+export HOME
+# The wiring file. BLIMP_ENV wins; else ~/.blimp_env; else the file the node's
+# installer writes (/root/.blimp_env) when that is the one that exists.
+if [ -n "${BLIMP_ENV:-}" ]; then ENVF="$BLIMP_ENV"
+elif [ ! -f "$HOME/.blimp_env" ] && [ -r /root/.blimp_env ]; then ENVF=/root/.blimp_env
+else ENVF="$HOME/.blimp_env"; fi
+# --yes / BLIMP_YES=1: take every prompt's documented default (no terminal needed).
+BLIMP_YES="${BLIMP_YES:-0}"
+BLIMP_PID=$BASHPID
 bold(){ printf '\033[1m%s\033[0m\n' "$*"; }
 die(){ printf '\033[31m[blimp] FATAL: %s\033[0m\n' "$*" >&2; exit 1; }
+# have_tty — a terminal we can actually OPEN. `-e /dev/tty` is true in an SSM
+# session or under setsid/nohup, where opening it fails ("No such device or address").
+have_tty(){ { : < /dev/tty; } 2>/dev/null; }
+# no_tty_fatal <what> — a prompt with no terminal and no --yes. Prompts run inside
+# $(…), where `exit` ends only the subshell, so the main shell is signalled too.
+trap 'exit 1' USR1
+no_tty_fatal(){
+  printf '\033[31m[blimp] FATAL: no terminal available to answer "%s" — pass --yes to take the documented defaults, or set the value in %s or the environment (or use --setup --config <file>)\033[0m\n' "$1" "$ENVF" >&2
+  kill -USR1 "$BLIMP_PID" 2>/dev/null; exit 1; }
 # ask VAR "prompt" [default] — keep an already-set value; else prompt (default on empty)
 ask(){ local var="$1" prompt="$2" def="${3:-}" cur="${!1:-}" v
   [ -n "$cur" ] && { printf '%s' "$cur"; return; }
-  # No terminal (CI, `ssh host cmd`, nohup) → take the default instead of dying.
-  # Test the OPEN, not `-r`: under nohup /dev/tty exists but opening it fails.
-  if ! { : < /dev/tty; } 2>/dev/null; then
-    printf '%s%s: <no tty, using default>\n' "$prompt" "${def:+ [$def]}" >&2
+  if [ "$BLIMP_YES" = 1 ]; then
+    printf '%s%s: <--yes, using default>\n' "$prompt" "${def:+ [$def]}" >&2
     printf '%s' "$def"; return
   fi
+  have_tty || no_tty_fatal "$var — ${prompt#"${prompt%%[! ]*}"}"
   printf '%s%s: ' "$prompt" "${def:+ [$def]}" >&2; read -r v </dev/tty || true
   printf '%s' "${v:-$def}"; }
 
@@ -58,6 +79,18 @@ usage(){
                      Every answer is overridable up-front via the env
                      (CATALOG_CHOICE / SOURCE_CHOICE / BUILD_DATASET / BLIMP_SF),
                      so a scripted run is non-interactive.
+                       --yes               take every documented default (the
+                                           first option of each question; SF1)
+                       --config <file>     KEY=VALUE answers (same keys as the
+                                           wiring file, plus the *_CHOICE ones)
+                       --data-bucket <B>   use an EXISTING bucket on your S3 for
+                                           the data (no s3:CreateBucket needed)
+                     On the Blimp node it first waits for the node's own install
+                     (containers up, :9000 and :19122 answering; BLIMP_READY_TIMEOUT).
+                     With no terminal and no --yes, a missing answer fails at once.
+  blimp --doctor     Read-only preflight: wiring file + keys (masked), token,
+                     containers, listening ports, :9000 / :19122, pyiceberg,
+                     data-bucket write access. Each problem line names its fix.
   blimp --register   Register YOUR parquet in the node's Iceberg catalog and point
                      the gateway at it (no copy; schema read from the parquet):
                        blimp --register --bucket B[/prefix] [--namespace NS] [--tables a,b]
@@ -112,12 +145,124 @@ usage(){
                      One update at a time; the node keeps a backup of every compose
                      file / container it replaces and rolls back a failed recreate.
 
-  Wiring is read from / written to ~/.blimp_env  (set BLIMP_ENV to relocate).
+  Wiring is read from / written to ~/.blimp_env (else /root/.blimp_env, which
+  the node's installer writes; set BLIMP_ENV to relocate). Every command, --setup
+  included, reads it; an exported variable is used only for keys the file does not set.
 H
-  # Secrets are masked: help output ends up in terminals, logs and screenshots.
-  [ -f "$ENVF" ] && { echo; bold "current wiring ($ENVF):"
-    sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN)[A-Za-z0-9_]*|[A-Za-z0-9_]*_SK|S3_KEY)=.+/\1=***/; s/^/  /' "$ENVF"; }
+  [ -f "$ENVF" ] && { echo; bold "current wiring ($ENVF):"; mask_wiring "$ENVF"; }
   return 0
+}
+
+# mask_wiring <file> — the wiring's KEY=VALUE lines with secrets masked: this
+# output ends up in terminals, logs and screenshots.
+mask_wiring(){
+  grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$1" 2>/dev/null \
+    | sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN)[A-Za-z0-9_]*|[A-Za-z0-9_]*_SK|S3_KEY|GW_AK)=.+/\1=***/; s/^/  /'
+}
+
+# load_kv <file> — source a KEY=VALUE file (the wiring, or a --setup --config
+# answers file). The FILE wins for every key it sets; the environment fills the
+# keys it lacks (an env-over-file flip broke the bench canaries, which export
+# container-side addresses). Before, --setup never read the file at all
+# (customer report 2026-11-03, item 3).
+load_kv(){
+  local f="$1" k kv; local -a keep=()
+  [ -r "$f" ] || return 1
+  for k in $(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$f"); do
+    [ -n "${!k:-}" ] && keep+=("$k=${!k}")
+  done
+  # shellcheck disable=SC1090
+  . "$f"
+  # The file wins for every key it sets (callers such as the bench canaries
+  # export container-side addresses for the gateway's configure body); the
+  # environment only fills keys the file lacks. A differing export is named.
+  for kv in ${keep[@]+"${keep[@]}"}; do
+    k="${kv%%=*}"
+    [ "${!k}" = "${kv#*=}" ] || echo "  note: $k from $f used; the exported value is ignored" >&2
+  done
+  return 0
+}
+
+# Every key save_env writes. Bound (blank) after loading so `set -u` can never
+# kill a run on a partial file — the installer writes only GW/CLUSTER_ID/
+# CLUSTER_TOKEN/GW_AK/GW_SK; a command that needs more says which, via require_wiring.
+WIRING_KEYS="REGION CLUSTER_REGION CLUSTER_ID CLUSTER_TOKEN GW GATEWAY ICEBERG_URL ICEBERG_URL_LOCAL ICEBERG_PREFIX WAREHOUSE ORIGIN_BUCKET NAMESPACE SOURCE S3_ENDPOINT S3_KEY S3_SECRET GW_AK GW_SK BLIMP_PY CATALOG_CHOICE SOURCE_TARGET ICEBERG_WAREHOUSE"
+wiring_defaults(){
+  local k; for k in $WIRING_KEYS; do printf -v "$k" '%s' "${!k:-}"; done
+  # REGION: setup's documented default; the node itself runs us-east-1.
+  REGION="${REGION:-${CLUSTER_REGION:-us-east-1}}"; CLUSTER_REGION="${CLUSTER_REGION:-$REGION}"
+  GW="${GW:-$GATEWAY}"; GATEWAY="$GW"
+  return 0
+}
+
+# require_wiring KEY... — fail naming the file and every missing key.
+require_wiring(){
+  local k miss=""
+  for k in "$@"; do [ -n "${!k:-}" ] || miss="$miss $k"; done
+  [ -z "$miss" ] || die "missing in $ENVF:$miss — run 'blimp --setup' (it writes them), or add each as KEY=<value> to $ENVF, or export it (used when the file does not set it)"
+}
+
+# wait_node_ready — when this CLI runs ON the Blimp node, wait until the node's
+# own install has finished: every service container up, the gateway answering
+# :9000/minio/health/live and its Nessie :19122/iceberg/v1/config with 200.
+# --setup started as soon as the fleet token was readable, i.e. mid-install:
+# apt raced the installer for the dpkg lock and the :19122 probe fell into the
+# fallback catalog (customer report 2026-11-03, item 5). Off the node: no-op.
+wait_node_ready(){
+  [ "${BLIMP_SKIP_READY:-0}" = 1 ] && return 0
+  local DKR=docker
+  docker info >/dev/null 2>&1 || { sudo -n docker info >/dev/null 2>&1 && DKR="sudo -n docker"; }
+  # On the node = the installer's token file, or a gateway container, is here.
+  [ -f /opt/0chain/zs3server/environment/admin_token ] \
+    || $DKR inspect minioserver >/dev/null 2>&1 || return 0
+  local tmo="${BLIMP_READY_TIMEOUT:-1200}" t0=$SECONDS last="" up total pend u n st status line
+  # The gateway's catalog is needed only when the gateway Nessie is (or may be) used.
+  local urls="http://127.0.0.1:${S3_PORT:-9000}/minio/health/live"
+  case "${CATALOG_CHOICE:-1}" in 1) urls="$urls http://127.0.0.1:19122/iceberg/v1/config" ;; esac
+  bold "== waiting for this node's install to finish (containers + gateway endpoints) =="
+  while :; do
+    up=0; total=0; pend=""
+    # A service = a container that is running, starting, restarting or created;
+    # an EXITED one (one-shot, or a stopped backup) is not counted. A
+    # healthcheck still "starting" is not up yet.
+    while IFS='|' read -r n st status; do
+      [ -n "$n" ] || continue
+      case "$st" in exited|dead) continue ;; esac
+      total=$((total+1))
+      case "$st|$status" in
+        running\|*"health: starting"*|running\|*unhealthy*) pend="$pend $n" ;;
+        running\|*) up=$((up+1)) ;;
+        *) pend="$pend $n($st)" ;;
+      esac
+    done < <($DKR ps -a --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
+    for u in $urls; do
+      total=$((total+1))
+      if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$u" 2>/dev/null)" = 200 ]; then up=$((up+1))
+      else pend="$pend ${u#http://127.0.0.1}"; fi
+    done
+    line="  $up of $total services up${pend:+ — waiting on:$pend}"
+    [ "$line" != "$last" ] && { printf '%s (%ss)\n' "$line" "$((SECONDS-t0))"; last="$line"; }
+    [ -z "$pend" ] && { bold "  ✓ node ready ($up of $total services up)"; return 0; }
+    [ $((SECONDS-t0)) -ge "$tmo" ] && die "node not ready after ${tmo}s —$pend not up. Check: docker ps -a; docker logs <name>. Wait longer with BLIMP_READY_TIMEOUT=<seconds>, or skip the gate with BLIMP_SKIP_READY=1"
+    sleep 10
+  done
+}
+
+# apt_get <args…> — sudo apt-get that waits out the dpkg lock (the node's own
+# installer, unattended-upgrades) with backoff instead of failing and moving on.
+apt_get(){
+  local i out rc
+  for i in 1 2 3 4 5 6; do
+    out=$(sudo apt-get -o DPkg::Lock::Timeout=60 "$@" 2>&1); rc=$?
+    [ "$rc" = 0 ] && { printf '%s\n' "$out" | tail -1; return 0; }
+    case "$out" in
+      *"Could not get lock"*|*"Unable to acquire the dpkg"*|*"Unable to lock"*)
+        echo "  … dpkg lock held by another process (try $i/6) — retrying in $((i*15))s" >&2
+        sleep $((i*15)) ;;
+      *) printf '%s\n' "$out" | tail -3 >&2; return "$rc" ;;
+    esac
+  done
+  printf '%s\n' "$out" | tail -3 >&2; return 1
 }
 
 save_env(){
@@ -299,18 +444,19 @@ local_url(){ # <url> <started_here:0|1>
 }
 
 # ---- pick one of N numbered options -----------------------------------------
-# Same no-tty contract as ask(): with no controlling terminal take the default
-# rather than dying, so CI / `ssh host blimp --setup` still completes.
+# Same no-tty contract as ask(): a pre-set VAR wins; --yes takes the default; no
+# terminal and no --yes fails at once naming the flag.
 pick(){ # <var> <prompt> <default-number> <label1> <label2> ...
   local var="$1" prompt="$2" def="$3"; shift 3
   local cur="${!var:-}" n=1 v
   [ -n "$cur" ] && { printf '%s' "$cur"; return; }
   { echo; bold "$prompt"; } >&2
   for l in "$@"; do printf '   %d) %s\n' "$n" "$l" >&2; n=$((n+1)); done
-  if ! { : < /dev/tty; } 2>/dev/null; then
-    printf '  choice [%s]: <no tty, using default>\n' "$def" >&2
+  if [ "$BLIMP_YES" = 1 ]; then
+    printf '  choice [%s]: <--yes, using default>\n' "$def" >&2
     printf '%s' "$def"; return
   fi
+  have_tty || no_tty_fatal "$var — $prompt"
   printf '  choice [%s]: ' "$def" >&2; read -r v </dev/tty || true
   v="${v:-$def}"
   case "$v" in ''|*[!0-9]*) v="$def";; esac
@@ -398,9 +544,22 @@ choose_catalog(){
        # On-node register/seed/query reach it via loopback — which also sidesteps
        # the cloud-VM hairpin (a box cannot connect to its own public IP). Remote
        # query engines use the bearer-gated read-only shim on :19123 instead.
-       ICEBERG_URL_LOCAL="http://127.0.0.1:19122/iceberg"
+       # Probe the on-node addresses FIRST (a pre-set ICEBERG_URL_LOCAL, then
+       # loopback), the derived public name last, and print every address
+       # tried: the derived blimp-<id>-0 name never answers for :19122, and the
+       # old message named only it (customer report 2026-11-03, item 6).
+       local cand tried="" hit=""
+       for cand in ${ICEBERG_URL_LOCAL:-} "http://127.0.0.1:19122/iceberg" "$ICEBERG_URL"; do
+         case " $tried " in *" $cand "*) continue ;; esac
+         tried="$tried $cand"
+         if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 8 "$cand/v1/config" 2>/dev/null)" = 200 ]; then
+           echo "    tried $cand/v1/config → 200" >&2; hit="$cand"; break
+         fi
+         echo "    tried $cand/v1/config → no answer" >&2
+       done
+       ICEBERG_URL_LOCAL="${hit:-http://127.0.0.1:19122/iceberg}"
        export ICEBERG_PREFIX ICEBERG_URL_LOCAL
-       if curl -s -m 8 "$ICEBERG_URL_LOCAL/v1/config" >/dev/null 2>&1; then
+       if [ -n "$hit" ]; then
          bold "  using the gateway Nessie catalog — $ICEBERG_URL_LOCAL (branch $ICEBERG_PREFIX)"
          # Nessie warehouses are SERVER-CONFIGURED AND NAMED. A client cannot ask
          # for an arbitrary path: GET /v1/config?warehouse=s3://blimp-src/wh
@@ -421,7 +580,7 @@ except Exception: print("")' 2>/dev/null)
          fi
          export NESSIE_WAREHOUSE ICEBERG_WAREHOUSE
        else
-         bold "  ! $ICEBERG_URL did not answer /v1/config — is :19122 reachable from here?"
+         bold "  ! no gateway catalog answered /v1/config at:$tried (check: blimp --doctor)"
          bold "    falling back to standing a catalog up on this box"
          ICEBERG_URL=""; ICEBERG_PREFIX=""
        fi ;;
@@ -573,13 +732,28 @@ standup_iceberg(){
   fi
 
   bold "standing up Nessie on :$port over s3://$wbucket (warehouse \"$wname\")"
-  sudo mkdir -p /opt/blimp/nessie 2>/dev/null || mkdir -p /opt/blimp/nessie
+  # The image runs as a NON-ROOT user: a store made by `sudo mkdir` is root-owned
+  # and RocksDB loops on "While open a file for appending: /data/nessie/LOG:
+  # Permission denied" (customer report 2026-11-03, item 7). Create it owned by
+  # the image's own uid/gid, read from the image (never assumed), and run the
+  # container as that same uid:gid. NESSIE_STORE relocates the store.
+  local img="${NESSIE_IMAGE:-ghcr.io/projectnessie/nessie:latest}" store="${NESSIE_STORE:-/opt/blimp/nessie}"
+  $DKR image inspect "$img" >/dev/null 2>&1 || $DKR pull -q "$img" >/dev/null 2>&1 \
+    || die "cannot pull $img — check this box's registry access (docker pull $img)"
+  local cuid cgid
+  cuid=$($DKR run --rm --entrypoint id "$img" -u 2>/dev/null | tr -dc '0-9')
+  cgid=$($DKR run --rm --entrypoint id "$img" -g 2>/dev/null | tr -dc '0-9')
+  [ -n "$cuid" ] && [ -n "$cgid" ] || die "cannot read the user $img runs as (docker run --rm --entrypoint id $img)"
+  sudo install -d -m 0750 -o "$cuid" -g "$cgid" "$store" 2>/dev/null \
+    || install -d -m 0750 -o "$cuid" -g "$cgid" "$store" 2>/dev/null \
+    || die "cannot create the Nessie store $store owned by $cuid:$cgid (the image's user) — create it so, or set NESSIE_STORE=<a dir you own>"
   $DKR rm -f blimp-nessie >/dev/null 2>&1 || true
   # Path-style access: the fleet endpoint and MinIO are single hosts, not
   # per-bucket virtual hosts. Harmless against real AWS.
   $DKR run -d --name blimp-nessie --restart unless-stopped \
+    --user "$cuid:$cgid" \
     -p "$port:19120" \
-    -v /opt/blimp/nessie:/data/nessie \
+    -v "$store:/data/nessie" \
     -e NESSIE_VERSION_STORE_TYPE=ROCKSDB \
     -e NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH=/data/nessie \
     -e NESSIE_CATALOG_DEFAULT_WAREHOUSE="$wname" \
@@ -593,7 +767,7 @@ standup_iceberg(){
     -e nessie.catalog.secrets.access-key.secret="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
     -e QUARKUS_HTTP_PORT=19120 \
     -e QUARKUS_MANAGEMENT_ENABLED=false \
-    ghcr.io/projectnessie/nessie:latest >/dev/null || die "failed to start blimp-nessie"
+    "$img" >/dev/null || die "failed to start blimp-nessie ($img)"
 
   # Quarkus cold-start on a small box runs well past a minute; the internal
   # installer waits generously for the same reason.
@@ -602,8 +776,13 @@ standup_iceberg(){
     curl -sf -m 4 "http://localhost:$port/iceberg/v1/config?warehouse=$wname" >/dev/null 2>&1 && break
     sleep 5
   done
-  curl -sf -m 4 "http://localhost:$port/iceberg/v1/config?warehouse=$wname" >/dev/null 2>&1 \
-    || die "Nessie did not come up on :$port (check: $DKR logs blimp-nessie)"
+  if ! curl -sf -m 4 "http://localhost:$port/iceberg/v1/config?warehouse=$wname" >/dev/null 2>&1; then
+    # The whole diagnosis, not a pointer to it: container state + its log tail.
+    echo "  blimp-nessie state: $($DKR inspect -f '{{.State.Status}} restarts={{.RestartCount}} exit={{.State.ExitCode}} {{.State.Error}}' blimp-nessie 2>&1)" >&2
+    echo "  last 20 log lines (docker logs blimp-nessie):" >&2
+    $DKR logs --tail 20 blimp-nessie 2>&1 | sed 's/^/    | /' >&2
+    die "Nessie did not come up on :$port (store $store, image $img)"
+  fi
 
   ICEBERG_URL="http://$(this_host):$port/iceberg"
   # The cluster reaches it at ICEBERG_URL; WE reach it on loopback. Both are
@@ -771,7 +950,7 @@ assess_mode(){
       10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) GW_PRIV="$GW" ;;
     esac
   fi
-  if [ -z "$GW_PRIV" ]; then
+  if [ -z "$GW_PRIV" ] && [ -z "${GW:-}" ]; then
     bold "  ! gateway private address not discoverable (no cloud API access from here, or not a cloud node)."
     bold "    Using the public endpoint. If this client IS on the node's private network, re-run with"
     bold "    GW=<gateway-private-ip> so the catalog is advertised on a reachable address."
@@ -805,6 +984,12 @@ assess_mode(){
   fi
   # "vpc"/"external" stay as the internal mode ids (every gate keys on them); the
   # user reads it as "can I reach the gateway on its private address or not".
+  # ON the Blimp node the gateway is this box: loopback, with no security group
+  # or hairpin in the way (the customer had to find GW=127.0.0.1 by hand,
+  # report 2026-11-03 item 6).
+  if [ -n "$(node_token)" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 "http://127.0.0.1:9000/minio/health/live" 2>/dev/null)" = 200 ]; then
+    GW_DEFAULT=127.0.0.1
+  fi
   bold "network assessment → private gateway ${GW_PRIV:-unknown} reachable: $([ "$MODE" = vpc ] && echo 'yes (private path, nothing to type)' || echo 'no (public endpoint)')$([ "$MODE" != vpc ] && [ "$SAME_ACCT" = 1 ] && echo ' — same cloud account, cross-region')"
   echo "  gateway → $GW_DEFAULT · advertise this node as → ${ADVERTISE_DEFAULT:-<set ADVERTISE_HOST>} · S3 creds → $CREDS_HINT"
 }
@@ -827,8 +1012,8 @@ ensure_deps(){
     command -v aws >/dev/null || command -v snap >/dev/null || want+=(awscli)
     if [ "${#want[@]}" -gt 0 ]; then
       bold "  installing: ${want[*]}"
-      sudo apt-get update -qq 2>/dev/null || true
-      sudo apt-get install -y -qq "${want[@]}" 2>&1 | tail -1 || true
+      apt_get update -qq >/dev/null || true
+      apt_get install -y -qq "${want[@]}" || echo "  ! apt-get install ${want[*]} failed (above)"
     fi
     command -v docker >/dev/null && sudo systemctl enable --now docker >/dev/null 2>&1 || true
     # aws CLI: prefer snap (newer) when apt's awscli is absent
@@ -874,9 +1059,11 @@ ensure_deps(){
   if [ -x "$BLIMP_PY" ] && ! "$BLIMP_PY" -c 'import duckdb' 2>/dev/null; then
     "$(dirname "$BLIMP_PY")/pip" install -q --force-reinstall --no-deps duckdb 2>&1 | tail -1 || true
   fi
+  # Fail HERE, loudly: carrying on without pyiceberg only failed much later, at
+  # registration (customer report 2026-11-03, item 5).
   "$BLIMP_PY" -c 'import pyiceberg' 2>/dev/null \
-    && bold "  ✓ deps ready (python: $BLIMP_PY)" \
-    || { BLIMP_PY=python3; echo "  ! pyiceberg unavailable — register/CDC steps need: pip install 'pyiceberg[s3fs]' pyarrow boto3"; }
+    || die "pyiceberg is not installed for $BLIMP_PY — registration and CDC need it. Install it (python3 -m venv $HOME/.blimp_venv && $HOME/.blimp_venv/bin/pip install 'pyiceberg[s3fs]==0.11.0' pyarrow boto3), or set BLIMP_PY=<a python that has it>, then re-run"
+  bold "  ✓ deps ready (python: $BLIMP_PY)"
   export BLIMP_PY
 }
 
@@ -1171,7 +1358,39 @@ cmd_unregister(){
 }
 
 cmd_setup(){
+  local cfg="" data_bucket=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y)        BLIMP_YES=1 ;;
+      --config)        cfg="${2:?--config needs a file}"; shift ;;
+      --config=*)      cfg="${1#--config=}" ;;
+      # An EXISTING bucket for the data (least-privilege roles: no CreateBucket).
+      --data-bucket)   data_bucket="${2:?--data-bucket needs a bucket name}"; shift ;;
+      --data-bucket=*) data_bucket="${1#--data-bucket=}" ;;
+      *) die "--setup: unknown flag $1 (flags: --yes, --config <file>, --data-bucket <bucket>; see blimp --help)" ;;
+    esac; shift
+  done
   bold "== blimp --setup — connect a Blimp cluster to this node's data =="
+  # Answers, lowest to highest precedence: the environment (fills only keys
+  # nothing below sets), the wiring file ($ENVF — the node's installer writes
+  # GW/CLUSTER_ID/CLUSTER_TOKEN there), a --config answers file, --data-bucket.
+  if load_kv "$ENVF"; then
+    bold "  wiring read from $ENVF (--config and --data-bucket override it)"
+  fi
+  if [ -n "$cfg" ]; then
+    [ -r "$cfg" ] || die "--config $cfg: cannot read the file"
+    # shellcheck disable=SC1090
+    . "$cfg"
+    bold "  answers from $cfg (they override the wiring file)"
+  fi
+  [ -n "$data_bucket" ] && ORIGIN_BUCKET="$data_bucket"
+  # --data-bucket names a bucket on the customer's own S3 (option 3), never the
+  # fleet / gateway layer.
+  [ -n "${ORIGIN_BUCKET:-}" ] && [ -z "${SOURCE_CHOICE:-}" ] && [ -z "${SOURCE_TARGET:-}" ] && SOURCE_CHOICE=3
+  export BLIMP_YES
+  # On the node: wait for its own install to finish before touching apt or
+  # probing the gateway (no-op elsewhere).
+  wait_node_ready
   ensure_deps
   echo
   # "Region" only means something for a bucket on AWS; MinIO / Ceph / R2 / the
@@ -1183,7 +1402,7 @@ cmd_setup(){
   # must keep using the cluster's region, so pin it now, before that happens.
   CLUSTER_REGION="${CLUSTER_REGION:-$REGION}"; export CLUSTER_REGION
   CLUSTER_ID=$(ask CLUSTER_ID "Blimp cluster id (from blimp.software)")
-  [ -n "$CLUSTER_ID" ] || die "CLUSTER_ID is required (the Blimp cluster to connect)"
+  [ -n "$CLUSTER_ID" ] || die "CLUSTER_ID is required (the Blimp cluster to connect) — set CLUSTER_ID=<id from the panel> in $ENVF, a --config file, or the environment"
   # Zero-touch: probe the private gateway path and pick vpc vs external mode, then
   # derive the gateway address, the address we advertise this node on, and the
   # creds default from it. Every value stays overridable via the prompts/env.
@@ -1196,7 +1415,9 @@ cmd_setup(){
   NAMESPACE=$(ask NAMESPACE "Iceberg namespace" "tpcds")
   # The gateway accepts only the account fleet token. On the Blimp node it is
   # read from the node itself; elsewhere it must be supplied (env or prompt).
-  [ -n "${CLUSTER_TOKEN:-}" ] || CLUSTER_TOKEN=$(node_token)
+  # The node's token file is authoritative (heal_wiring's rule): a rotated
+  # token in an older wiring file must not win.
+  local ntok; ntok=$(node_token); [ -n "$ntok" ] && CLUSTER_TOKEN="$ntok"
   [ -n "${CLUSTER_TOKEN:-}" ] || CLUSTER_TOKEN=$(ask CLUSTER_TOKEN "Fleet token (panel: Settings -> API token)")
   [ -n "${CLUSTER_TOKEN:-}" ] || die "CLUSTER_TOKEN is required: run --setup on the Blimp node, or set CLUSTER_TOKEN=<fleet token from the panel (Settings -> API token)>"
   export CLUSTER_TOKEN
@@ -1217,6 +1438,7 @@ cmd_setup(){
       BLIMP_SF="${BLIMP_SF:-1}" BLIMP_DATA_TARGET="${SOURCE_TARGET:-external}" \
       FLEET_ENDPOINT="$(endpoint_local "${S3_ENDPOINT:-}")" FLEET_KEY="${S3_KEY:-}" FLEET_SECRET="${S3_SECRET:-}" \
       FLEET_BUCKET="${ORIGIN_BUCKET:-}" \
+      BLIMP_DATA_BUCKET="$([ "${SOURCE_TARGET:-external}" = external ] && printf '%s' "${ORIGIN_BUCKET:-}")" \
       bash "$HERE/standup_data.sh") || die "SF${BLIMP_SF} data standup failed"
     eval "$gen"                      # sets ORIGIN_BUCKET WAREHOUSE S3_ENDPOINT [S3_KEY S3_SECRET] REGION
     # standup_data emits WAREHOUSE=s3://<bucket>/wh, which is right for a path
@@ -1243,7 +1465,9 @@ cmd_setup(){
   # not apply to it at all — skip rather than warn on every run.
   if [ -z "${ICEBERG_WAREHOUSE:-}" ] && [ -n "$ORIGIN_BUCKET" ] && [ "$wh_bkt" != "$ORIGIN_BUCKET" ]; then
     printf '\033[33m  ⚠ warehouse bucket (%s) ≠ data bucket (%s). The gateway serves catalog\n    metadata only from the data bucket; a split will make MV authoring fail.\n    Recommended: use s3://%s/wh. Continue anyway? [y/N] \033[0m' "$wh_bkt" "$ORIGIN_BUCKET" "$ORIGIN_BUCKET" >&2
-    local yn; read -r yn </dev/tty || true
+    local yn=""
+    # No terminal or --yes: the documented default (the co-located warehouse).
+    if [ "$BLIMP_YES" != 1 ] && have_tty; then read -r yn </dev/tty || true; else echo "<using s3://$ORIGIN_BUCKET/wh>" >&2; fi
     [ "${yn:-N}" = y ] || [ "${yn:-N}" = Y ] || WAREHOUSE="s3://$ORIGIN_BUCKET/wh"
   fi
   # Explicit S3 keys are REQUIRED only when this node's AWS identity can't reach
@@ -1413,23 +1637,27 @@ preflight(){
 # with the clear message.
 need_env(){
   if [ ! -f "$ENVF" ]; then
-    if [ -t 0 ] || [ -e /dev/tty ]; then
-      printf 'No wiring yet. Run blimp --setup now? [Y/n] ' >&2
+    if [ "$BLIMP_YES" = 1 ]; then
+      bold "no wiring at $ENVF — running blimp --setup with its defaults (--yes)"
+      cmd_setup
+    elif have_tty; then
+      printf 'No wiring at %s yet. Run blimp --setup now? [Y/n] ' "$ENVF" >&2
       local yn; read -r yn </dev/tty 2>/dev/null || yn=n
-      case "${yn:-Y}" in n|N) die "run 'blimp --setup' first (or set BLIMP_ENV)";; esac
+      case "${yn:-Y}" in n|N) die "run 'blimp --setup' first (or set BLIMP_ENV=<wiring file>)";; esac
       cmd_setup
     else
-      die "no wiring yet — run 'blimp --setup' first (or set BLIMP_ENV)."
+      die "no wiring at $ENVF, and no terminal to offer setup — run 'blimp --setup --yes' (or --setup --config <file>), or set BLIMP_ENV=<wiring file>"
     fi
   fi
-  # shellcheck disable=SC1090
-  . "$ENVF"
-  GW="${GW:-${GATEWAY:-}}"; export GW GATEWAY="$GW"
+  load_kv "$ENVF" || die "cannot read the wiring file $ENVF (BLIMP_ENV) as $(id -un)"
+  wiring_defaults
+  export GW GATEWAY REGION CLUSTER_REGION
   # The gateway validates the account's FLEET token only. The wiring carries it
   # (heal_wiring reads the node's copy when the CLI runs on the box).
-  export CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
+  export CLUSTER_TOKEN
   # Self-heal stale creds/token left behind by a cluster redeploy (see heal_wiring).
   heal_wiring
+  [ -n "${GW:-}" ] || die "GW (the gateway address) is missing in $ENVF — add GW=<gateway address> (GW=127.0.0.1 on the node itself), or run 'blimp --setup'"
   [ -n "${CLUSTER_TOKEN:-}" ] || die "CLUSTER_TOKEN is empty: the gateway accepts only the account fleet token. On the Blimp node it is read from the node; elsewhere set CLUSTER_TOKEN=<fleet token from the panel (Settings -> API token)> in $ENVF"
 }
 
@@ -1461,7 +1689,7 @@ ensure_storage_tools(){
       url="https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch}/mount-s3.${pkg}"
       if out=$(curl -fsSL "$url" -o "/tmp/mount-s3.$pkg" 2>&1); then
         case "$pkg" in
-          deb) out=$(sudo apt-get install -y -qq "/tmp/mount-s3.deb" 2>&1) ;;
+          deb) out=$(apt_get install -y -qq "/tmp/mount-s3.deb" 2>&1) ;;
           rpm) out=$(sudo dnf install -y -q "/tmp/mount-s3.rpm" 2>&1 \
                   || sudo yum install -y -q "/tmp/mount-s3.rpm" 2>&1) ;;
         esac
@@ -1484,7 +1712,7 @@ ensure_storage_tools(){
     bold "  installing openmpi (dlio/mlperf needs an MPI runtime)…"
     if command -v dnf >/dev/null; then sudo dnf install -y -q openmpi openmpi-devel >/dev/null 2>&1
     elif command -v yum >/dev/null; then sudo yum install -y -q openmpi openmpi-devel >/dev/null 2>&1
-    elif command -v apt-get >/dev/null; then sudo apt-get install -y -qq openmpi-bin libopenmpi-dev >/dev/null 2>&1; fi
+    elif command -v apt-get >/dev/null; then apt_get install -y -qq openmpi-bin libopenmpi-dev >/dev/null 2>&1; fi
     { [ -x /usr/lib64/openmpi/bin/mpirun ] || [ -x /usr/bin/mpirun ] || command -v mpirun >/dev/null; } \
       || echo "  ! openmpi install failed — mlperf will fail with 'cannot load MPI library'"
   fi
@@ -1498,7 +1726,7 @@ ensure_storage_tools(){
     command -v dnf >/dev/null && ! python3 -c 'import ensurepip' 2>/dev/null \
       && sudo dnf install -y -q python3-pip >/dev/null 2>&1
     command -v apt-get >/dev/null && ! python3 -c 'import ensurepip' 2>/dev/null \
-      && sudo apt-get install -y -qq python3-venv >/dev/null 2>&1
+      && apt_get install -y -qq python3-venv >/dev/null 2>&1
     # TMPDIR must NOT be /tmp: it is often a small RAM-backed tmpfs, and
     # dlio-benchmark pulls multiple GB of wheels that pip unpacks under TMPDIR.
     local dtmp="${DLIO_TMPDIR:-/var/tmp/dlio-build}"
@@ -1563,7 +1791,7 @@ ensure_acid_tools(){
 
 cmd_storage(){
   need_env
-  : "${GW:?gateway missing in wiring}" "${REGION:?}"
+  require_wiring GW REGION
   # Everything the suite needs, checked in seconds and reported together.
   preflight 1 1
   ensure_storage_tools
@@ -1623,7 +1851,7 @@ if sk: print("    skipped:", sk)' 2>/dev/null || echo "  $out" ;;
 
 cmd_query(){
   need_env
-  : "${GW:?}" "${CLUSTER_ID:?}" "${ICEBERG_URL:?}" "${WAREHOUSE:?}"
+  require_wiring GW CLUSTER_ID ICEBERG_URL WAREHOUSE
   preflight 0 0
   # The suite runs against the source wired by `blimp --setup` (the gateway's
   # "customer" source): the gateway authors MVs from it, the CDC append lands in
@@ -1664,6 +1892,113 @@ cmd_query(){
   return $rc
 }
 
+# blimp --doctor — one read-only preflight of everything setup and the suites
+# depend on, each line naming what to fix: the wiring file and its keys
+# (masked), the values commands will use, the token, the node's containers and
+# listening ports, the gateway on :9000 and its catalog on :19122, python deps,
+# and whether the data bucket is writable (one small PUT of .blimp/write-check —
+# the only write it makes). Never prompts, never heals, never rewrites the wiring.
+cmd_doctor(){
+  local bad=0 k v code DKR=docker
+  bold "== blimp --doctor =="
+  echo "wiring file: $ENVF$([ -n "${BLIMP_ENV:-}" ] && echo ' (BLIMP_ENV)')"
+  if [ -r "$ENVF" ]; then
+    mask_wiring "$ENVF"; load_kv "$ENVF"
+  else
+    echo "  ✗ not found or not readable — run 'blimp --setup', or set BLIMP_ENV=<wiring file>"; bad=$((bad+1))
+  fi
+  wiring_defaults
+  local ntok; ntok=$(node_token)
+  [ -n "$ntok" ] && CLUSTER_TOKEN="$ntok"
+  echo "values commands will use (wiring file; the environment fills keys it does not set):"
+  for k in GW CLUSTER_ID REGION ICEBERG_URL ICEBERG_URL_LOCAL ICEBERG_PREFIX WAREHOUSE NAMESPACE ORIGIN_BUCKET S3_ENDPOINT SOURCE_TARGET CLUSTER_TOKEN GW_AK BLIMP_PY; do
+    v="${!k:-}"
+    case "$k" in *TOKEN|GW_AK) [ -n "$v" ] && { [ ${#v} -ge 16 ] && v="…${v: -4}" || v="***"; } ;; esac
+    printf '  %-18s %s\n' "$k" "${v:-(unset)}"
+  done
+  [ -n "$ntok" ] && echo "  (CLUSTER_TOKEN from this node's token file)"
+  [ -n "${GW:-}" ] || { echo "  ✗ GW unset — add GW=<gateway address> to $ENVF (GW=127.0.0.1 on the node)"; bad=$((bad+1)); }
+
+  echo "token:"
+  if [ -z "${GW:-}" ] || [ -z "${CLUSTER_TOKEN:-}" ]; then
+    echo "  ✗ cannot check — GW or CLUSTER_TOKEN unset"; bad=$((bad+1))
+  else
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$GW:9000/admin/credentials" -H "Authorization: Bearer $CLUSTER_TOKEN" 2>/dev/null)
+    case "$code" in
+      200) echo "  ✓ the gateway accepts CLUSTER_TOKEN (GET /admin/credentials → 200)" ;;
+      401|403) echo "  ✗ the gateway rejects CLUSTER_TOKEN (HTTP $code) — use the fleet token (panel: Settings -> API token)"; bad=$((bad+1)) ;;
+      *) echo "  ✗ gateway http://$GW:9000 did not answer (HTTP ${code:-none})"; bad=$((bad+1)) ;;
+    esac
+  fi
+
+  echo "containers:"
+  docker info >/dev/null 2>&1 || { sudo -n docker info >/dev/null 2>&1 && DKR="sudo -n docker"; }
+  if $DKR info >/dev/null 2>&1; then
+    local rows; rows=$($DKR ps -a --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)
+    [ -n "$rows" ] || echo "  (none on this box — the gateway is remote, or the install has not started)"
+    printf '%s\n' "$rows" | while IFS='|' read -r n st status; do
+      [ -n "$n" ] && printf '  %s %-28s %s\n' "$([ "$st" = running ] && echo ✓ || echo ·)" "$n" "$status"
+    done
+  else
+    echo "  (docker not available as $(id -un) — skipped)"
+  fi
+
+  echo "listening ports:"
+  if command -v ss >/dev/null 2>&1; then
+    local p a
+    for p in 9000 9443 19122 19123 8181 9401; do
+      a=$(ss -lntH 2>/dev/null | awk -v p=":$p" '$4 ~ p"$" {print $4}' | sort -u | paste -sd' ' -)
+      printf '  :%-6s %s\n' "$p" "${a:-not listening}"
+    done
+  else
+    echo "  (ss not installed — skipped)"
+  fi
+
+  echo "gateway endpoints:"
+  # :9000 must answer; of the catalog addresses (on-node first, as setup probes
+  # them) at least one must.
+  local u seen="" cat_ok=0
+  for u in "http://${GW:-127.0.0.1}:9000/minio/health/live" ${ICEBERG_URL_LOCAL:+"$ICEBERG_URL_LOCAL/v1/config"} \
+           "http://127.0.0.1:19122/iceberg/v1/config" ${ICEBERG_URL:+"$ICEBERG_URL/v1/config"}; do
+    case " $seen " in *" $u "*) continue ;; esac; seen="$seen $u"
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "$u" 2>/dev/null)
+    if [ "$code" = 200 ]; then
+      echo "  ✓ $u → 200"; case "$u" in */v1/config) cat_ok=1 ;; esac
+    else
+      echo "  · $u → ${code:-no answer}"
+      case "$u" in *:9000/*) echo "  ✗ the gateway S3/admin port does not answer"; bad=$((bad+1)) ;; esac
+    fi
+  done
+  [ "$cat_ok" = 1 ] || { echo "  ✗ no Iceberg catalog answered /v1/config at any address above"; bad=$((bad+1)); }
+
+  echo "python:"
+  if "${BLIMP_PY:-python3}" -c 'import pyiceberg' 2>/dev/null; then echo "  ✓ pyiceberg (${BLIMP_PY:-python3})"
+  else echo "  ✗ pyiceberg missing for ${BLIMP_PY:-python3} — blimp --setup installs it into ~/.blimp_venv"; bad=$((bad+1)); fi
+
+  echo "data bucket:"
+  if [ -z "${ORIGIN_BUCKET:-}" ]; then
+    echo "  (ORIGIN_BUCKET unset — nothing to check; --setup --data-bucket <bucket> names one)"
+  elif ! command -v aws >/dev/null 2>&1; then
+    echo "  ✗ aws CLI missing — cannot check s3://$ORIGIN_BUCKET"; bad=$((bad+1))
+  else
+    # shellcheck source=s3_check.sh
+    . "$HERE/s3_check.sh"
+    local ep=""; [ -n "${S3_ENDPOINT:-}" ] && ep=$(endpoint_local "$S3_ENDPOINT")
+    local vfy=""; case "$ep" in https://*) case "$ep" in *amazonaws.com*) ;; *) vfy="--no-verify-ssl" ;; esac ;; esac
+    local werr ident="this box's AWS identity"; [ -n "${S3_KEY:-}" ] && ident="the wiring's S3_KEY"
+    # shellcheck disable=SC2086
+    if werr=$(AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
+              AWS_DEFAULT_REGION="$REGION" s3_write_check "$ORIGIN_BUCKET" ${ep:+--endpoint-url "$ep"} $vfy); then
+      echo "  ✓ s3://$ORIGIN_BUCKET writable (${ep:-AWS S3}, $ident)"
+    else
+      echo "  ✗ s3://$ORIGIN_BUCKET not writable (${ep:-AWS S3}, $ident): $werr"; bad=$((bad+1))
+    fi
+  fi
+  echo
+  if [ "$bad" = 0 ]; then bold "doctor: no problems found"; else bold "doctor: $bad problem(s) — each ✗ line above names its fix"; fi
+  [ "$bad" = 0 ]
+}
+
 # Flags may follow the command: `blimp --query --evict --verify`. Two different
 # verifications exist: the AUTHOR's row-hash (the node proves every new MV
 # against the original query before banking it — always on, not a flag), and
@@ -1679,7 +2014,7 @@ pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
 for f in "$@"; do
   # --update / --update-log take their own sub-arguments (service lists,
   # --tag svc=tag, --dry-run, an update id); cmd_update validates them.
-  case "$CMD" in --update|update|--update-log|--register|register|--unregister|unregister) break ;; esac
+  case "$CMD" in --update|update|--update-log|--register|register|--unregister|unregister|--setup|setup) break ;; esac
   if [ -n "$pending" ]; then
     printf -v "$pending" '%s' "$f"; export "$pending"; pending=""; continue
   fi
@@ -1687,6 +2022,8 @@ for f in "$@"; do
     # --verify: after each measured tick, run the ORIGINAL query over base and
     # compare its result md5 with the tick's served result (bench_cdc.sh phase
     # 4). One original-query run per query; VERIFY_CAP_S caps it (default 3600).
+    # --yes: take every prompt's documented default (no terminal needed).
+    --yes|-y)       BLIMP_YES=1 ;;
     --verify)       VERIFY=1; export VERIFY ;;
     # --evict: genuine cold state — evict each query's MV(s) via /admin/mv/evict
     # before phase 1 so it re-authors from the recipe library.
@@ -1749,7 +2086,7 @@ case "$CMD" in --query|query) [ -n "${QNRS:-}" ] || QNRS=first-10 ;; esac
 # read-after-write and never exposes a torn erasure-decode under load.
 cmd_acid(){
   need_env
-  : "${GW:?gateway missing in wiring}"
+  require_wiring GW
   preflight 1 0
   [ -n "${GW_AK:-}" ] || GW_AK=$(ask GW_AK "Gateway S3 access key")
   [ -n "${GW_SK:-}" ] || GW_SK=$(ask GW_SK "Gateway S3 secret key")
@@ -1908,7 +2245,7 @@ cmd_immutable(){
 # pass reclaims nothing. Reads GW + CLUSTER_TOKEN from the wiring file.
 cmd_gc(){
   need_env
-  : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
+  require_wiring GW
   local S3_PORT="${S3_PORT:-9000}" tok="$CLUSTER_TOKEN"
   local url="http://$GW:$S3_PORT/admin/fleet/orphan-sweep"
   if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$GW:$S3_PORT/minio/health/live" 2>/dev/null)" != 200 ]; then
@@ -1936,7 +2273,7 @@ cmd_gc(){
 # polls, and tails.
 cmd_update(){
   need_env
-  : "${GW:?gateway missing in wiring — run 'blimp --setup'}"
+  require_wiring GW
   local tok="$CLUSTER_TOKEN" base="http://$GW:${CDC_PORT:-9401}"
   local what="" dry=0 tags="" a
   while [ $# -gt 0 ]; do
@@ -2002,7 +2339,8 @@ except Exception: pass' 2>/dev/null)
 }
 
 case "$CMD" in
-  --setup)            cmd_setup ;;
+  --setup|setup)      cmd_setup "$@" ;;
+  --doctor|doctor)    cmd_doctor ;;
   --update|update)    cmd_update "$@" ;;
   --update-log)       need_env; [ -n "${1:-}" ] || die "usage: blimp --update-log <update-id>"
                       curl -s -m 20 "http://$GW:${CDC_PORT:-9401}/update/log?id=$1" -H "Authorization: Bearer $CLUSTER_TOKEN" ;;
