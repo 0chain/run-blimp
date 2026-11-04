@@ -185,11 +185,6 @@ def main():
                             region=args.region, key=args.s3_key, secret=args.s3_secret,
                             prefix=args.prefix)
 
-    try:
-        cat.create_namespace(args.namespace)
-    except NamespaceAlreadyExistsError:
-        pass
-
     fs_kw = {"client_kwargs": {"region_name": args.region, "endpoint_url": s3_endpoint}}
     if args.s3_key:
         fs_kw["key"] = args.s3_key
@@ -219,6 +214,18 @@ def main():
         if not tables:
             sys.exit(f"no table prefixes with parquet under s3://{base}/ ({where})")
         print(f"  tables found: {', '.join(tables)}")
+    else:
+        # --tables given: still prove S3 access before touching the catalog.
+        try:
+            fs.ls(base)
+        except Exception as e:
+            sys.exit(f"FATAL: cannot list s3://{base}/ ({where}, endpoint {s3_endpoint}): {str(e)[:200]}")
+    # Only once the data is listed: a bad key or an empty prefix must leave no
+    # namespace behind in the catalog.
+    try:
+        cat.create_namespace(args.namespace)
+    except NamespaceAlreadyExistsError:
+        pass
     ok = 0
     for tbl in tables:
         prefix = f"{base}/{tbl}/"
