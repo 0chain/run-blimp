@@ -490,9 +490,28 @@ grep -q '^REG' "$CALLS" && bad "the registrar ran after the refusal" || ok "noth
 ( cmd_register --bucket whbkt/sf10 --s3-endpoint http://minio:9000 ) >/dev/null 2>&1; rc=$?
 eq "$rc" 0 "a prefix of the warehouse bucket registers"
 reg=$(grep '^REG' "$CALLS")
-case "$reg" in *"--warehouse s3://whbkt/wh "*"--source-bucket whbkt/sf10"*"--namespace sf10"*) ok "registrar lists the prefix, namespace = last path element, catalog's warehouse" ;; *) bad "prefix registrar args: $reg" ;; esac
+case "$reg" in *"--warehouse s3://whbkt/wh "*"--source-bucket whbkt "*"--namespace sf10"*"--source-prefix sf10"*) ok "registrar gets the bucket and the prefix apart, namespace = last path element, catalog's warehouse" ;; *) bad "prefix registrar args: $reg" ;; esac
 grep -q '/admin/source/configure.*"namespace": "sf10".*"bucket": "whbkt"' "$CALLS" \
   && ok "gateway wired to the warehouse bucket (not bucket/prefix)" || bad "gateway wiring: $(grep configure "$CALLS")"
+# a nested prefix: bucket once, the whole rest is the listing prefix
+: > "$CALLS"
+( cmd_register --bucket s3://whbkt//runs/r1/tier24/ --s3-endpoint http://minio:9000 --strict-nullability ) >/dev/null 2>&1
+reg=$(grep '^REG' "$CALLS")
+case "$reg" in *"--source-bucket whbkt "*"--namespace tier24"*"--source-prefix runs/r1/tier24 "*"--strict-nullability"*) ok "nested prefix parsed once as bucket + prefix; --strict-nullability passed" ;; *) bad "nested prefix registrar args: $reg" ;; esac
+# credentials by endpoint: the wiring's keys only for the wiring's endpoint, and
+# never as AWS keys unless they are AWS keys
+: > "$CALLS"
+( S3_ENDPOINT=http://minio:9000 S3_KEY=minioK S3_SECRET=minioS; cmd_register --bucket whbkt/p ) >/dev/null 2>&1
+grep '^REG' "$CALLS" | grep -q -- '--s3-key minioK' && ok "the wiring's keys reused for the wiring's endpoint" || bad "wiring keys not reused: $(grep '^REG' "$CALLS")"
+: > "$CALLS"
+( S3_ENDPOINT=http://minio:9000 S3_KEY=minioK S3_SECRET=minioS; cmd_register --bucket whbkt/p --s3-endpoint aws ) >/dev/null 2>&1
+grep '^REG' "$CALLS" | grep -q -- '--s3-key' && bad "MinIO keys sent to AWS: $(grep '^REG' "$CALLS")" || ok "an AWS bucket does not get the wiring's MinIO keys"
+: > "$CALLS"
+( S3_ENDPOINT= S3_KEY=minioK S3_SECRET=minioS; cmd_register --bucket whbkt/p ) >/dev/null 2>&1
+grep '^REG' "$CALLS" | grep -q -- '--s3-key' && bad "non-AWS wiring keys sent to AWS: $(grep '^REG' "$CALLS")" || ok "non-AWS wiring keys are not used as AWS keys"
+: > "$CALLS"
+( S3_ENDPOINT= S3_KEY=AKIAABCDEFGHIJKLMNOP S3_SECRET=s; cmd_register --bucket whbkt/p ) >/dev/null 2>&1
+grep '^REG' "$CALLS" | grep -q -- '--s3-key AKIAABCDEFGHIJKLMNOP' && ok "wiring AWS keys reused for AWS" || bad "wiring AWS keys dropped: $(grep '^REG' "$CALLS")"
 rm -rf "$TMPD"
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

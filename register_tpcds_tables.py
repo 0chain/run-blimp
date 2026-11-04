@@ -17,7 +17,7 @@
 #     --namespace tpcds
 #
 # The 24 TPC-DS tables live at s3://<source-bucket>/<table>/**/*.parquet.
-import argparse, sys
+import argparse, contextlib, io, sys
 import boto3
 import pyarrow.parquet as pq
 import s3fs
@@ -45,11 +45,81 @@ TPCDS_TABLES = [
 BASELINE_TAG_AGE_MS = 100 * 365 * 24 * 3600 * 1000  # rollback.py's TAG_AGE_MS
 
 
+def _mask(k):
+    """Last 4 characters only for a key long enough that 4 reveal little."""
+    return "…" + k[-4:] if k and len(k) >= 16 else "***"
+
+
+def print_s3_identity(endpoint, key, secret, region):
+    """Name the credentials in use before the first S3 call (blimp --register
+    once signed AWS requests with the node's MinIO keys and said nothing)."""
+    aws = not endpoint or endpoint.rstrip("/").endswith(".amazonaws.com")
+    if key and not aws:
+        print(f"  S3 identity: access key {_mask(key)} at {endpoint}")
+        return
+    if not aws:
+        print(f"  S3 identity: no keys (default credential chain) at {endpoint}")
+        return
+    if not key:
+        try:
+            c = boto3.Session().get_credentials()
+            chain = f"{c.method} key {_mask(c.access_key)}" if c else "no credentials found"
+        except Exception:
+            chain = "no credentials found"
+    try:
+        kw = {"region_name": region}
+        if key:
+            kw.update(aws_access_key_id=key, aws_secret_access_key=secret)
+        who = boto3.client("sts", **kw).get_caller_identity()
+        src = f"access key {_mask(key)}" if key else f"the AWS default credential chain ({chain})"
+        print(f"  S3 identity: AWS {who['Arn']} (account {who['Account']}) via {src}")
+    except Exception as e:
+        print(f"  S3 identity: AWS, {'access key ' + _mask(key) if key else 'default credential chain: ' + chain}"
+              f" — could not be resolved ({str(e)[:160]})")
+
+
+def nullability_gaps(t, fs, files):
+    """{column: file} for every top-level column the catalog table REQUIRES while
+    some parquet file declares it OPTIONAL — the one mismatch Iceberg resolves by
+    itself (an optional field accepts required and optional files alike). Read
+    only after add_files refused the files, so the happy path reads one footer."""
+    req = {f.name for f in t.schema().fields if f.required}
+    gaps = {}
+    for f in files:
+        with fs.open(f.replace("s3://", ""), "rb") as fh:
+            for fld in pq.read_schema(fh):
+                if fld.nullable and fld.name in req and fld.name not in gaps:
+                    gaps[fld.name] = f
+    return gaps
+
+
+def schema_mismatch(t, fs, files):
+    """One line naming the first column whose parquet type/presence differs from
+    the table, in place of pyiceberg's whole-schema table."""
+    tf = {f.name: f for f in t.schema().fields}
+    for f in files:
+        with fs.open(f.replace("s3://", ""), "rb") as fh:
+            sch = pq.read_schema(fh)
+        for fld in sch:
+            if fld.name not in tf:
+                return f"column {fld.name} is in {f} but not in the table"
+        missing = [n for n, x in tf.items() if x.required and n not in sch.names]
+        if missing:
+            return f"required column {missing[0]} is missing from {f}"
+    return ""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", required=True, help="Iceberg REST catalog URL")
     ap.add_argument("--warehouse", required=True, help="s3://bucket/prefix for catalog metadata + CDC appends")
-    ap.add_argument("--source-bucket", required=True, help="S3 bucket holding the TPC-DS parquet")
+    ap.add_argument("--source-bucket", required=True, help="S3 bucket holding the parquet (bucket[/prefix] accepted)")
+    ap.add_argument("--source-prefix", default="", help="prefix inside the bucket that holds <table>/ folders (may be nested: runs/<id>/<dataset>)")
+    # Iceberg has optional fields natively; a parquet column declared optional
+    # (pyarrow's and pandas' default) is registered as optional. --strict-nullability
+    # refuses instead, naming the column.
+    ap.add_argument("--strict-nullability", action="store_true",
+                    help="refuse a table whose parquet declares optional a column the table requires (default: make it optional)")
     ap.add_argument("--region", default="ap-south-1")
     ap.add_argument("--namespace", default="tpcds")
     ap.add_argument("--tables", default="", help="comma-separated tables (default: the 24 TPC-DS tables; 'auto' = every top-level prefix holding parquet)")
@@ -73,6 +143,14 @@ def main():
     ap.add_argument("--s3-secret", default="", help="S3 secret key")
     args = ap.parse_args()
 
+    # bucket[/prefix], parsed ONCE: the bucket for bucket calls (region, the
+    # warehouse comparison), bucket/prefix for listing. A nested value used to be
+    # taken whole as a bucket name by some calls and as a prefix by others.
+    bkt, _, pfx0 = args.source_bucket.strip("/").partition("/")
+    pfx = "/".join(x for x in (pfx0.strip("/"), args.source_prefix.strip("/")) if x)
+    base = f"{bkt}/{pfx}" if pfx else bkt
+    where = f"bucket '{bkt}', prefix '{pfx or '(none)'}'"
+
     auto = args.tables.strip() == "auto"
     tables = [] if auto else ([t.strip() for t in args.tables.split(",") if t.strip()] or TPCDS_TABLES)
 
@@ -83,9 +161,9 @@ def main():
     #    — a single S3 endpoint can't serve two regions, so pyiceberg's warehouse
     #    write would 301. Same-region is a hard requirement, so say so plainly.
     if not args.s3_endpoint and not args.s3_key:
-        src_region = bucket_region(args.source_bucket)
+        src_region = bucket_region(bkt)
         if src_region and src_region != args.region:
-            print(f"  NOTE: source bucket {args.source_bucket} is in {src_region}, "
+            print(f"  NOTE: source bucket {bkt} is in {src_region}, "
                   f"not --region {args.region} — using {src_region}")
             args.region = src_region
         wh_bkt = args.warehouse.split("/")[2] if args.warehouse.startswith("s3://") else ""
@@ -93,15 +171,16 @@ def main():
         if wh_region and src_region and wh_region != src_region:
             sys.exit(
                 f"FATAL: warehouse bucket '{wh_bkt}' is in {wh_region} but source "
-                f"'{args.source_bucket}' is in {src_region}. The Iceberg warehouse "
+                f"bucket '{bkt}' is in {src_region}. The Iceberg warehouse "
                 f"MUST be in the same region as your data — use e.g. "
-                f"s3://{args.source_bucket}/wh")
+                f"s3://{bkt}/wh")
 
     # DEFAULT to the region-specific S3 endpoint. Without it, s3fs and pyiceberg
     # fall back to the us-east-1 endpoint (s3.amazonaws.com), and any bucket in
     # another region returns HTTP 301. Customer only sets --s3-endpoint for MinIO.
     s3_endpoint = args.s3_endpoint or f"https://s3.{args.region}.amazonaws.com"
-    print(f"  s3 endpoint: {s3_endpoint}  region: {args.region}")
+    print(f"  s3 endpoint: {s3_endpoint}  region: {args.region}  {where}")
+    print_s3_identity(args.s3_endpoint, args.s3_key, args.s3_secret, args.region)
     cat = load_rest_catalog("zus", args.catalog, args.warehouse, s3_endpoint=s3_endpoint,
                             region=args.region, key=args.s3_key, secret=args.s3_secret,
                             prefix=args.prefix)
@@ -119,19 +198,30 @@ def main():
     if auto:
         # every top-level prefix of the bucket that holds parquet is a table;
         # the warehouse prefix (catalog metadata) is not
-        wh_dir = args.warehouse.split("/", 3)[3].split("/")[0] if args.warehouse.startswith(f"s3://{args.source_bucket}/") else ""
-        for d in fs.ls(args.source_bucket, detail=True):
+        wh_dir = args.warehouse[len(f"s3://{base}/"):].split("/")[0] if args.warehouse.startswith(f"s3://{base}/") else ""
+        try:
+            listing = fs.ls(base, detail=True)
+        except Exception as e:
+            sys.exit(f"FATAL: cannot list s3://{base}/ ({where}, endpoint {s3_endpoint}): {str(e)[:200]}")
+        for d in listing:
             name = d["name"].rstrip("/").split("/")[-1]
             if d.get("type") != "directory" or name == wh_dir or name.startswith((".", "_")):
                 continue
-            if any(p.endswith(".parquet") for p in fs.find(d["name"], maxdepth=None)):
+            found = [p for p in fs.find(d["name"], maxdepth=None) if p.endswith(".parquet")]
+            if found:
                 tables.append(name)
+                # parquet only in sub-folders that are not partitions (k=v):
+                # the folder is probably one more prefix level, not a table
+                subs = sorted({p[len(d["name"].rstrip("/")) + 1:].split("/")[0] for p in found if p.count("/") > d["name"].rstrip("/").count("/") + 1})
+                if subs and all("=" not in x for x in subs) and not any(p.count("/") == d["name"].rstrip("/").count("/") + 1 for p in found):
+                    print(f"  NOTE: {name}/ holds parquet only in sub-folders ({', '.join(subs[:5])}{', …' if len(subs) > 5 else ''})"
+                          f" — if those are the tables, pass --bucket {base}/{name}")
         if not tables:
-            sys.exit(f"no table prefixes with parquet under s3://{args.source_bucket}/")
+            sys.exit(f"no table prefixes with parquet under s3://{base}/ ({where})")
         print(f"  tables found: {', '.join(tables)}")
     ok = 0
     for tbl in tables:
-        prefix = f"{args.source_bucket}/{tbl}/"
+        prefix = f"{base}/{tbl}/"
         # exclude chunkINCR/: CDC-delta parquet written by gen_incr_delta.py with a
         # different physical layout (FLBA decimals); the CDC test appends those via
         # the API, they must not be in the base snapshot
@@ -159,7 +249,30 @@ def main():
                     ok += 1
                     continue
             # register the existing parquet files (no rewrite)
-            t.add_files(file_paths=files)
+            try:
+                # pyiceberg prints its whole-schema compatibility table to stdout
+                # before raising; the one-line message below replaces it
+                with contextlib.redirect_stdout(io.StringIO()):
+                    t.add_files(file_paths=files)
+            except ValueError as e:
+                if "Mismatch in fields" not in str(e):
+                    raise
+                gaps = nullability_gaps(t, fs, files)
+                if not gaps:
+                    raise RuntimeError(f"schema mismatch: {schema_mismatch(t, fs, files) or str(e).splitlines()[0]}") from None
+                col, f0 = next(iter(gaps.items()))
+                if args.strict_nullability:
+                    raise RuntimeError(f"{tbl}.{col} is optional in parquet ({f0}) and required by the catalog table"
+                                       f"{f' (+{len(gaps) - 1} more: ' + ', '.join(list(gaps)[1:]) + ')' if len(gaps) > 1 else ''}"
+                                       " — rewrite it non-nullable, or register without --strict-nullability") from None
+                # the files disagree on nullability (or the table came from a
+                # required-only first file): the column is optional
+                with t.update_schema() as u:
+                    for c in gaps:
+                        u.make_column_optional(c)
+                print(f"  {tbl:26s} NOTE optional in parquet, made optional in the table: {', '.join(gaps)} (e.g. {f0})")
+                t = cat.load_table(ident)
+                t.add_files(file_paths=files)
             if t.current_snapshot() is None:
                 raise RuntimeError("add_files committed no snapshot — the catalog table is still empty")
             n = t.current_snapshot().summary.get("total-records", "?") if t.current_snapshot() else "?"
@@ -175,7 +288,7 @@ def main():
             print(f"  {tbl:26s} OK   {len(files):5d} files  rows={n}{tagged}")
             ok += 1
         except Exception as e:
-            print(f"  {tbl:26s} FAIL {str(e)[:120]}")
+            print(f"  {tbl:26s} FAIL {str(e).splitlines()[0][:300] if str(e) else type(e).__name__} (s3://{prefix})")
     print(f"\nregistered {ok}/{len(tables)} tables into {args.catalog} ns={args.namespace}")
     sys.exit(0 if ok == len(tables) else 1)
 

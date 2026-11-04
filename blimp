@@ -61,8 +61,14 @@ usage(){
   blimp --register   Register YOUR parquet in the node's Iceberg catalog and point
                      the gateway at it (no copy; schema read from the parquet):
                        blimp --register --bucket B[/prefix] [--namespace NS] [--tables a,b]
-                         [--s3-endpoint URL --s3-key K --s3-secret S]
-                     Tables default to every top-level prefix of B holding parquet.
+                         [--s3-endpoint URL|aws --s3-key K --s3-secret S] [--strict-nullability]
+                     Tables default to every folder directly under B[/prefix] holding
+                     parquet; the prefix may be nested (B/runs/<id>/<dataset>). Optional
+                     (nullable) parquet columns register as optional Iceberg fields;
+                     --strict-nullability refuses a file that declares optional a
+                     column the table requires. The wiring's S3 keys
+                     are used only for the wiring's endpoint; an AWS bucket otherwise
+                     uses the AWS credential chain. The identity is printed first.
   blimp --unregister Drop a namespace's tables from the catalog (files untouched):
                        blimp --unregister [--namespace NS] [--tables a,b] [--yes]
   blimp --storage    Test: storage suite.
@@ -910,7 +916,8 @@ register_source_tables(){
   AWS_ACCESS_KEY_ID="${S3_KEY:-${AWS_ACCESS_KEY_ID:-}}" AWS_SECRET_ACCESS_KEY="${S3_SECRET:-${AWS_SECRET_ACCESS_KEY:-}}" \
     "${BLIMP_PY:-python3}" "$HERE/register_tpcds_tables.py" --catalog "$cat_url" \
     --warehouse "$reg_wh" --source-bucket "$ORIGIN_BUCKET" --region "$REGION" \
-    --namespace "$NAMESPACE" ${tables:+--tables "$tables"} $reg_ep $reg_keys $pfx_flag 2>&1
+    --namespace "$NAMESPACE" ${tables:+--tables "$tables"} ${SOURCE_PREFIX:+--source-prefix "$SOURCE_PREFIX"} \
+    ${STRICT_NULLABILITY:+--strict-nullability} $reg_ep $reg_keys $pfx_flag 2>&1
 }
 
 # wire_gateway_source — point the gateway's live source at $NAMESPACE in
@@ -1009,25 +1016,54 @@ except Exception: pass'
 #   --namespace NS     catalog namespace (default: the last path element)
 #   --tables a,b       tables to register (default: every top-level prefix
 #                      under the bucket that holds parquet)
-#   --s3-endpoint URL  the bucket's S3 endpoint (blank = AWS S3)
-#   --s3-key K --s3-secret S   keys for that endpoint (blank = IAM role)
+#   --s3-endpoint URL  the bucket's S3 endpoint (default: the wiring's; "aws" = AWS S3)
+#   --s3-key K --s3-secret S   keys for that endpoint (default: the wiring's keys
+#                      when the endpoint is the wiring's; for AWS, the AWS default
+#                      credential chain — env, profile, instance role)
+#   --strict-nullability  refuse parquet that declares optional a column the
+#                      table requires (default: register it as optional)
 cmd_register(){
   need_env
-  local bucket="" ns="" tables="auto" ep="${S3_ENDPOINT:-}" key="${S3_KEY:-}" sec="${S3_SECRET:-}"
+  local bucket="" ns="" tables="auto" ep="${S3_ENDPOINT:-}" key="" sec="" key_set=0 strict=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --bucket)      bucket="${2:?--bucket needs a value}"; shift ;;
       --namespace)   ns="${2:?--namespace needs a value}"; shift ;;
       --tables)      tables="${2:?--tables needs a value}"; shift ;;
-      --s3-endpoint) ep="${2:?--s3-endpoint needs a value}"; shift ;;
-      --s3-key)      key="${2:?--s3-key needs a value}"; shift ;;
+      --s3-endpoint) ep="${2:?--s3-endpoint needs a value}"; shift; case "$ep" in aws|AWS) ep="" ;; esac ;;
+      --s3-key)      key="${2:?--s3-key needs a value}"; key_set=1; shift ;;
       --s3-secret)   sec="${2:?--s3-secret needs a value}"; shift ;;
+      --strict-nullability) strict=1 ;;
       *) die "--register: unknown flag $1 (see blimp --help)" ;;
     esac; shift
   done
-  [ -n "$bucket" ] || die "usage: blimp --register --bucket <bucket>[/prefix] [--namespace NS] [--tables a,b] [--s3-endpoint URL --s3-key K --s3-secret S]"
-  bucket="${bucket#s3://}"; bucket="${bucket%/}"
-  local root="${bucket%%/*}"
+  [ -n "$bucket" ] || die "usage: blimp --register --bucket <bucket>[/prefix] [--namespace NS] [--tables a,b] [--s3-endpoint URL|aws --s3-key K --s3-secret S] [--strict-nullability]"
+  # --bucket is parsed ONCE as bucket[/prefix]: the bucket for every bucket call
+  # (warehouse comparison, region, the gateway's source), the prefix — nested
+  # is fine (runs/<id>/<dataset>) — for listing the tables.
+  bucket="${bucket#s3://}"; bucket=$(printf '%s' "$bucket" | sed -E 's#/+#/#g; s#^/##; s#/$##')
+  local root="${bucket%%/*}" prefix=""
+  [ "$bucket" = "$root" ] || prefix="${bucket#*/}"
+  # CREDENTIALS BY ENDPOINT. The wiring's S3_KEY/S3_SECRET belong to the
+  # wiring's S3_ENDPOINT (on a node, its MinIO). They are reused only for that
+  # endpoint, and never as AWS keys unless they are AWS keys: --register once
+  # signed a customer's AWS bucket with the node's MinIO keys ("The AWS Access
+  # Key Id you provided does not exist in our records", 2026-11-03).
+  local aws_ep=0 cred_src
+  case "$ep" in ""|*.amazonaws.com|*.amazonaws.com/) aws_ep=1 ;; esac
+  if [ "$key_set" = 1 ]; then
+    cred_src="the keys passed with --s3-key"
+  elif [ "$ep" = "${S3_ENDPOINT:-}" ] && [ -n "${S3_KEY:-}" ] \
+       && { [ "$aws_ep" = 0 ] || printf '%s' "$S3_KEY" | grep -qE '^(AKIA|ASIA)[A-Z0-9]{16}$'; }; then
+    key="$S3_KEY"; sec="${S3_SECRET:-}"
+    cred_src="the wiring's keys for ${ep:-AWS S3} ($ENVF)"
+  elif [ "$aws_ep" = 1 ]; then
+    cred_src="the AWS default credential chain (env / profile / instance role)"
+    [ -n "${S3_KEY:-}" ] && cred_src="$cred_src — not the wiring's S3_KEY, which belongs to ${S3_ENDPOINT:-a non-AWS S3}"
+  else
+    cred_src="no keys (the wiring's keys belong to ${S3_ENDPOINT:-AWS S3}, not $ep — pass --s3-key/--s3-secret)"
+  fi
+  bold "  data: bucket $root, prefix ${prefix:-(none)}, endpoint ${ep:-AWS S3} — credentials: $cred_src"
   # A catalog with a fixed PATH warehouse (a plain REST catalog) writes table
   # metadata there whatever the registrar asks, and the gateway reads catalog
   # metadata only from the data bucket (setup's guardrail 1): data in another
@@ -1039,11 +1075,13 @@ try: print(json.load(sys.stdin).get("defaults",{}).get("warehouse",""))
 except Exception: print("")' 2>/dev/null)
     case "$cwh" in s3://*)
       local wb; wb=$(echo "$cwh" | sed -E 's#^s3://([^/]+).*#\1#')
-      [ "$wb" = "$root" ] || die "the catalog keeps its metadata in s3://$wb and the gateway reads metadata only from the data bucket — put the data under a prefix of that bucket and pass --bucket $wb/<prefix>, or wire your own catalog with blimp --setup"
+      [ "$wb" = "$root" ] || die "the catalog keeps its metadata in s3://$wb and the gateway reads metadata only from the data bucket ($root, prefix ${prefix:-(none)}) — put the data under a prefix of that bucket and pass --bucket $wb/<prefix>, or wire your own catalog with blimp --setup"
       WAREHOUSE="$cwh" ;;
     esac
   fi
   ORIGIN_BUCKET="$root"; NAMESPACE="${ns:-${bucket##*/}}"
+  # S3_KEY/S3_SECRET now name the DATA bucket's keys (save_env persists them
+  # with S3_ENDPOINT, so the pair stays consistent).
   S3_ENDPOINT="$ep"; S3_KEY="$key"; S3_SECRET="$sec"
   # The data is the caller's own bucket now, not the node's TPC-DS standup.
   SOURCE_TARGET=external
@@ -1053,8 +1091,9 @@ except Exception: print("")' 2>/dev/null)
   export ORIGIN_BUCKET NAMESPACE S3_ENDPOINT S3_KEY S3_SECRET SOURCE_TARGET WAREHOUSE
   bold "== registering s3://$bucket ($tables) as namespace $NAMESPACE =="
   local before; before=$(catalog_list_tables "$NAMESPACE")
-  # the registrar lists s3://<bucket>[/prefix]/<table>/ — the prefix rides in its bucket arg
-  ORIGIN_BUCKET="$bucket" REGISTER_EXPLICIT_S3=1 register_source_tables "$tables" || die "registration failed — nothing re-wired"
+  # the registrar lists s3://<bucket>/<prefix>/<table>/
+  SOURCE_PREFIX="$prefix" STRICT_NULLABILITY="$strict" REGISTER_EXPLICIT_S3=1 register_source_tables "$tables" \
+    || die "registration of bucket $root, prefix ${prefix:-(none)} failed (above) — nothing re-wired"
   # A catalog that does not publish its warehouse (/v1/config empty — the
   # tabulario REST catalog) is checked after the fact: where it actually put a
   # new table's metadata. Outside the data bucket, the new tables are dropped
