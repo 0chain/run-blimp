@@ -167,7 +167,7 @@ facts_of(){ printf '%s\n' "${SUITE_ARR[@]}" | cut -d: -f1 | sort -u; }
 names_for_fact(){ local ft="$1" n; for n in "${NAMES[@]}"; do [ "${FACT[$n]}" = "$ft" ] && printf '%s ' "$n"; done; }
 
 # per-run captured columns
-declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL I_T0 V_RESULT V_RESURL MERGE MODE REASON MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT
+declare -A A_MS M_MS V_MS S_MS I_QMS I_MERGE I_STATUS I_ROWS I_MD5 I_MD5R I_MVURL I_RESURL I_T0 V_RESULT V_RESURL MERGE MODE REASON MVTBL MV_ROWS MV_COLS MV_HASH_OLD MV_HASH_NEW DELTA_ROWS DELTA_VERDICT TICK_ROUTE
 
 run(){ # run <sql> <label> [author_phase]  -> echoes the JSON
   # EVERY call passes skip_verify — the production path. The author's own
@@ -576,6 +576,20 @@ except Exception: print(-1)' 2>/dev/null)
     # THE TICK'S RESULT IDENTITY: status, rows and the result md5 the gateway
     # computed, so the served tick can be compared with the original query.
     echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint} status=$(echo "$R" | J status) rows=$(echo "$R" | J rows) md5=$(echo "$R" | J md5) md5r=$(echo "$R" | J md5_rounded)"
+    # THE ROUTE THE TICK TOOK, from the gateway's own trace: an answer page kept
+    # by a delta route rewrites its whole small data.parquet, which the ETag
+    # gate below reads as "rebaselined" — 22 of a customer's 28 "rebaselined"
+    # SF10 ticks were delta routes (2026-11-05).
+    TICK_ROUTE[$n]=$(echo "$R" | "$PY3" -c '
+import json,sys
+try: d=json.loads(sys.stdin.read() or "{}")
+except Exception: d={}
+ph=[str(x.get("phase","")) for x in (d.get("author_trace") or [])]
+delta=("answer_delta_topn","answer_delta_legs","answer_delta_sum","answer_key_local","key_local_recompute")
+rec=("answer_from_rollup_levels","answer_from_udr_level","answer_refresh_stamped_full","answer_delta_declined","answer_page_delta_declined")
+r=next((p for p in ph if p in delta), "")
+if not r and any(p in rec for p in ph): r="RECOMPUTED"
+print(r)' 2>/dev/null)
     # THE TICK, one format for every query: the post-append request's own phase
     # totals (the parts sum to its wall time) and the MV's current size.
     echo "$R" | "$PY3" -c '
@@ -616,6 +630,11 @@ try: d=json.load(open(sys.argv[1]))
 except Exception: print(''); raise SystemExit
 e=d.get(sys.argv[2]) or {}
 print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$t" 2>/dev/null)"
+      # a rewritten page the gateway kept by a delta route is a delta merge;
+      # one it recomputed is named as such
+      if [ "$v" = rebaselined ]; then
+        case "${TICK_ROUTE[$n]:-}" in RECOMPUTED) v=RECOMPUTED;; "") ;; *) v="delta:${TICK_ROUTE[$n]}";; esac
+      fi
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
     done
   fi
