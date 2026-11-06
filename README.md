@@ -565,7 +565,12 @@ the browser — so a MISMATCH can be inspected side by side.
 `merge_ms` only counts when `delta_verdict` is `merged` — `UNCHANGED` or
 `EMPTY` mean the append produced no delta for that MV and the number measured
 nothing. `rebaselined` means no delta part was written but the MV content
-changed (a full re-aggregation ran instead of a merge); `NO-BASELINE` means the
+changed and the gateway did not name the route (a gateway that predates
+`tick_route`). A rewritten MV is otherwise labelled with the gateway's
+`tick_route`: `delta` (every write O(Δ), e.g. an answer page kept by a Δ
+route), `recompute` (an MV recomputed from Δ-merged MVs only, no fact read),
+`key-local` (the touched keys recomputed from base) or `rebuild` (an MV
+rebuilt from a full fact read); `NO-BASELINE` means the
 MV did not exist before the tick, so the merge is unproven, not a result. `mode=incremental` is the delta-merge fast path; `no-delta` is a full
 re-author; "no MV — served from base" means the query authored nothing and
 scanned the source. There is **no PASS/FAIL verdict**: those outcomes are

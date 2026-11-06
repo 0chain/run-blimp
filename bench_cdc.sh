@@ -576,19 +576,21 @@ except Exception: print(-1)' 2>/dev/null)
     # THE TICK'S RESULT IDENTITY: status, rows and the result md5 the gateway
     # computed, so the served tick can be compared with the original query.
     echo "   $n: incr_query=${I_QMS[$n]:-?}ms merge=${I_MERGE[$n]:-–}ms mv=${MV_ROWS[$n]:-?}x${MV_COLS[$n]:-?}${hint} status=$(echo "$R" | J status) rows=$(echo "$R" | J rows) md5=$(echo "$R" | J md5) md5r=$(echo "$R" | J md5_rounded)"
-    # THE ROUTE THE TICK TOOK, from the gateway's own trace: an answer page kept
-    # by a delta route rewrites its whole small data.parquet, which the ETag
-    # gate below reads as "rebaselined" — 22 of a customer's 28 "rebaselined"
-    # SF10 ticks were delta routes (2026-11-05).
+    # THE ROUTE THE TICK TOOK, as the gateway names it (tick_route: delta |
+    # recompute | key-local | rebuild | none) — one label for any query
+    # on any dataset, decided where the work ran. The bench used to re-derive
+    # it from phase-name lists of its own; those lists are kept only for a
+    # gateway that predates the field.
     TICK_ROUTE[$n]=$(echo "$R" | "$PY3" -c '
 import json,sys
 try: d=json.loads(sys.stdin.read() or "{}")
 except Exception: d={}
-ph=[str(x.get("phase","")) for x in (d.get("author_trace") or [])]
-delta=("answer_delta_topn","answer_delta_legs","answer_delta_sum","answer_key_local","key_local_recompute")
-rec=("answer_from_rollup_levels","answer_from_udr_level","answer_refresh_stamped_full","answer_delta_declined","answer_page_delta_declined")
-r=next((p for p in ph if p in delta), "")
-if not r and any(p in rec for p in ph): r="RECOMPUTED"
+r=d.get("tick_route") or ""
+if not r:
+    ph=[str(x.get("phase","")) for x in (d.get("author_trace") or [])]
+    if any(p in ("answer_delta_topn","answer_delta_legs","answer_delta_sum","answer_key_local") for p in ph): r="delta"
+    elif "key_local_recompute" in ph: r="key-local"
+    elif any(p in ("answer_from_rollup_levels","answer_from_udr_level","answer_refresh_stamped_full","answer_delta_declined","answer_page_delta_declined") for p in ph): r="recompute"
 print(r)' 2>/dev/null)
     # THE TICK, one format for every query: the post-append request's own phase
     # totals (the parts sum to its wall time) and the MV's current size.
@@ -632,7 +634,7 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
       # a rewritten page the gateway kept by a delta route is a delta merge;
       # one it recomputed is named as such
       if [ "$v" = rebaselined ]; then
-        case "${TICK_ROUTE[$n]:-}" in RECOMPUTED) v=RECOMPUTED;; "") ;; *) v="delta:${TICK_ROUTE[$n]}";; esac
+        case "${TICK_ROUTE[$n]:-}" in ""|none) ;; *) v="${TICK_ROUTE[$n]}";; esac
       fi
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
       [ -n "${TICK_ROUTE[$n]:-}" ] && _gate_routes="$_gate_routes $t=${TICK_ROUTE[$n]}"
@@ -650,9 +652,8 @@ except Exception: raise SystemExit
 for kv in sys.argv[2:]:
     t,r=kv.split('=',1)
     e=d.get(t)
-    if not isinstance(e,dict) or e.get('verdict')!='rebaselined': continue
-    e['route']=r
-    e['verdict']='recomputed' if r=='RECOMPUTED' else 'delta-page'
+    if not isinstance(e,dict) or e.get('verdict')!='rebaselined' or r=='none': continue
+    e['verdict']=r
 json.dump(d,open(sys.argv[1],'w'),indent=1)" "$DELTA_POST" $_gate_routes 2>/dev/null || true
     sed 's/^/   /' "$DELTA_POST"
     [ -s "$DELTA_ERR" ] && sed 's/^/   ! /' "$DELTA_ERR"
@@ -789,7 +790,11 @@ echo "delta_verdict is THE GATE on merge_ms — it is read off the delta part's 
 echo "parquet footer, the only place the truth exists (the gateway counts delta"
 echo "FILES, never rows):"
 echo "  merged       delta part had rows>0            -> merge_ms is a REAL number"
-echo "  rebaselined  no part, MV content changed      -> full re-aggregation ran"
+echo "  delta        MV rewritten by an O(delta) route (gateway tick_route)"
+echo "  recompute    MV recomputed from delta-merged MVs, no fact read"
+echo "  key-local    touched keys recomputed from base"
+echo "  rebuild      MV rebuilt from a full fact read"
+echo "  rebaselined  no part, MV content changed, route not named (older gateway)"
 echo "  EMPTY        delta part had 0 rows            -> merge_ms MEASURED NOTHING"
 echo "  UNCHANGED    no part, MV byte-identical       -> merge_ms MEASURED NOTHING"
 echo "  NO-BASELINE  MV absent from the pre-snapshot     -> unproven, not a result"
