@@ -620,8 +620,7 @@ for x in fb: print("   %s: SCALE-FALLBACK %s" % (n, x[:300]))
     echo ">> delta gate: rows folded in by each merge"
     : > "$DELTA_ERR"
     delta_tool verdict --pre "$DELTA_PRE" --tables $GATE_TABLES > "$DELTA_POST" || true
-    sed 's/^/   /' "$DELTA_POST"
-    [ -s "$DELTA_ERR" ] && sed 's/^/   ! /' "$DELTA_ERR"
+    _gate_routes=""
     for n in $FNAMES; do
       t="${MVTBL[$n]##*.}"; [ -n "$t" ] || continue
       read v r <<<"$("$PY3" -c "
@@ -636,7 +635,27 @@ print('%s %s'%(e.get('verdict','?'), e.get('delta_rows','?')))" "$DELTA_POST" "$
         case "${TICK_ROUTE[$n]:-}" in RECOMPUTED) v=RECOMPUTED;; "") ;; *) v="delta:${TICK_ROUTE[$n]}";; esac
       fi
       DELTA_VERDICT[$n]="${v:-?}"; DELTA_ROWS[$n]="${r:-?}"
+      [ -n "${TICK_ROUTE[$n]:-}" ] && _gate_routes="$_gate_routes $t=${TICK_ROUTE[$n]}"
     done
+    # THE PRINTED GATE CARRIES THE ROUTE TOO: a rewritten answer page the
+    # gateway kept by a delta route read "verdict": "rebaselined",
+    # delta_rows 0 in this JSON while the table said delta:<route>, and a
+    # customer's report read the JSON as "still a rebaseline underneath"
+    # (ebc5ab39, SF10, 2026-11-06). The page is written whole because a
+    # top-N / page cannot be appended to; the work behind it is O(Δ).
+    "$PY3" -c "
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: raise SystemExit
+for kv in sys.argv[2:]:
+    t,r=kv.split('=',1)
+    e=d.get(t)
+    if not isinstance(e,dict) or e.get('verdict')!='rebaselined': continue
+    e['route']=r
+    e['verdict']='recomputed' if r=='RECOMPUTED' else 'delta-page'
+json.dump(d,open(sys.argv[1],'w'),indent=1)" "$DELTA_POST" $_gate_routes 2>/dev/null || true
+    sed 's/^/   /' "$DELTA_POST"
+    [ -s "$DELTA_ERR" ] && sed 's/^/   ! /' "$DELTA_ERR"
   fi
   # EVERY TICK IS CHECKED (user mandate 2026-10-07): a tick that is not the last
   # is compared with the original over base here, before the next append
