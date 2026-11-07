@@ -242,6 +242,14 @@ def sql_literal(v):
     if isinstance(v, (int, decimal.Decimal)):
         return str(v)
     if isinstance(v, float):
+        # a non-finite float has no bare literal: `inf` reads as a column
+        # (q59's week-over-week ratio divides by a zero week; the membership
+        # proof died "Referenced column inf not found" and the verdict read
+        # MISMATCH, node 37, 2026-11-07)
+        if v != v:
+            return "'nan'::DOUBLE"
+        if v in (float("inf"), float("-inf")):
+            return "'%s'::DOUBLE" % ("inf" if v > 0 else "-inf")
         return repr(v)
     if isinstance(v, datetime.datetime):
         return "TIMESTAMP '%s'" % v.isoformat(sep=" ")
@@ -273,7 +281,11 @@ def membership_sql(sql, served_raw):
     on = []
     for i in range(k):
         if any(isinstance(r[i], float) for r in rows):
-            on.append("(q.c%d IS NULL AND v.c%d IS NULL OR abs(q.c%d - v.c%d) <= 1e-9 * greatest(1, abs(v.c%d)))" % (i, i, i, i, i))
+            # equal first: inf - inf is NaN, so infinities match only by =
+            # the tolerance only between finite values: inf <= inf and NaN
+            # compare TRUE in DuckDB, which "proved" a non-finite row a member
+            # of any answer (review B-1)
+            on.append("(q.c%d IS NULL AND v.c%d IS NULL OR q.c%d = v.c%d OR (isfinite(q.c%d) AND isfinite(v.c%d) AND abs(q.c%d - v.c%d) <= 1e-9 * greatest(1, abs(v.c%d))))" % ((i,) * 9))
         else:
             on.append("q.c%d IS NOT DISTINCT FROM v.c%d" % (i, i))
     return "SELECT v.rid FROM (%s) q(%s) JOIN (VALUES %s) v(rid, need, %s) ON %s GROUP BY v.rid, v.need HAVING count(*) >= v.need" % (whole, qc, vals, qc, " AND ".join(on))

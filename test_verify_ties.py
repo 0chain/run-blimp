@@ -36,6 +36,15 @@ class WrittenSince(unittest.TestCase):
         assert v.written_since(_FakeFS(t - datetime.timedelta(days=1)), "b/k", 0)
 
 
+
+class NonFinite(unittest.TestCase):
+    # q59's week-over-week ratio puts inf in the tied rows (node 37, 2026-11-07)
+    def test_literals_and_tolerance(self):
+        self.assertEqual(v.sql_literal(float("inf")), "'inf'::DOUBLE")
+        self.assertEqual(v.sql_literal(float("nan")), "'nan'::DOUBLE")
+        m = v.membership_sql("SELECT a, b FROM t ORDER BY a LIMIT 3", (["a", "b"], [(1, float("inf"))]))
+        self.assertIn("isfinite(q.c1) AND isfinite(v.c1)", m)
+
 if __name__ == "__main__":
     unittest.main()
 
