@@ -48,3 +48,45 @@ class NonFinite(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class KeyedProof(unittest.TestCase):
+    """ORDER BY keys not projected (ClickBench v_q25_*): the page is proven by
+    ranking the whole relation on the query's own ORDER BY."""
+    Q = "SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 3;"
+    SETUP = "CREATE TABLE hits AS SELECT * FROM (VALUES ('a',1),('b',2),('c',3),('d',3),('e',4),('', 0)) t(SearchPhrase, EventTime);"
+
+    def test_not_applicable(self):
+        for q in ["SELECT k, count(*) FROM t GROUP BY k ORDER BY max(x) LIMIT 3",
+                  "SELECT DISTINCT k FROM t ORDER BY x LIMIT 3",
+                  "SELECT k FROM t ORDER BY x LIMIT 3 OFFSET 2",
+                  "SELECT k FROM a UNION ALL SELECT k FROM b ORDER BY 1 LIMIT 3",
+                  # review K-1/K-2: an ordinal or a shadowing alias binds
+                  # differently in a window; a comment swallows the statement
+                  "SELECT SearchPhrase FROM hits ORDER BY 1, EventTime LIMIT 2",
+                  "SELECT -a AS a FROM t ORDER BY a, b LIMIT 2",
+                  "SELECT a FROM t -- x\nORDER BY b LIMIT 2",
+                  # K-3..K-6: parenthesized ordinal / alias, quoted names, a
+                  # repeated expression under two aliases
+                  "SELECT a FROM t ORDER BY (1) DESC, x LIMIT 1",
+                  "SELECT -a AS a FROM t ORDER BY (a) LIMIT 1",
+                  'SELECT -a AS a FROM t ORDER BY "a", x LIMIT 1',
+                  'SELECT -a AS "a" FROM t ORDER BY a, x LIMIT 1',
+                  "SELECT -a AS x, -a AS a FROM t ORDER BY x DESC, b LIMIT 1"]:
+            self.assertIsNone(v.keyed_proof_sql(q, (["k"], [("a",)])), q)
+
+    def test_proof_in_duckdb(self):
+        import shutil, subprocess
+        if not shutil.which("duckdb"):
+            self.skipTest("no duckdb CLI")
+        def holds(served):
+            want, stmt = v.keyed_proof_sql(self.Q, (["SearchPhrase"], served))
+            out = subprocess.run(["duckdb", "-csv", "-noheader", "-c", self.SETUP + stmt + ";"], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return len([l for l in out.stdout.splitlines() if l.strip()]) == want
+        self.assertTrue(holds([("a",), ("b",), ("c",)]))
+        self.assertTrue(holds([("a",), ("b",), ("d",)]))   # the other tied row
+        self.assertFalse(holds([("a",), ("c",), ("d",)]))  # b ranks before the tie
+        self.assertFalse(holds([("a",), ("b",), ("e",)]))  # e is past the page
+        self.assertFalse(holds([("a",), ("b",)]))          # short page
+        self.assertFalse(holds([("a",), ("a",), ("b",)]))  # a served twice

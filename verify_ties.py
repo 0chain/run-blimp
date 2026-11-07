@@ -291,6 +291,130 @@ def membership_sql(sql, served_raw):
     return "SELECT v.rid FROM (%s) q(%s) JOIN (VALUES %s) v(rid, need, %s) ON %s GROUP BY v.rid, v.need HAVING count(*) >= v.need" % (whole, qc, vals, qc, " AND ".join(on))
 
 
+def has_comment(sql):
+    """A -- or /* comment outside string literals."""
+    i = 0
+    while i < len(sql):
+        if sql[i] == "'":
+            j = i + 1
+            while j < len(sql) and not (sql[j] == "'" and not sql.startswith("''", j)):
+                j += 2 if sql.startswith("''", j) else 1
+            i = j + 1
+        elif sql.startswith("--", i) or sql.startswith("/*", i):
+            return True
+        else:
+            i += 1
+    return False
+
+
+def top_level_items(text):
+    """text split on its depth-0 commas."""
+    items, cur, depth = [], "", 0
+    for c in text:
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        if c == "," and depth == 0:
+            items.append(cur); cur = ""
+        else:
+            cur += c
+    items.append(cur)
+    return items
+
+
+def keyed_output_items(blanked, start, end):
+    """[(expression, output name)] of the outermost select list, one per item
+    (blanked: literals blanked, same length as the SQL). None when an item is
+    quoted or its name cannot be read — the keyed proof then declines."""
+    body = blanked[start:end]
+    if '"' in body or "`" in body:
+        return None
+    out = []
+    for it in top_level_items(body):
+        it = it.strip()
+        if not it:
+            return None
+        if it == "*" or it.endswith(".*"):
+            continue
+        if re.fullmatch(r"\w+(\.\w+)?", it):
+            out.append((it.lower(), it.split(".")[-1].lower()))
+            continue
+        m = re.fullmatch(r"(.+?)\s+(?:as\s+)?(\w+)", it, re.I | re.S)
+        if not m:
+            return None
+        out.append((re.sub(r"\s+", "", m.group(1)).lower(), m.group(2).lower()))
+    return out
+
+
+def keyed_proof_sql(sql, served_raw):
+    """(want, statement) proving a page whose ORDER BY keys are NOT projected:
+    the served rows carry no key, so the tie rule cannot see the boundary
+    (ClickBench v_q25_*: `SELECT SearchPhrase … ORDER BY EventTime LIMIT 10`,
+    a false MISMATCH on every run, node 144, 2026-11-07). The statement ranks
+    the whole relation by the query's own ORDER BY text (rank(): ties share a
+    rank) and returns one row iff every row ranked before the n-th row is
+    served, every served row is a row ranked at or before it (multiplicities
+    included), and as many rows were served as the page holds. None when the
+    outermost statement is not a plain SELECT … ORDER BY … LIMIT n."""
+    orig = sql.strip().rstrip(";").rstrip()
+    s = blank_sql(orig)
+    mask = top_level(s)
+    def top(rx):
+        return [m for m in re.finditer(rx, s, re.I) if mask[m.start()]]
+    if top(r"\b(group\s+by|having|distinct|union|intersect|except|qualify|offset)\b"):
+        return None
+    sel, obs = top(r"\bselect\b"), top(r"\border\s+by\b")
+    lim = re.search(r"\blimit\s+(\d+)\s*$", s, re.I)
+    if len(sel) != 1 or sel[0].start() != 0 or not obs or not lim or not all(mask[lim.start():]):
+        return None
+    ob = obs[-1]
+    frm = [m for m in top(r"\bfrom\b") if m.start() < ob.start()]
+    cols, rows = served_raw
+    n, k = int(lim.group(1)), len(cols)
+    if not frm or not rows or k == 0 or n <= 0:
+        return None
+    items = orig[ob.end():lim.start()].strip()
+    # The window must bind each item as the ORDER BY does (review K-1/K-2): an
+    # ordinal is a constant in a window, and a bare name that is an output
+    # alias binds to the alias in ORDER BY but to the source column in the
+    # window. Neither is rebound here — the proof declines (a MISMATCH stays).
+    # A comment would swallow the rest of the one-line statement.
+    if has_comment(orig):
+        return None
+    outs = keyed_output_items(s, sel[0].end(), frm[0].start())
+    if outs is None:
+        return None
+    for it in top_level_items(strip_sql(items)):
+        core = re.sub(r"\s+(asc|desc)\b|\s+nulls\s+(first|last)\b", "", it.strip(), flags=re.I).strip()
+        # ALLOW-LIST (review K-3..K-6): a plain column only. Parentheses,
+        # quotes, ordinals and expressions decline.
+        if not re.fullmatch(r"\w+(\.\w+)?", core) or re.fullmatch(r"\d+", core):
+            return None
+        bare = core.lower()
+        if "." not in bare:
+            for expr, name in outs:
+                if name == bare and expr.split(".")[-1] != bare:
+                    return None  # an output alias shadows the column
+    f = frm[0].start()
+    inner = "%s, rank() OVER (ORDER BY %s) AS __rk %s" % (orig[:f].rstrip(), items, orig[f:ob.start()].rstrip())
+    cs = ", ".join("c%d" % i for i in range(k))
+    need = Counter(rows)
+    vals = ", ".join("(%s, %d)" % (", ".join(sql_literal(v) for v in r), need[r]) for r in need)
+    def eq(a, b):
+        return " AND ".join("%s.c%d IS NOT DISTINCT FROM %s.c%d" % (a, i, b, i) for i in range(k))
+    stmt = ("WITH w(%s, __rk) AS (%s), "
+            "r AS (SELECT COALESCE((SELECT __rk FROM w ORDER BY __rk LIMIT 1 OFFSET %d), (SELECT max(__rk) FROM w)) AS r), "
+            "need AS (SELECT %s, count(*) AS cnt FROM w, r WHERE w.__rk < r.r GROUP BY ALL), "
+            "pool AS (SELECT %s, count(*) AS cnt FROM w, r WHERE w.__rk <= r.r GROUP BY ALL), "
+            "s(%s, cnt) AS (VALUES %s) "
+            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM need LEFT JOIN s ON %s WHERE s.cnt IS NULL OR s.cnt < need.cnt) "
+            "AND NOT EXISTS (SELECT 1 FROM s LEFT JOIN pool ON %s WHERE pool.cnt IS NULL OR s.cnt > pool.cnt) "
+            "AND (SELECT sum(cnt) FROM s) = least(%d, (SELECT count(*) FROM w))") % (
+        cs, inner, n - 1, cs, cs, cs, vals, eq("need", "s"), eq("s", "pool"), n)
+    return 1, stmt
+
+
 def has_offset(sql):
     """The outermost statement ends in LIMIT n OFFSET k."""
     s = strip_sql(sql).strip().rstrip(";").strip()
@@ -421,7 +545,16 @@ def main():
         ok, why = float_verdict(read_raw(served, fs), read_raw(base, fs))
         if not ok:
             ok, why = tie_verdict(a.sql, read_rows(served, fs), read_rows(base, fs))
-            if ok and a.membership_out:
+            keyed = None
+            if not ok and "do not all resolve to result columns" in why:
+                keyed = keyed_proof_sql(a.sql, read_raw(served, fs))
+            if keyed and a.membership_out:
+                # the ORDER BY keys are not in the result: the page is proven
+                # against the whole relation ranked by those keys, on the base
+                with open(a.membership_out, "w") as f:
+                    f.write("%d\n%s\n" % keyed)
+                ok, why = True, "ties: ORDER BY keys are not result columns — proven by the keyed rank check over the base"
+            elif ok and a.membership_out:
                 raw = read_raw(served, fs)
                 m = membership_sql(a.sql, raw)
                 if m:
