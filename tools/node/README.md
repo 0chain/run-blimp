@@ -12,7 +12,7 @@ Install on a node: copy each file to `/root/` (the paths the scripts assume), th
   sources back to `bench_baseline`, expire abandoned snapshots, run `tpc_batch`.
 - `restart_clean.sh <env> <irc|-> <s3e|-> <LABEL> <argsfile>` — stop the running pass,
   update to `zs3:latest`, start a new one.
-- `stopone.sh <q>` — stop one query's run (client and gateway).
+- `stopone.sh <q>` — stop one query's run: blimp, its `bench_cdc.sh` tick loop (also an orphaned one) and the gateway query, each process tree by PID; exits 1 naming any PID still alive. `tpc_batch` moves to the next entry.
 - `rollback.py <env> dry|apply|restore <backup.json>` — roll every table to its
   `bench_baseline` tag (tag set by `register_tpcds_tables.py --tag-baseline`).
 - `expire_abandoned.py <env> apply` — expire snapshots off the current lineage.
