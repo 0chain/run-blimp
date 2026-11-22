@@ -2034,7 +2034,7 @@ node_cmd(){
     mkdir -p "$nh" && "$vpy" -m venv "$nh/venv" || die "python3 -m venv failed"
     "$nh/venv/bin/pip" install -q --upgrade pip || die "pip upgrade failed"
     # The released wheel; the git branch only if the release asset can't be fetched.
-    "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-https://github.com/0chain/run-blimp/releases/download/v0.1.0/blimp_memory-0.1.0-py3-none-any.whl}" \
+    "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-https://github.com/0chain/run-blimp/releases/download/v0.1.1/blimp_memory-0.1.1-py3-none-any.whl}" \
       || { [ -z "${BLIMP_NODE_PKG:-}" ] && "$nh/venv/bin/pip" install -q "git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory"; } \
       || die "installing blimp-memory failed (set BLIMP_NODE_PKG to a wheel or path)"
   fi
