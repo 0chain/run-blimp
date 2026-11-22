@@ -65,6 +65,13 @@ usage(){
   bold "blimp — Blimp prod-source setup + validation"
   cat <<'H'
 
+  Memory for Claude / OpenAI (7 days free, then a subscription):
+  blimp login        sign in (starts the free week on a new account)
+  blimp install      install the memory node on this Mac or server (--server, --node)
+  blimp connect <t>  claude-code | claude-desktop | codex | anthropic | openai | claude.ai | chatgpt
+  blimp disconnect <t>|--all    blimp status    blimp subscribe    blimp pause | resume
+  blimp forget --user U --yes   blimp uninstall [--delete-data --yes]
+
   blimp --setup      Connect a Blimp cluster to your data (run on your app node).
                      Asks three things, each defaulting to the INTERNAL option so
                      a plain customer needs no pre-existing infrastructure:
@@ -2010,6 +2017,29 @@ cmd_doctor(){
 if [ "${BLIMP_LIB_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
 CMD="${1:-}"; shift 2>/dev/null || true
+
+# Blimp memory node (Claude / OpenAI memory): the Python package blimp-memory, in its own
+# venv under ~/.blimp. `blimp install` creates the venv on first use.
+node_cmd(){
+  local nh="${BLIMP_NODE_HOME:-$HOME/.blimp}" py="${BLIMP_NODE_PYTHON:-}"
+  [ -n "$py" ] || py="$nh/venv/bin/python"
+  if [ ! -x "$py" ]; then
+    [ "$1" = install ] || die "the Blimp node is not installed — run: blimp install"
+    command -v python3 >/dev/null || die "python3 (3.10+) is required"
+    echo "== creating $nh/venv =="
+    mkdir -p "$nh" && python3 -m venv "$nh/venv" || die "python3 -m venv failed"
+    "$nh/venv/bin/pip" install -q --upgrade pip \
+      && "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory}" \
+      || die "installing blimp-memory failed (set BLIMP_NODE_PKG to a wheel or path)"
+  fi
+  BLIMP_NODE_HOME="$nh" BLIMP_PYTHON="$py" exec "$py" -m blimp_memory.cli "$@"
+}
+
+# node subcommands take their own flags: dispatch before the global flag parser
+case "$CMD" in
+  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp)
+    node_cmd "$CMD" "$@" ;;
+esac
 pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
 for f in "$@"; do
   # --update / --update-log take their own sub-arguments (service lists,
