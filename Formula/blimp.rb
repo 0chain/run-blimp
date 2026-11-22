@@ -4,9 +4,9 @@
 class Blimp < Formula
   desc "Memory for Claude/OpenAI and Blimp nodes on your own computer"
   homepage "https://blimp.software"
-  url "https://github.com/0chain/run-blimp/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "3d56b443461800831fda295a237658361766f0df2cde6c43fc52837246ef79b5"
-  version "0.1.0"
+  url "https://github.com/0chain/run-blimp/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "b604db2868e5fcb699d161c9d9e753565d6c30ca954c7c3467c4d39c8aaa2602"
+  version "0.1.1"
 
   depends_on "python@3.12"
 
