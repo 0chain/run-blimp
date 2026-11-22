@@ -2025,11 +2025,17 @@ node_cmd(){
   [ -n "$py" ] || py="$nh/venv/bin/python"
   if [ ! -x "$py" ]; then
     case "$1" in install|login|launch) ;; *) die "the Blimp node is not installed — run: blimp install (memory) or blimp launch --local (a node on this computer)";; esac
-    command -v python3 >/dev/null || die "python3 (3.10+) is required"
+    # BLIMP_VENV_PYTHON: Homebrew's formula points it at python@3.12 (macOS's own
+    # python3 can be 3.9; blimp-memory needs 3.10+).
+    local vpy="${BLIMP_VENV_PYTHON:-python3}"
+    command -v "$vpy" >/dev/null || die "python3 (3.10+) is required"
+    "$vpy" -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "$vpy is $("$vpy" -V 2>&1); blimp needs Python 3.10+ (brew install python@3.12)"
     echo "== creating $nh/venv =="
-    mkdir -p "$nh" && python3 -m venv "$nh/venv" || die "python3 -m venv failed"
-    "$nh/venv/bin/pip" install -q --upgrade pip \
-      && "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory}" \
+    mkdir -p "$nh" && "$vpy" -m venv "$nh/venv" || die "python3 -m venv failed"
+    "$nh/venv/bin/pip" install -q --upgrade pip || die "pip upgrade failed"
+    # The released wheel; the git branch only if the release asset can't be fetched.
+    "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-https://github.com/0chain/run-blimp/releases/download/v0.1.0/blimp_memory-0.1.0-py3-none-any.whl}" \
+      || { [ -z "${BLIMP_NODE_PKG:-}" ] && "$nh/venv/bin/pip" install -q "git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory"; } \
       || die "installing blimp-memory failed (set BLIMP_NODE_PKG to a wheel or path)"
   fi
   BLIMP_NODE_HOME="$nh" BLIMP_PYTHON="$py" exec "$py" -m blimp_memory.cli "$@"
