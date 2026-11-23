@@ -613,8 +613,11 @@ choose_source_location(){
   local have_gw=0
   [ -n "${GW:-}" ] && [ -n "${GW_AK:-}" ] && [ -n "${GW_SK:-}" ] && have_gw=1
   local c
+  # A desktop node (blimp launch --local made /etc/blimp-desktop) keeps its data on its
+  # own gateway: the fleet layer is the account's servers, reached over a home uplink.
+  local def=2; [ "$have_fleet" = 1 ] && [ ! -d /etc/blimp-desktop ] && def=1
   if [ "$have_fleet" = 1 ] || [ "$have_gw" = 1 ]; then
-    c=$(pick SOURCE_CHOICE "Dataset (source) location" "$([ "$have_fleet" = 1 ] && echo 1 || echo 2)" \
+    c=$(pick SOURCE_CHOICE "Dataset (source) location" "$def" \
       "the fleet cache layer — ${FLEET_URL:-(unavailable)} (default)" \
       "this node's own gateway S3 — http://${GW:-?}:${S3_PORT:-9000} (nothing to install)" \
       "another S3 endpoint (your own bucket / MinIO / other cloud)")
@@ -2034,7 +2037,7 @@ node_cmd(){
     mkdir -p "$nh" && "$vpy" -m venv "$nh/venv" || die "python3 -m venv failed"
     "$nh/venv/bin/pip" install -q --upgrade pip || die "pip upgrade failed"
     # The released wheel; the git branch only if the release asset can't be fetched.
-    "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-https://github.com/0chain/run-blimp/releases/download/v0.1.1/blimp_memory-0.1.1-py3-none-any.whl}" \
+    "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-https://github.com/0chain/run-blimp/releases/download/v0.1.2/blimp_memory-0.1.2-py3-none-any.whl}" \
       || { [ -z "${BLIMP_NODE_PKG:-}" ] && "$nh/venv/bin/pip" install -q "git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory"; } \
       || die "installing blimp-memory failed (set BLIMP_NODE_PKG to a wheel or path)"
   fi
