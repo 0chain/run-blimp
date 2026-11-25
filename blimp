@@ -71,6 +71,8 @@ usage(){
   blimp connect <t>  claude-code | claude-desktop | codex | anthropic | openai | claude.ai | chatgpt
   blimp disconnect <t>|--all    blimp status    blimp subscribe    blimp pause | resume
   blimp forget --user U --yes   blimp uninstall [--delete-data --yes]
+  blimp chat                    Claude Code with no history or prompt cache: memory + relevant CLAUDE.md per prompt
+  blimp import <export.zip>     backfill claude.ai / ChatGPT history
 
   blimp --setup      Connect a Blimp cluster to your data (run on your app node).
                      Asks three things, each defaulting to the INTERNAL option so
@@ -2046,7 +2048,7 @@ node_cmd(){
 
 # node subcommands take their own flags: dispatch before the global flag parser
 case "$CMD" in
-  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp|launch)
+  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp|launch|chat|import)
     node_cmd "$CMD" "$@" ;;
 esac
 pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
