@@ -2048,7 +2048,7 @@ node_cmd(){
 
 # node subcommands take their own flags: dispatch before the global flag parser
 case "$CMD" in
-  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp|launch|chat|import)
+  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp|launch|chat|run|import)
     node_cmd "$CMD" "$@" ;;
 esac
 pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
