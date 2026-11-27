@@ -4,18 +4,17 @@
 class Blimp < Formula
   desc "Memory for Claude/OpenAI and Blimp nodes on your own computer"
   homepage "https://blimp.software"
-  url "https://github.com/0chain/run-blimp/archive/refs/tags/v0.1.3.tar.gz"
-  sha256 "49379854a6f3622afedef8164a33ebb3747be71762310cd916afb6dc4aa36600"
-  version "0.1.3"
+  url "https://github.com/0chain/run-blimp/archive/refs/tags/v0.1.4.tar.gz"
+  sha256 "cc7c67c6308e9b86acb16b29f7987c310def3ab30bc278dc0e7e6162276cbadf"
+  version "0.1.4"
 
-  depends_on "python@3.12"
+  # No Python dependency: the node commands fetch uv and a prebuilt Python 3.12 into ~/.blimp
+  # on first use. Depending on python@3.12 made `brew upgrade blimp` compile Python from source
+  # on Intel Macs (Homebrew ships no Intel bottles), 20-40 minutes for a script update.
 
   def install
     libexec.install Dir["*"]
-    # The node commands (login, launch, install, ...) create their Python venv under
-    # ~/.blimp on first use; give them Homebrew's Python (macOS's python3 is 3.9).
-    (bin/"blimp").write_env_script libexec/"blimp",
-      BLIMP_VENV_PYTHON: Formula["python@3.12"].opt_bin/"python3.12"
+    (bin/"blimp").write_exec_script libexec/"blimp"
   end
 
   def caveats
