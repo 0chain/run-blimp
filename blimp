@@ -2031,22 +2031,63 @@ CMD="${1:-}"; shift 2>/dev/null || true
 NODE_PKG_VER="0.1.3"
 NODE_PKG_URL="https://github.com/0chain/run-blimp/releases/download/v${NODE_PKG_VER}/blimp_memory-${NODE_PKG_VER}-py3-none-any.whl"
 
+# The node's Python comes from uv (one prebuilt binary) and uv's prebuilt CPython, both kept
+# under ~/.blimp: nothing is compiled and no system or Homebrew Python is needed. Depending on
+# Homebrew's python@3.12 made `brew upgrade blimp` build Python from source on Intel Macs
+# (no bottles; 20-40 min), and a venv on a Homebrew Python broke when brew replaced it.
+UV_VER="0.13.10"
+uv_sha256(){
+  case "$1" in
+    x86_64-apple-darwin)       echo 153e03197588204c04fc4c81cc4bafbfa4280222a385e4ee36a87aeec0ae63b4 ;;
+    aarch64-apple-darwin)      echo e419bf07533bdbf48795fc793601c834dd79db57a8c49ce8e25cfe3a8639958d ;;
+    x86_64-unknown-linux-gnu)  echo bf65ac1a0af10f92c522d91ac096c7c0a39657647b155577e7836c2cbbb4526c ;;
+    aarch64-unknown-linux-gnu) echo 14590f644805a6234ffe071154340669e38137f38e60aa9629690119704107d2 ;;
+  esac
+}
+
+# ensure_uv <node home>: prints the path of uv $UV_VER under <node home>/bin, downloading it
+# (checksum pinned above) when it is missing or another version.
+ensure_uv(){
+  local nh="$1" uv="$1/bin/uv" os arch t want got tmp
+  if [ -x "$uv" ] && [ "$("$uv" --version 2>/dev/null | awk '{print $2}')" = "$UV_VER" ]; then printf '%s' "$uv"; return 0; fi
+  case "$(uname -s)" in Darwin) os=apple-darwin ;; Linux) os=unknown-linux-gnu ;; *) die "no uv build for $(uname -s)" ;; esac
+  case "$(uname -m)" in x86_64|amd64) arch=x86_64 ;; arm64|aarch64) arch=aarch64 ;; *) die "no uv build for $(uname -m)" ;; esac
+  t="$arch-$os"; want=$(uv_sha256 "$t")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/blimp-uv.XXXXXX") || die "mktemp failed"
+  echo "== fetching uv $UV_VER ($t) ==" >&2
+  curl -fsSL -o "$tmp/uv.tar.gz" "https://github.com/astral-sh/uv/releases/download/$UV_VER/uv-$t.tar.gz" \
+    || die "downloading uv failed"
+  got=$( (shasum -a 256 "$tmp/uv.tar.gz" 2>/dev/null || sha256sum "$tmp/uv.tar.gz") | awk '{print $1}')
+  [ "$got" = "$want" ] || die "uv download checksum mismatch ($got, expected $want)"
+  tar -xzf "$tmp/uv.tar.gz" -C "$tmp" || die "unpacking uv failed"
+  mkdir -p "$nh/bin" && mv -f "$tmp/uv-$t/uv" "$uv" && chmod 755 "$uv" || die "installing uv failed"
+  rm -rf "$tmp"
+  printf '%s' "$uv"
+}
+
+# uv with its Python installs and cache kept under the node home, never in the user's own uv setup
+uv_run(){ local nh="$1"; shift; UV_PYTHON_INSTALL_DIR="$nh/python" UV_CACHE_DIR="$nh/cache/uv" UV_NO_CONFIG=1 "$@"; }
+
 node_cmd(){
-  local nh="${BLIMP_NODE_HOME:-$HOME/.blimp}" py="${BLIMP_NODE_PYTHON:-}"
+  local nh="${BLIMP_NODE_HOME:-$HOME/.blimp}" py="${BLIMP_NODE_PYTHON:-}" uv
   [ -n "$py" ] || py="$nh/venv/bin/python"
+  # -L too: a venv's python is a symlink to its base, and -e is false once the base is gone
+  if [ -z "${BLIMP_NODE_PYTHON:-}" ] && { [ -e "$py" ] || [ -L "$py" ]; } && ! "$py" -c '' 2>/dev/null; then
+    # the venv's base Python is gone (a venv on a Homebrew Python that brew replaced): set it
+    # aside — kept, not deleted — and build a new one below
+    local aside; aside="$nh/venv.broken-$(date +%Y%m%d%H%M%S)"
+    echo "== the memory node's Python no longer runs; moving $nh/venv to $aside and rebuilding =="
+    mv "$nh/venv" "$aside" || die "could not move $nh/venv aside"
+  fi
   if [ ! -x "$py" ]; then
     case "$1" in install|login|launch) ;; *) die "the Blimp node is not installed — run: blimp install (memory) or blimp launch --local (a node on this computer)";; esac
-    # BLIMP_VENV_PYTHON: Homebrew's formula points it at python@3.12 (macOS's own
-    # python3 can be 3.9; blimp-memory needs 3.10+).
-    local vpy="${BLIMP_VENV_PYTHON:-python3}"
-    command -v "$vpy" >/dev/null || die "python3 (3.10+) is required"
-    "$vpy" -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "$vpy is $("$vpy" -V 2>&1); blimp needs Python 3.10+ (brew install python@3.12)"
-    echo "== creating $nh/venv =="
-    mkdir -p "$nh" && "$vpy" -m venv "$nh/venv" || die "python3 -m venv failed"
-    "$nh/venv/bin/pip" install -q --upgrade pip || die "pip upgrade failed"
+    uv=$(ensure_uv "$nh") || exit 1
+    echo "== creating $nh/venv (Python 3.12, prebuilt) =="
+    mkdir -p "$nh"
+    uv_run "$nh" "$uv" venv -q --python 3.12 --managed-python "$nh/venv" || die "creating the venv failed"
     # The released wheel; the git branch only if the release asset can't be fetched.
-    "$nh/venv/bin/pip" install -q "${BLIMP_NODE_PKG:-$NODE_PKG_URL}" \
-      || { [ -z "${BLIMP_NODE_PKG:-}" ] && "$nh/venv/bin/pip" install -q "git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory"; } \
+    uv_run "$nh" "$uv" pip install -q --python "$nh/venv/bin/python" "${BLIMP_NODE_PKG:-$NODE_PKG_URL}" \
+      || { [ -z "${BLIMP_NODE_PKG:-}" ] && uv_run "$nh" "$uv" pip install -q --python "$nh/venv/bin/python" "git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory"; } \
       || die "installing blimp-memory failed (set BLIMP_NODE_PKG to a wheel or path)"
   elif [ -z "${BLIMP_NODE_PYTHON:-}${BLIMP_NODE_PKG:-}" ]; then
     # an existing venv: bring an older package up to this release (a newer or dev one is kept)
@@ -2055,7 +2096,8 @@ node_cmd(){
     if "$py" -c 'import sys; a, b = (tuple(int(x) for x in v.split(".")[:3]) for v in sys.argv[1:3]); sys.exit(a >= b)' \
          "$have" "$NODE_PKG_VER" 2>/dev/null; then
       echo "== updating the memory node package $have -> $NODE_PKG_VER =="
-      "$nh/venv/bin/pip" install -q "$NODE_PKG_URL" || die "updating blimp-memory failed"
+      uv=$(ensure_uv "$nh") || exit 1
+      uv_run "$nh" "$uv" pip install -q --python "$py" "$NODE_PKG_URL" || die "updating blimp-memory failed"
       echo "   a running memory node picks it up after: blimp pause && blimp resume"
     fi
   fi

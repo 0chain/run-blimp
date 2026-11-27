@@ -3,7 +3,7 @@
 #   irm https://raw.githubusercontent.com/0chain/run-blimp/main/install.ps1 | iex
 #
 # Installs the blimp CLI for this user (no administrator needed):
-#   - Python 3.10+ (uses an existing one; else winget; else the python.org installer, per-user)
+#   - uv and a prebuilt Python 3.12, both under %USERPROFILE%\.blimp (no system Python needed)
 #   - the blimp-memory package (release wheel) in %USERPROFILE%\.blimp\venv
 #   - %USERPROFILE%\.blimp\bin\blimp.cmd, added to your user PATH
 # Then:  blimp login   and   blimp launch --local   (sets up WSL2 on first run; that step asks
@@ -17,7 +17,14 @@ $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with
 $BlimpHome = if ($env:BLIMP_NODE_HOME) { $env:BLIMP_NODE_HOME } else { Join-Path $env:USERPROFILE '.blimp' }
 $Pkg = if ($env:BLIMP_NODE_PKG) { $env:BLIMP_NODE_PKG } else {
   'https://github.com/0chain/run-blimp/releases/download/v0.1.3/blimp_memory-0.1.3-py3-none-any.whl' }
-$PyVersion = '3.12.10'
+# The node's Python comes from uv (one prebuilt binary, checksum pinned) and uv's prebuilt
+# CPython, both under %USERPROFILE%\.blimp: no Python install, winget or python.org installer,
+# and no administrator. The same path as the macOS/Linux blimp script.
+$UvVer = '0.13.10'
+$UvSha = @{
+  'x86_64-pc-windows-msvc'  = '297b3881fe1adfb922becc2c1613202abb41dc83ea5ff43d472aa087ca1f8683'
+  'aarch64-pc-windows-msvc' = 'f223bcd3fa010174ffeeb885cc1d5334bb81388640c65baa5b8b42b47017337e'
+}
 
 function Say($m) { Write-Host "[install] $m" -ForegroundColor Cyan }
 
@@ -25,64 +32,41 @@ if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
   Write-Warning 'Windows on ARM: the CLI installs, but `blimp launch --local` is not supported yet (no ARM build of the node images).'
 }
 
-function Test-Python($exe, [string[]]$pre) {
-  try {
-    & $exe @pre -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>$null
-    return ($LASTEXITCODE -eq 0)
-  } catch { return $false }
+New-Item -ItemType Directory -Force -Path (Join-Path $BlimpHome 'bin') | Out-Null
+$uv = Join-Path $BlimpHome 'bin\uv.exe'
+$have = if (Test-Path $uv) { ((& $uv --version) -split ' ')[1] } else { '' }
+if ($have -ne $UvVer) {
+  $t = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+  $zip = Join-Path $env:TEMP "uv-$UvVer-$t.zip"
+  Say "fetching uv $UvVer ($t)"
+  Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/astral-sh/uv/releases/download/$UvVer/uv-$t.zip" -OutFile $zip
+  $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+  if ($got -ne $UvSha[$t]) { throw "uv download checksum mismatch ($got, expected $($UvSha[$t]))" }
+  $dir = Join-Path $env:TEMP "uv-$UvVer-$t"
+  Expand-Archive -Path $zip -DestinationPath $dir -Force
+  Copy-Item -Force (Get-ChildItem -Path $dir -Recurse -Filter 'uv.exe' | Select-Object -First 1).FullName $uv
+  Remove-Item $zip -Force -ErrorAction SilentlyContinue
 }
-
-function Find-Python {
-  $cands = @(
-    @{ exe = 'py'; pre = @('-3.12') }, @{ exe = 'py'; pre = @('-3.13') }, @{ exe = 'py'; pre = @('-3.11') },
-    @{ exe = 'py'; pre = @('-3.10') }, @{ exe = 'python'; pre = @() },
-    @{ exe = (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'); pre = @() }
-  )
-  foreach ($c in $cands) {
-    if ((Get-Command $c.exe -ErrorAction SilentlyContinue) -or (Test-Path $c.exe)) {
-      # skip the Microsoft Store alias stub (it opens the Store instead of running)
-      $src = (Get-Command $c.exe -ErrorAction SilentlyContinue).Source
-      if ($src -and $src -like '*WindowsApps*') { continue }
-      if (Test-Python $c.exe $c.pre) { return $c }
-    }
-  }
-  return $null
-}
-
-$py = Find-Python
-if (-not $py) {
-  if (Get-Command winget -ErrorAction SilentlyContinue) {
-    Say 'installing Python 3.12 with winget (per user)'
-    winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements | Out-Null
-  } else {
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
-    $url = "https://www.python.org/ftp/python/$PyVersion/python-$PyVersion-$arch.exe"
-    $exe = Join-Path $env:TEMP "python-$PyVersion-$arch.exe"
-    Say "downloading $url"
-    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $exe
-    $sig = Get-AuthenticodeSignature $exe
-    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Python Software Foundation') {
-      throw "the Python installer is not signed by the Python Software Foundation ($($sig.Status))"
-    }
-    Say 'installing Python (per user, no administrator)'
-    Start-Process -FilePath $exe -ArgumentList '/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=1', 'Include_test=0' -Wait
-    Remove-Item $exe -Force -ErrorAction SilentlyContinue
-  }
-  $py = Find-Python
-  if (-not $py) { throw 'Python 3.10+ was not found after installing it; open a new PowerShell and run this again.' }
-}
-Say ("using Python: {0} {1}" -f $py.exe, ($py.pre -join ' '))
+# uv's Python installs and cache stay under the node home, never in the user's own uv setup
+$env:UV_PYTHON_INSTALL_DIR = Join-Path $BlimpHome 'python'
+$env:UV_CACHE_DIR = Join-Path $BlimpHome 'cache\uv'
+$env:UV_NO_CONFIG = '1'
 
 New-Item -ItemType Directory -Force -Path $BlimpHome | Out-Null
 $venvPy = Join-Path $BlimpHome 'venv\Scripts\python.exe'
-if (-not (Test-Path $venvPy)) {
-  Say "creating $BlimpHome\venv"
-  & $py.exe @($py.pre) -m venv (Join-Path $BlimpHome 'venv')
-  if ($LASTEXITCODE -ne 0) { throw 'python -m venv failed' }
+if ((Test-Path $venvPy) -and -not (& { try { & $venvPy -c '' 2>$null; $LASTEXITCODE -eq 0 } catch { $false } })) {
+  # the venv's base Python is gone: set it aside (kept, not deleted) and build a new one
+  $aside = Join-Path $BlimpHome ("venv.broken-" + (Get-Date -Format 'yyyyMMddHHmmss'))
+  Say "the memory node's Python no longer runs; moving the venv to $aside"
+  Move-Item (Join-Path $BlimpHome 'venv') $aside
 }
-& $venvPy -m pip install -q --upgrade pip
+if (-not (Test-Path $venvPy)) {
+  Say "creating $BlimpHome\venv (Python 3.12, prebuilt)"
+  & $uv venv -q --python 3.12 --managed-python (Join-Path $BlimpHome 'venv')
+  if ($LASTEXITCODE -ne 0) { throw 'creating the venv failed' }
+}
 Say "installing blimp-memory ($Pkg)"
-& $venvPy -m pip install -q --upgrade $Pkg
+& $uv pip install -q --python $venvPy --upgrade $Pkg
 if ($LASTEXITCODE -ne 0) { throw "installing blimp-memory failed ($Pkg)" }
 
 $bin = Join-Path $BlimpHome 'bin'
