@@ -14,7 +14,7 @@ class Blimp < Formula
 
   def install
     libexec.install Dir["*"]
-    (bin/"blimp").write_exec_script libexec/"blimp"
+    bin.write_exec_script libexec/"blimp"
   end
 
   def caveats
