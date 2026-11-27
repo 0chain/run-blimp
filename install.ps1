@@ -16,7 +16,7 @@ $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with
 
 $BlimpHome = if ($env:BLIMP_NODE_HOME) { $env:BLIMP_NODE_HOME } else { Join-Path $env:USERPROFILE '.blimp' }
 $Pkg = if ($env:BLIMP_NODE_PKG) { $env:BLIMP_NODE_PKG } else {
-  'https://github.com/0chain/run-blimp/releases/download/v0.1.2/blimp_memory-0.1.2-py3-none-any.whl' }
+  'https://github.com/0chain/run-blimp/releases/download/v0.1.3/blimp_memory-0.1.3-py3-none-any.whl' }
 $PyVersion = '3.12.10'
 
 function Say($m) { Write-Host "[install] $m" -ForegroundColor Cyan }
