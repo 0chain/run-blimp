@@ -16,7 +16,7 @@ $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with
 
 $BlimpHome = if ($env:BLIMP_NODE_HOME) { $env:BLIMP_NODE_HOME } else { Join-Path $env:USERPROFILE '.blimp' }
 $Pkg = if ($env:BLIMP_NODE_PKG) { $env:BLIMP_NODE_PKG } else {
-  'https://github.com/0chain/run-blimp/releases/download/v0.1.3/blimp_memory-0.1.3-py3-none-any.whl' }
+  'https://github.com/0chain/run-blimp/releases/download/v0.1.4/blimp_memory-0.1.4-py3-none-any.whl' }
 # The node's Python comes from uv (one prebuilt binary, checksum pinned) and uv's prebuilt
 # CPython, both under %USERPROFILE%\.blimp: no Python install, winget or python.org installer,
 # and no administrator. The same path as the macOS/Linux blimp script.
