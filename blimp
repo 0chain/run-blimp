@@ -2090,11 +2090,30 @@ node_cmd(){
       || { [ -z "${BLIMP_NODE_PKG:-}" ] && uv_run "$nh" "$uv" pip install -q --python "$nh/venv/bin/python" "git+https://github.com/0chain/zs3@claude/blimp-memory-phase4-5#subdirectory=blimp-memory"; } \
       || die "installing blimp-memory failed (set BLIMP_NODE_PKG to a wheel or path)"
   elif [ -z "${BLIMP_NODE_PYTHON:-}${BLIMP_NODE_PKG:-}" ]; then
-    # an existing venv: bring an older package up to this release (a newer or dev one is kept)
-    local have
+    # an existing venv: bring an older package up to this release (a newer or dev one is kept),
+    # and move a venv built on another Python (Homebrew's, before 0.1.4) onto uv's: nothing
+    # depends on python@3.12 any more, so `brew autoremove` could delete it and the node service,
+    # which runs the venv's python directly, would no longer start
+    local have cmp base
     have=$("$py" -c 'import importlib.metadata as m; print(m.version("blimp-memory"))' 2>/dev/null || echo 0)
-    if "$py" -c 'import sys; a, b = (tuple(int(x) for x in v.split(".")[:3]) for v in sys.argv[1:3]); sys.exit(a >= b)' \
-         "$have" "$NODE_PKG_VER" 2>/dev/null; then
+    # cmp: older | same | newer than this release; a dev/local build (not x.y.z) is left alone
+    cmp=$("$py" -c 'import sys
+try: a, b = (tuple(int(x) for x in v.split(".")) for v in sys.argv[1:3])
+except ValueError: print("dev"); sys.exit()
+print("older" if a < b else "same" if a == b else "newer")' "$have" "$NODE_PKG_VER" 2>/dev/null || echo dev)
+    base=$(sed -n 's/^home *= *//p' "$nh/venv/pyvenv.cfg" 2>/dev/null)
+    if { [ "$cmp" = older ] || [ "$cmp" = same ]; } && [ -n "$base" ] && [ "${base#"$nh/python/"}" = "$base" ]; then
+      echo "== moving the memory node onto a prebuilt Python 3.12 (was $base) =="
+      uv=$(ensure_uv "$nh") || exit 1
+      local new="$nh/venv.new" old="$nh/venv.old-$(date +%Y%m%d%H%M%S)"
+      [ -e "$new" ] && mv "$new" "$new.stale-$(date +%s)"
+      uv_run "$nh" "$uv" venv -q --python 3.12 --managed-python "$new" \
+        && uv_run "$nh" "$uv" pip install -q --python "$new/bin/python" "$NODE_PKG_URL" \
+        || die "building the new venv failed; the current one is unchanged"
+      mv "$nh/venv" "$old" && mv "$new" "$nh/venv" || die "swapping the venv failed (old one at $old)"
+      echo "   the previous venv is kept at $old"
+      echo "   a running memory node picks it up after: blimp pause && blimp resume"
+    elif [ "$cmp" = older ]; then
       echo "== updating the memory node package $have -> $NODE_PKG_VER =="
       uv=$(ensure_uv "$nh") || exit 1
       uv_run "$nh" "$uv" pip install -q --python "$py" "$NODE_PKG_URL" || die "updating blimp-memory failed"
