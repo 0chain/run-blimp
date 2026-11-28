@@ -2080,7 +2080,7 @@ node_cmd(){
     mv "$nh/venv" "$aside" || die "could not move $nh/venv aside"
   fi
   if [ ! -x "$py" ]; then
-    case "$1" in install|login|launch) ;; *) die "the Blimp node is not installed — run: blimp install (memory) or blimp launch --local (a node on this computer)";; esac
+    case "${1:-}" in install|login|launch) ;; *) die "the Blimp node is not installed — run: blimp install (memory) or blimp launch --local (a node on this computer)";; esac
     uv=$(ensure_uv "$nh") || exit 1
     echo "== creating $nh/venv (Python 3.12, prebuilt) =="
     mkdir -p "$nh"
@@ -2125,8 +2125,12 @@ print("older" if a < b else "same" if a == b else "newer")' "$have" "$NODE_PKG_V
 
 # node subcommands take their own flags: dispatch before the global flag parser
 case "$CMD" in
-  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp|launch|chat|run|import)
+  login|logout|install|connect|disconnect|status|subscribe|pause|resume|forget|uninstall|serve|mcp|launch|chat|run|import|connectors|skills|api)
     node_cmd "$CMD" "$@" ;;
+  # Claude Code-style entry points (blimp_memory.cli claude_style): bare blimp = chat (manual),
+  # -p/--print = one answer, --auto = run to done, -c/--continue, -r/--resume
+  ""|-p|--print|--auto|-c|--continue|-r|--resume)
+    if [ -n "$CMD" ]; then node_cmd "$CMD" "$@"; else node_cmd; fi ;;
 esac
 pending=""   # name of the variable the NEXT argument fills (--tpc "3 7 19")
 for f in "$@"; do
