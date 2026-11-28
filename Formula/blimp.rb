@@ -4,9 +4,9 @@
 class Blimp < Formula
   desc "Memory for Claude/OpenAI and Blimp nodes on your own computer"
   homepage "https://blimp.software"
-  url "https://github.com/0chain/run-blimp/archive/refs/tags/v0.1.6.tar.gz"
-  sha256 "0b9bac487b7e937bf3aaef8e57be725758589f873dabb0dda152242a266365a0"
-  version "0.1.6"
+  url "https://github.com/0chain/run-blimp/archive/refs/tags/v0.1.7.tar.gz"
+  sha256 "d7e8d44259fc2df3883a6e134f569925fe0ec6c647036df98c0912c2750c0a99"
+  version "0.1.7"
 
   # No Python dependency: the node commands fetch uv and a prebuilt Python 3.12 into ~/.blimp
   # on first use. Depending on python@3.12 made `brew upgrade blimp` compile Python from source
