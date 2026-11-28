@@ -2028,7 +2028,7 @@ CMD="${1:-}"; shift 2>/dev/null || true
 # The memory-node package this release runs. node_cmd installs it into a new venv and
 # upgrades an existing venv that holds an older one: without the upgrade a `brew upgrade`
 # changed only this script, and the node kept the package it was first installed with.
-NODE_PKG_VER="0.1.4"
+NODE_PKG_VER="0.1.5"
 NODE_PKG_URL="https://github.com/0chain/run-blimp/releases/download/v${NODE_PKG_VER}/blimp_memory-${NODE_PKG_VER}-py3-none-any.whl"
 
 # The node's Python comes from uv (one prebuilt binary) and uv's prebuilt CPython, both kept
